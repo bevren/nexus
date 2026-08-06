@@ -4934,7 +4934,31 @@ function getStatusBarText() {
   const elapsedSeconds =
     thinkingStartedAt > 0 ? Math.floor((Date.now() - thinkingStartedAt) / 1000) : 0;
   const symbol = thinkingFrameIndex % 2 === 0 ? "\u2022" : "\u25e6";
-  return `${symbol} ${THINKING_FRAMES[thinkingFrameIndex % THINKING_FRAMES.length]} (${elapsedSeconds}s)`;
+  const thinkingText = `${THINKING_FRAMES[thinkingFrameIndex % THINKING_FRAMES.length]} (${elapsedSeconds}s)`;
+  return `${symbol} ${applyShineEffect(thinkingText, thinkingFrameIndex, 5)}`;
+}
+
+const SHINE_RESET = "\u001b[0m";
+const SHINE_BRIGHT = "\u001b[1m\u001b[97m";
+const SHINE_DIM = "\u001b[90m";
+
+function applyShineEffect(text, frameIndex, windowWidth) {
+  // Left-to-right sweeping bright highlight over dim text.
+  if (!text) {
+    return text;
+  }
+  const win = Math.max(1, windowWidth || 5);
+  const total = Math.max(1, text.length);
+  const cycle = total + win; // shine spawns off the left, exits off the right
+  const phase = frameIndex % cycle;
+  const start = phase - win;
+  let out = "";
+  for (let i = 0; i < text.length; i += 1) {
+    const inWindow = i >= start && i <= phase;
+    out += inWindow ? `${SHINE_BRIGHT}${text[i]}${SHINE_RESET}` : `${SHINE_DIM}${text[i]}${SHINE_RESET}`;
+  }
+  // Add a dim reset so the status line doesn't leak styling into the rest of the frame.
+  return `${out}${SHINE_RESET}`;
 }
 
 function updateThinkingAnimationState() {
