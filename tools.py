@@ -18,6 +18,7 @@ from collections import Counter
 from uuid import uuid4
 from typing import Iterable
 import harness
+import skills_deps
 
 WORKSPACE_ROOT = Path.cwd().resolve()
 NEXUS_DIR = Path.home() / ".nexus"
@@ -1928,6 +1929,20 @@ def _parse_skill_frontmatter(text):
     return name, description, frontmatter, body
 
 
+def _skill_deps_status(skill_dir):
+    # Attach dependency status to a skill entry (non-blocking).
+    try:
+        info = skills_deps.requirements_satisfied(skill_dir)
+        return {
+            "present": info["present"],
+            "installed": info["installed"],
+            "installing": info["installing"],
+            "needs_install": info["needs_install"],
+            "error": info["error"],
+        }
+    except Exception as exc:
+        return {"present": False, "installed": False, "error": str(exc)}
+
 def _skill_entry_from_file(skill_dir):
     md = skill_dir / "SKILL.md"
     if not md.exists():
@@ -1974,7 +1989,13 @@ def list_skills() -> dict[str, object]:
     found.sort(key=lambda e: e["name"].lower())
     return {
         "skills": [
-            {"name": s["name"], "description": s["description"]} for s in found
+            {
+                "name": s["name"],
+                "description": s["description"],
+                "has_deps": _skill_deps_status(s["path"])["present"],
+                "deps_installed": _skill_deps_status(s["path"])["installed"],
+            }
+            for s in found
         ],
         "error": "",
     }
@@ -2006,6 +2027,9 @@ def get_skill(name: str) -> dict[str, object]:
             for candidate in candidates:
                 entry = _skill_entry_from_file(candidate)
                 if entry and entry["name"].lower() == key.lower():
+                    entry["deps"] = _skill_deps_status(entry["path"])
+                    if entry["deps"].get("needs_install"):
+                        entry["deps"] = skills_deps.ensure_skill_dependencies(entry["path"])
                     return entry
         except Exception:
             continue
@@ -2142,6 +2166,13 @@ def refine_reflection(auto: bool = True) -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+def skill_python_path() -> str:
+    # Return the shared skill venv python executable (creates venv if needed).
+    try:
+        return skills_deps.get_venv_python()
+    except Exception as exc:
+        return "error: " + str(exc)
+
 FUNCTIONS = {
     "insert_memory": insert_memory,
     "retrieve_memory": retrieve_memory,
@@ -2184,6 +2215,7 @@ FUNCTIONS = {
     "harness_skill": harness_skill,
     "record_refinement": record_refinement,
     "refine_reflection": refine_reflection,
+    "skill_python_path": skill_python_path,
     "web_search": web_search,
 }
 
@@ -2217,6 +2249,7 @@ FUNCTION_DESCRIPTIONS = {
     "get_file_info": "async get_file_info(path: str) -> dict: Return file metadata inside workspace.",
     "read_file_summary": "async read_file_summary(path: str) -> dict: Return summary/preview for large files.",
     "fetch_url": "fetch_url(url: str, max_chars: int = 20000) -> dict: Fetch a URL and extract visible text content (HTML stripped). Returns {url, title, text, truncated, error}.",
+    "skill_python_path": "skill_python_path() -> str: Return the shared skill venv python executable (creates venv if needed). Use with run_shell to run skill scripts that depend on requirements.txt packages.",
     "list_skills": "list_skills() -> dict: List available skills. Returns {skills: [{name, description}], error}.",
     "get_skill": "get_skill(name: str) -> dict: Get a skill by name. Returns {name, description, path, body, error}. Load the body only when using the skill.",
     "web_search": "web_search(query: str, max_results: int = 5) -> dict: Search the web via DuckDuckGo (Lite HTML with Instant Answer fallback). Returns {query, results: [{title, snippet, url}], error}.",
