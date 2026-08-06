@@ -76,6 +76,7 @@ const MIN_LLM_REQUEST_TIMEOUT_MS = 10000;
 const MAX_LLM_REQUEST_TIMEOUT_MS = 600000;
 const THINKING_ANIMATION_INTERVAL_MS = 320;
 const THINKING_FRAMES = ["Thinking   ", "Thinking.  ", "Thinking.. ", "Thinking..."];
+const SPINNER_FRAMES = ["\u280b", "\u2819", "\u2839", "\u2838", "\u283c", "\u2834", "\u2826", "\u2827", "\u2807", "\u280f"];
 const APPEND_COMPOSER_FIXED_ROWS = 8;
 const MOUSE_KEYPRESS_SUPPRESS_MS = 650;
 const MOUSE_SELECTION_REENABLE_MS = 1800;
@@ -308,6 +309,7 @@ let systemPromptLoadPromise = null;
 let thinkingAnimationTimer = null;
 let thinkingFrameIndex = 0;
 let thinkingStartedAt = 0;
+let activeToolRun = null; // { label, startedAt, done, ok }
 let contextLeftPercentByModel = {};
 let currentSessionUid = createSessionUid();
 let sessionFilePath = getSessionFilePath(currentSessionUid);
@@ -2003,6 +2005,13 @@ function extractAllPythonCodeBlocks(text) {
   return blocks;
 }
 
+function getToolRunLabel(pythonCode) {
+  const source = String(pythonCode ?? "");
+  const firstLine = source.split("\n").find((ln) => ln.trim().length > 0) || "";
+  const snippet = firstLine.trim().slice(0, 48);
+  return snippet || "code execution";
+}
+
 function isPredefinedToolFunction(name) {
   return typeof name === "string" && Object.prototype.hasOwnProperty.call(toolDescriptions, name);
 }
@@ -2635,7 +2644,17 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
       }
 
       for (const pythonCode of pythonBlocks) {
+        activeToolRun = {
+          label: getToolRunLabel(pythonCode),
+          startedAt: Date.now(),
+          done: false,
+          ok: false,
+        };
         const execResult = await executeCodeWithPythonTool(pythonCode);
+        if (activeToolRun) {
+          activeToolRun.done = true;
+          activeToolRun.ok = Boolean(execResult?.ok);
+        }
         const toolResultPayload = buildToolResultPayload(execResult);
         const historyActionResult = applyHistoryActionsFromTool(execResult?.historyActions, generation);
         if (historyActionResult.changed) {
@@ -2669,9 +2688,11 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
 
       const followUpMessages = buildOpenRouterMessagesFromHistory(resolvedModel);
       if (followUpMessages.length === 0) {
+        activeToolRun = null;
         break;
       }
 
+      activeToolRun = null;
       const followUpCompletion = await requestWithTimeout(followUpMessages);
       if (generation !== chatGeneration) {
         return;
@@ -4894,7 +4915,20 @@ function getStatusBarText() {
   }
 
   if (!isAssistantThinking()) {
+    activeToolRun = null;
     return "";
+  }
+
+  // Tool execution status takes priority over the generic thinking animation.
+  if (activeToolRun) {
+    const label = activeToolRun.label || "code execution";
+    const elapsed = Math.floor((Date.now() - activeToolRun.startedAt) / 1000);
+    const frame = SPINNER_FRAMES[thinkingFrameIndex % SPINNER_FRAMES.length];
+    if (!activeToolRun.done) {
+      return `${frame} Running: ${label} (${elapsed}s)`;
+    }
+    const mark = activeToolRun.ok ? "\u2713" : "\u2717";
+    return `${mark} ${label} (${elapsed}s)`;
   }
 
   const elapsedSeconds =
