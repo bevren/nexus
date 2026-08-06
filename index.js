@@ -4988,7 +4988,7 @@ function updateThinkingAnimationState() {
     }
 
     thinkingFrameIndex = (thinkingFrameIndex + 1) % THINKING_FRAMES.length;
-    shineFrameIndex += 5;
+    shineFrameIndex += 12;
     markDirty();
     renderFrame(false);
   }, THINKING_ANIMATION_INTERVAL_MS);
