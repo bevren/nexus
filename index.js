@@ -91,8 +91,8 @@ const BRACKETED_PASTE_START = "\u001b[200~";
 const BRACKETED_PASTE_END = "\u001b[201~";
 const ENABLE_BRACKETED_PASTE = "\u001b[?2004h";
 const DISABLE_BRACKETED_PASTE = "\u001b[?2004l";
-const ENABLE_MOUSE_TRACKING = "\u001b[?1000h\u001b[?1006h";
-const DISABLE_MOUSE_TRACKING = "\u001b[?1000l\u001b[?1006l";
+const ENABLE_MOUSE_TRACKING = "\u001b[?1002h\u001b[?1006h";
+const DISABLE_MOUSE_TRACKING = "\u001b[?1002l\u001b[?1006l";
 const ENTER_ALT_SCREEN = "\u001b[?1049h";
 const EXIT_ALT_SCREEN = "\u001b[?1049l";
 const APP_MOUSE_TRACKING_ENABLED = process.env.TUI_ENABLE_MOUSE !== "0";
@@ -5613,34 +5613,32 @@ function handleMouseEvent(buttonCode, action, x, y) {
   const buttonBase = buttonCode & 3;
 
   if (!isWheel) {
-    const isLeftDown = action === "M" && buttonBase === 0;
-    const isDrag = action === "M" && buttonBase === 0;
+    const isLeftButton = buttonBase === 0;
     const isRelease = action === "m" || buttonBase === 3;
 
-    if (isLeftDown) {
-      // Begin in-app selection (mouse tracking stays ON; wheel still works
-      // between drags). SGR y is 1-based; viewport rows are 0-based.
+    if (action === "M" && isLeftButton) {
+      // Left press OR drag. On first press set the anchor; on subsequent
+      // M events (drag) only extend the end -- never re-anchor.
       const row = Math.max(0, y - 1);
       const col = Math.max(0, x - 1);
-      selectionAnchor = { row, col, offset: chatScrollOffset };
-      selectionEnd = { row, col };
-      selectionActive = true;
-      markDirty();
-      renderFrame(false);
-      return;
-    }
-
-    if (isDrag && selectionActive && selectionAnchor) {
-      // Track drag while selection is active; map to displayed row.
-      selectionEnd = { row: Math.max(0, y - 1), col: Math.max(0, x - 1) };
+      if (!selectionActive || !selectionAnchor) {
+        selectionAnchor = { row, col, offset: chatScrollOffset };
+        selectionEnd = { row, col };
+        selectionActive = true;
+      } else {
+        selectionEnd = { row, col };
+      }
       markDirty();
       renderFrame(false);
       return;
     }
 
     if (isRelease) {
-      // Keep the selection highlighted; wheel scroll becomes available again.
-      // If selection was never really made (no drag), clear it.
+      // Keep the highlight; wheel scroll works again after release.
+      if (selectionActive) {
+        markDirty();
+        renderFrame(true);
+      }
       exitMouseSelectionMode();
       return;
     }
@@ -6714,6 +6712,7 @@ function renderFrame(forceChatRefresh = false) {
   const needsChatRefresh =
     !APPEND_CHAT_TO_SCROLLBACK &&
     (forceChatRefresh ||
+      selectionActive ||
       currentRenderableMessageCount !== lastRenderableMessageCount ||
       statusLayoutChanged ||
       lastChatAreaHeight === null ||
