@@ -5635,6 +5635,15 @@ function handleMouseEvent(buttonCode, action, x, y) {
 
     if (isRelease) {
       // Keep the highlight; wheel scroll works again after release.
+      // A plain click (no drag distance) clears any existing selection.
+      if (selectionActive && selectionAnchor && selectionEnd) {
+        const moved =
+          selectionAnchor.row !== selectionEnd.row ||
+          selectionAnchor.col !== selectionEnd.col;
+        if (!moved) {
+          clearSelection();
+        }
+      }
       if (selectionActive) {
         markDirty();
         renderFrame(true);
@@ -5673,9 +5682,13 @@ function handleMouseEvent(buttonCode, action, x, y) {
 }
 
 function clearSelection() {
+  const wasActive = selectionActive;
   selectionAnchor = null;
   selectionEnd = null;
   selectionActive = false;
+  if (wasActive) {
+    dirty = true;
+  }
 }
 
 const SELECT_BG = "\u001b[48;5;238m";
@@ -5739,17 +5752,63 @@ function lineInSelection(row) {
   );
 }
 
-function writeSelectedLine(row, line, cols) {
-  // Paint the whole line with a selection background, then overlay the styled
-  // text. Using an extra cursor write per row keeps it simple and correct.
-  const plain = String(line?.text ?? "");
-  const styled = String(line?.styledText ?? "");
-  readline.cursorTo(process.stdout, 0, row);
-  if (styled) {
-    process.stdout.write(`${SELECT_BG}${stripAnsiSgr(styled).padEnd(cols, " ")}${SELECT_BG_RESET}`);
-  } else {
-    process.stdout.write(`${SELECT_BG}${plain.padEnd(cols, " ")}${SELECT_BG_RESET}`);
+function getSelectionColRange(row) {
+  if (!selectionActive || !selectionAnchor || !selectionEnd) {
+    return null;
   }
+  const r1 = selectionAnchor.row;
+  const r2 = selectionEnd.row;
+  const c1 = selectionAnchor.col;
+  const c2 = selectionEnd.col;
+  const top = Math.min(r1, r2);
+  const bottom = Math.max(r1, r2);
+  if (row < top || row > bottom) {
+    return null;
+  }
+
+  let start;
+  let end;
+  if (top === bottom) {
+    start = Math.min(c1, c2);
+    end = Math.max(c1, c2);
+  } else if (row === top) {
+    start = row === r1 ? c1 : c2;
+    end = Infinity;
+  } else if (row === bottom) {
+    start = 0;
+    end = row === r1 ? c1 : c2;
+  } else {
+    start = 0;
+    end = Infinity;
+  }
+  if (start < 0) {
+    start = 0;
+  }
+  if (end === Infinity || end < start) {
+    end = start + 9999;
+  }
+  return { start, end };
+}
+
+function writeSelectedLine(row, line, cols) {
+  // Character-level highlight: only the cells within the selection column
+  // range get the background; the rest renders normally (no whole-line tint).
+  const plain = String(line?.text ?? "");
+  const range = getSelectionColRange(row);
+  readline.cursorTo(process.stdout, 0, row);
+  let out = "";
+  if (!range) {
+    out = `${SELECT_BG}${plain.padEnd(cols, " ")}${SELECT_BG_RESET}`;
+  } else {
+    for (let i = 0; i < cols; i += 1) {
+      if (i >= range.start && i <= range.end) {
+        out += `${SELECT_BG}${i < plain.length ? plain[i] : " "}${SELECT_BG_RESET}`;
+      } else {
+        out += i < plain.length ? plain[i] : " ";
+      }
+    }
+  }
+  process.stdout.write(`${out}${SELECT_BG_RESET}`);
 }
 
 function isRowSelected(row) {
@@ -6709,6 +6768,8 @@ function renderFrame(forceChatRefresh = false) {
     lastRenderableMessageCount = -1;
   }
 
+  const selectionOnlyChatRefresh =
+    selectionActive && !forceChatRefresh;
   const needsChatRefresh =
     !APPEND_CHAT_TO_SCROLLBACK &&
     (forceChatRefresh ||
@@ -6722,8 +6783,13 @@ function renderFrame(forceChatRefresh = false) {
   if (needsChatRefresh) {
     const oldChatHeight = lastChatAreaHeight ?? 0;
     const chatClearHeight = Math.max(chatAreaHeight, oldChatHeight);
-    for (let y = 0; y < chatClearHeight; y += 1) {
-      writeLine(y, "", cols);
+    // During a selection drag we repaint rows anyway; clearing the whole
+    // region each motion causes flicker. Skip the clear when only the
+    // selection changed and no layout/messages changed.
+    if (!selectionOnlyChatRefresh) {
+      for (let y = 0; y < chatClearHeight; y += 1) {
+        writeLine(y, "", cols);
+      }
     }
 
     const chatStartRow = Math.max(0, chatAreaHeight - chatVisualLines.length);
