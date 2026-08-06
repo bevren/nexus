@@ -8,8 +8,15 @@ Supports the invocation shapes index.js uses with system python:
 Importing tools here statically ensures PyInstaller bundles tools.py and all
 its dependencies (difflib, urllib, harness, skills_deps, ...) into the PYZ.
 """
+import asyncio
+import base64
+import contextlib
+import io
 import os
 import sys
+import textwrap
+import traceback
+import ast
 
 import tools
 
