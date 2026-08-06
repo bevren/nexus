@@ -3,6 +3,7 @@ require = createRequire(__filename);
 
 const readline = require("readline");
 const fs = require("fs/promises");
+const fsSync = require("fs");
 const path = require("path");
 const os = require("os");
 const { execFile } = require("child_process");
@@ -639,7 +640,7 @@ function getBundledPythonExe() {
   ];
   for (const candidate of candidates) {
     try {
-      if (fs.existsSync(candidate)) {
+      if (fsSync.existsSync(candidate)) {
         return candidate;
       }
     } catch {
