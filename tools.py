@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from collections import Counter
 from uuid import uuid4
 from typing import Iterable
+import harness
 
 WORKSPACE_ROOT = Path.cwd().resolve()
 NEXUS_DIR = Path.home() / ".nexus"
@@ -2023,6 +2024,124 @@ def get_skill(name: str) -> dict[str, object]:
         "error": f"skill not found: {key}" + (f" (available: {', '.join(names)})" if names else ""),
     }
 
+
+
+# --- RLM subagents + continual harness (Prime Agent-style interfaces) ---
+
+def rlm_spawn(
+    prompt: str,
+    model: str = "",
+    system: str = "",
+    timeout: int = 300,
+    max_tokens: int = 2048,
+    template: str = "",
+) -> dict:
+    """Spawn a child sub-agent. Returns an admission handle (id, status) immediately.
+    Poll with list_subagents() or delete with delete_subagent(handle_id)."""
+    try:
+        if template:
+            handle = harness.rlm(prompt, template=template, timeout=timeout, max_tokens=max_tokens)
+        else:
+            handle = harness.rlm(
+                prompt,
+                model=model or None,
+                system=system or None,
+                timeout=timeout,
+                max_tokens=max_tokens,
+            )
+        return handle.to_dict()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def list_subagents() -> list[dict]:
+    """List spawned child sub-agents with status, prompt, result, error."""
+    try:
+        return harness.rlm.list_subagents()
+    except Exception as exc:
+        return [{"ok": False, "error": str(exc)}]
+
+
+def delete_subagent(handle_id: str) -> dict:
+    """Delete a spawned child sub-agent by handle id."""
+    try:
+        return harness.rlm.delete_subagent(handle_id)
+    except Exception as exc:
+        return {"deleted": False, "error": str(exc)}
+
+
+def harness_overview() -> dict:
+    """Continual harness overview: memories, skills, subagent templates, prompt notes, refinements."""
+    try:
+        return harness.rlm.harness.overview()
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def harness_memory(key: str, content: str = "", delete: bool = False) -> dict:
+    """Create/update/delete a persistent harness memory by key."""
+    try:
+        h = harness.rlm.harness
+        if delete:
+            return h.delete_memory(key)
+        return h.create_memory(key, content)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def harness_prompt_note(name: str, content: str = "", delete: bool = False) -> dict:
+    """Create/update/delete a persistent harness prompt note by name."""
+    try:
+        h = harness.rlm.harness
+        if delete:
+            return h.delete_prompt_note(name)
+        return h.create_prompt_note(name, content)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def harness_subagent(name: str, prompt: str = "", model: str = "", system: str = "", delete: bool = False) -> dict:
+    """Persist a reusable subagent template (create/update/delete by name)."""
+    try:
+        h = harness.rlm.harness
+        if delete:
+            return h.delete_subagent(name)
+        if prompt:
+            return h.update_subagent(name, prompt=prompt, model=model or None, system=system or None)
+        return h.create_subagent(name, prompt or name, model=model or None, system=system or None)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def harness_skill(name: str, description: str = "", body: str = "", delete: bool = False) -> dict:
+    """Create/update/delete a skill in the continual harness (writes ~/.nexus/skills/<name>/SKILL.md)."""
+    try:
+        h = harness.rlm.harness
+        if delete:
+            return h.delete_skill(name)
+        if body:
+            return h.create_skill(name, description, body)
+        return h.update_skill(name, description=description or None, body=None)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def record_refinement(summary: str, evidence: str = "") -> dict:
+    """Persist a reusable pattern into the continual harness with supporting evidence."""
+    try:
+        return harness.rlm.harness.record_refinement(summary, evidence)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def refine_reflection(auto: bool = True) -> dict:
+    """Auto-synthesize a refinement from recent subagent results and prompt notes."""
+    try:
+        return harness.refine.run(auto=auto)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 FUNCTIONS = {
     "insert_memory": insert_memory,
     "retrieve_memory": retrieve_memory,
@@ -2055,6 +2174,16 @@ FUNCTIONS = {
     "fetch_url": fetch_url,
     "list_skills": list_skills,
     "get_skill": get_skill,
+    "rlm_spawn": rlm_spawn,
+    "list_subagents": list_subagents,
+    "delete_subagent": delete_subagent,
+    "harness_overview": harness_overview,
+    "harness_memory": harness_memory,
+    "harness_prompt_note": harness_prompt_note,
+    "harness_subagent": harness_subagent,
+    "harness_skill": harness_skill,
+    "record_refinement": record_refinement,
+    "refine_reflection": refine_reflection,
     "web_search": web_search,
 }
 
@@ -2091,6 +2220,16 @@ FUNCTION_DESCRIPTIONS = {
     "list_skills": "list_skills() -> dict: List available skills. Returns {skills: [{name, description}], error}.",
     "get_skill": "get_skill(name: str) -> dict: Get a skill by name. Returns {name, description, path, body, error}. Load the body only when using the skill.",
     "web_search": "web_search(query: str, max_results: int = 5) -> dict: Search the web via DuckDuckGo (Lite HTML with Instant Answer fallback). Returns {query, results: [{title, snippet, url}], error}.",
+    "rlm_spawn": "rlm_spawn(prompt: str, model: str = '', system: str = '', timeout: int = 300, max_tokens: int = 2048, template: str = '') -> dict: Spawn a child sub-agent. Returns an admission handle {id, status, prompt} immediately; poll list_subagents() or delete_subagent(id).",
+    "list_subagents": "list_subagents() -> list[dict]: List spawned child sub-agents with status, prompt, result, error.",
+    "delete_subagent": "delete_subagent(handle_id: str) -> dict: Delete a spawned child sub-agent by handle id.",
+    "harness_overview": "harness_overview() -> dict: Continual harness overview: memories, skills, subagent templates, prompt notes, refinements.",
+    "harness_memory": "harness_memory(key: str, content: str = '', delete: bool = False) -> dict: Create/update/delete a persistent harness memory by key.",
+    "harness_prompt_note": "harness_prompt_note(name: str, content: str = '', delete: bool = False) -> dict: Create/update/delete a persistent harness prompt note by name.",
+    "harness_subagent": "harness_subagent(name: str, prompt: str = '', model: str = '', system: str = '', delete: bool = False) -> dict: Persist a reusable subagent template.",
+    "harness_skill": "harness_skill(name: str, description: str = '', body: str = '', delete: bool = False) -> dict: Create/update/delete a skill in the continual harness.",
+    "record_refinement": "record_refinement(summary: str, evidence: str = '') -> dict: Persist a reusable pattern into the continual harness with evidence.",
+    "refine_reflection": "refine_reflection(auto: bool = True) -> dict: Auto-synthesize a refinement from recent subagent results and prompt notes.",
 }
 
 
