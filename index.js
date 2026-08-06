@@ -75,6 +75,7 @@ const DEFAULT_LLM_REQUEST_TIMEOUT_MS = 120000;
 const MIN_LLM_REQUEST_TIMEOUT_MS = 10000;
 const MAX_LLM_REQUEST_TIMEOUT_MS = 600000;
 const THINKING_ANIMATION_INTERVAL_MS = 320;
+const SHINE_ANIMATION_INTERVAL_MS = 33;
 const THINKING_FRAMES = ["Thinking   ", "Thinking.  ", "Thinking.. ", "Thinking..."];
 const SPINNER_FRAMES = ["\u280b", "\u2819", "\u2839", "\u2838", "\u283c", "\u2834", "\u2826", "\u2827", "\u2807", "\u280f"];
 const APPEND_COMPOSER_FIXED_ROWS = 8;
@@ -309,6 +310,7 @@ let systemPromptLoadPromise = null;
 let thinkingAnimationTimer = null;
 let thinkingFrameIndex = 0;
 let shineFrameIndex = 0;
+let shineAnimationTimer = null;
 let thinkingStartedAt = 0;
 let activeToolRun = null; // { label, startedAt, done, ok }
 let contextLeftPercentByModel = {};
@@ -1109,6 +1111,10 @@ function cleanupTerminal(options = {}) {
   if (thinkingAnimationTimer) {
     clearInterval(thinkingAnimationTimer);
     thinkingAnimationTimer = null;
+  }
+  if (shineAnimationTimer) {
+    clearInterval(shineAnimationTimer);
+    shineAnimationTimer = null;
   }
   clearMouseSelectionTimer();
   mouseSelectionMode = false;
@@ -4970,28 +4976,45 @@ function updateThinkingAnimationState() {
       clearInterval(thinkingAnimationTimer);
       thinkingAnimationTimer = null;
     }
+    if (shineAnimationTimer) {
+      clearInterval(shineAnimationTimer);
+      shineAnimationTimer = null;
+    }
     thinkingFrameIndex = 0;
     shineFrameIndex = 0;
     return;
   }
 
-  if (thinkingAnimationTimer) {
-    return;
-  }
+  if (!thinkingAnimationTimer) {
+    thinkingAnimationTimer = setInterval(() => {
+      if (activeBuffer !== "main" || !isAssistantThinking()) {
+        updateThinkingAnimationState();
+        markDirty();
+        renderFrame(false);
+        return;
+      }
 
-  thinkingAnimationTimer = setInterval(() => {
-    if (activeBuffer !== "main" || !isAssistantThinking()) {
-      updateThinkingAnimationState();
+      thinkingFrameIndex = (thinkingFrameIndex + 1) % THINKING_FRAMES.length;
       markDirty();
       renderFrame(false);
-      return;
-    }
+    }, THINKING_ANIMATION_INTERVAL_MS);
+  }
 
-    thinkingFrameIndex = (thinkingFrameIndex + 1) % THINKING_FRAMES.length;
-    shineFrameIndex += 12;
-    markDirty();
-    renderFrame(false);
-  }, THINKING_ANIMATION_INTERVAL_MS);
+  // High-frequency shine: ~30fps smooth left-to-right sweep.
+  if (!shineAnimationTimer) {
+    shineAnimationTimer = setInterval(() => {
+      if (activeBuffer !== "main" || !isAssistantThinking()) {
+        updateThinkingAnimationState();
+        markDirty();
+        renderFrame(false);
+        return;
+      }
+
+      shineFrameIndex += 2;
+      markDirty();
+      renderFrame(false);
+    }, SHINE_ANIMATION_INTERVAL_MS);
+  }
 }
 
 function ensureAppendReservedBottomRows(requiredRows, rows, cols = process.stdout.columns || 80) {
