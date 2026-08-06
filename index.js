@@ -308,6 +308,7 @@ let skillsCatalog = [];
 let systemPromptLoadPromise = null;
 let thinkingAnimationTimer = null;
 let thinkingFrameIndex = 0;
+let shineFrameIndex = 0;
 let thinkingStartedAt = 0;
 let activeToolRun = null; // { label, startedAt, done, ok }
 let contextLeftPercentByModel = {};
@@ -4935,7 +4936,7 @@ function getStatusBarText() {
     thinkingStartedAt > 0 ? Math.floor((Date.now() - thinkingStartedAt) / 1000) : 0;
   const symbol = thinkingFrameIndex % 2 === 0 ? "\u2022" : "\u25e6";
   const thinkingText = `${THINKING_FRAMES[thinkingFrameIndex % THINKING_FRAMES.length]} (${elapsedSeconds}s)`;
-  return `${symbol} ${applyShineEffect(thinkingText, thinkingFrameIndex, 5)}`;
+  return `${symbol} ${applyShineEffect(thinkingText, shineFrameIndex, 5)}`;
 }
 
 const SHINE_RESET = "\u001b[0m";
@@ -4954,7 +4955,7 @@ function applyShineEffect(text, frameIndex, windowWidth) {
   const start = phase - win;
   let out = "";
   for (let i = 0; i < text.length; i += 1) {
-    const inWindow = i >= start && i <= phase;
+    const inWindow = i > start && i <= phase;
     out += inWindow ? `${SHINE_BRIGHT}${text[i]}${SHINE_RESET}` : `${SHINE_DIM}${text[i]}${SHINE_RESET}`;
   }
   // Add a dim reset so the status line doesn't leak styling into the rest of the frame.
@@ -4970,6 +4971,7 @@ function updateThinkingAnimationState() {
       thinkingAnimationTimer = null;
     }
     thinkingFrameIndex = 0;
+    shineFrameIndex = 0;
     return;
   }
 
@@ -4986,6 +4988,7 @@ function updateThinkingAnimationState() {
     }
 
     thinkingFrameIndex = (thinkingFrameIndex + 1) % THINKING_FRAMES.length;
+    shineFrameIndex += 1;
     markDirty();
     renderFrame(false);
   }, THINKING_ANIMATION_INTERVAL_MS);
