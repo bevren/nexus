@@ -215,6 +215,7 @@ let lastFooterTop = null;
 let lastMenuRenderedLines = [];
 let lastStatusTop = null;
 let lastStatusHeight = 0;
+let lastStatusVisible = false;
 let hasInitializedScreen = false;
 let forceFullClearOnNextRender = false;
 let dirty = true;
@@ -6419,6 +6420,14 @@ function renderFrame(forceChatRefresh = false) {
     (lastStatusTop === null ||
       lastStatusTop !== statusBlockTop ||
       lastStatusHeight !== statusBlockHeight);
+  const statusVisibilityChanged = APPEND_CHAT_TO_SCROLLBACK
+    ? false
+    : lastStatusVisible !== statusVisible;
+  if (statusVisibilityChanged && !APPEND_CHAT_TO_SCROLLBACK) {
+    // Cleanly redraw the whole screen when entering/leaving the thinking
+    // state so stale status rows cannot overlap chat or input text.
+    forceFullClearOnNextRender = true;
+  }
 
   if (!APPEND_CHAT_TO_SCROLLBACK && forceFullClearOnNextRender) {
     readline.cursorTo(process.stdout, 0, 0);
@@ -6613,6 +6622,7 @@ function renderFrame(forceChatRefresh = false) {
   lastFooterTop = footerTop;
   lastStatusTop = statusBlockTop;
   lastStatusHeight = statusBlockHeight;
+  lastStatusVisible = statusVisible;
   lastMenuRenderedLines = menuLines.map((line) => ({ ...line }));
   dirty = false;
 }
