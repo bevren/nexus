@@ -628,8 +628,35 @@ function execFileAsync(file, args, options = {}) {
   });
 }
 
+function getBundledPythonExe() {
+  const candidates = [
+    path.join(__dirname, "tools.exe"),
+    path.join(process.cwd(), "tools.exe"),
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    } catch {
+      // continue
+    }
+  }
+  return "";
+}
+
 async function runPythonCommand(args, options = {}) {
   const mergedOptions = { cwd: process.cwd(), windowsHide: true, ...options };
+  const bundledExe = getBundledPythonExe();
+
+  // Prefer a self-contained tools.exe bundled next to this app.
+  if (bundledExe) {
+    const normalized = args.map((arg) =>
+      typeof arg === "string" && path.basename(arg) === "tools.py" ? arg : arg
+    );
+    return await execFileAsync(bundledExe, normalized, mergedOptions);
+  }
+
   try {
     return await execFileAsync("python", args, mergedOptions);
   } catch (error) {
