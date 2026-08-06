@@ -1462,8 +1462,8 @@ def run_shell(command: str, timeout: int | float = 10) -> dict[str, object]:
 
     if timeout_seconds <= 0:
         raise ValueError("timeout must be greater than 0")
-    if timeout_seconds > 120:
-        raise ValueError("timeout must be <= 120 seconds")
+    if timeout_seconds > 600:
+        raise ValueError("timeout must be <= 600 seconds")
 
     try:
         completed = subprocess.run(

@@ -62,7 +62,7 @@ const PASTE_BURST_MIN_CHARS_WITH_NEWLINES = 80;
 const PASTE_BURST_EVENT_THRESHOLD = 3;
 const PASTE_BURST_MIN_CHARS_RAPID_MULTILINE = 24;
 const PASTE_BURST_BLOCK_MS = 250;
-const TOOL_EXEC_TIMEOUT_MS = 8000;
+const TOOL_EXEC_TIMEOUT_MS = 300000;
 const TOOL_EXEC_MAX_STEPS = 120000;
 const TOOL_RESULT_TRUNCATE_WRAP_COLS = 120;
 const TOOL_RESULT_TRUNCATE_MAX_LINES = 14;
@@ -629,7 +629,11 @@ function execFileAsync(file, args, options = {}) {
 }
 
 function getBundledPythonExe() {
+  // Prefer the tools.exe that sits NEXT TO this executable (works when sea.exe
+  // is launched from any cwd via PATH). __dirname resolves to the exe's folder
+  // in SEA, process.execPath is the definitive path.
   const candidates = [
+    path.join(path.dirname(process.execPath), "tools.exe"),
     path.join(__dirname, "tools.exe"),
     path.join(process.cwd(), "tools.exe"),
   ];
