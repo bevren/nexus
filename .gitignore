@@ -4,3 +4,6 @@ sessions/
 tests/
 .npmrc
 __pycache__/
+sea.exe
+sea-prep.blob
+dist/
