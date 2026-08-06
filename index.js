@@ -5790,8 +5790,12 @@ function writeColoredLine(y, rawText, cols, color) {
   readline.cursorTo(process.stdout, 0, y);
   process.stdout.write(`${color}${rawText}${RESET_COLOR}`);
 
-  if (rawText.length < cols) {
-    process.stdout.write(" ".repeat(cols - rawText.length));
+  // Pad by VISIBLE width: ANSI escape codes are invisible but inflate
+  // String.length, which would leave stale text on screen when the status
+  // line shrinks (e.g. "Running: ..." -> "Thinking...").
+  const visibleLength = stripAnsiSgr(rawText).length;
+  if (visibleLength < cols) {
+    process.stdout.write(" ".repeat(cols - visibleLength));
   }
 }
 
