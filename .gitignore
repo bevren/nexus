@@ -1,0 +1,6 @@
+.env
+node_modules/
+sessions/
+tests/
+.npmrc
+__pycache__/

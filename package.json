@@ -1,0 +1,16 @@
+{
+  "name": "simple-code-tui",
+  "version": "1.0.0",
+  "description": "",
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node index.js --self-test-append && node index.js --self-test-format && node --check index.js"
+  },
+  "dependencies": {
+    "openai": "^6.25.0"
+  }
+}

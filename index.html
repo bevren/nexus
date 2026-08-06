@@ -1,0 +1,1232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio Recorder & Player</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 40px;
+            width: 100%;
+            max-width: 500px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 25px 50px rgba(0, 0, 0, 0.3);
+        }
+
+        h1 {
+            color: #fff;
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 1.8rem;
+        }
+
+        .status {
+            text-align: center;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            color: #fff;
+            min-height: 50px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .status.recording {
+            background: rgba(255, 0, 0, 0.2);
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+
+        .visualizer {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 20px;
+            min-height: 120px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        canvas {
+            width: 100%;
+            height: 80px;
+            border-radius: 8px;
+            background: rgba(0, 0, 0, 0.4);
+        }
+
+        .visualizer-hint {
+            color: rgba(255, 255, 255, 0.5);
+            font-size: 0.8rem;
+            margin-top: 8px;
+        }
+
+        .controls {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 25px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .effects {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            margin-bottom: 20px;
+            padding: 15px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 10px;
+        }
+
+        .toggle-container {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: #fff;
+            font-size: 0.9rem;
+        }
+
+        .toggle-switch {
+            position: relative;
+            width: 50px;
+            height: 26px;
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 13px;
+            cursor: pointer;
+            transition: background 0.3s ease;
+        }
+
+        .toggle-switch.active {
+            background: linear-gradient(135deg, #00d2ff 0%, #3a7bd5 100%);
+        }
+
+        .toggle-switch::after {
+            content: '';
+            position: absolute;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background: white;
+            top: 3px;
+            left: 3px;
+            transition: transform 0.3s ease;
+        }
+
+        .toggle-switch.active::after {
+            transform: translateX(24px);
+        }
+
+        .effect-indicator {
+            display: none;
+            background: rgba(255, 100, 100, 0.3);
+            color: #ff6464;
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            animation: pulse 1.5s infinite;
+        }
+
+        .effect-indicator.active {
+            display: inline-block;
+        }
+
+        .pitch-slider {
+            display: none;
+            align-items: center;
+            gap: 10px;
+            padding: 10px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 8px;
+            margin-top: 10px;
+        }
+
+        .pitch-slider.active {
+            display: flex;
+        }
+
+        .robot-style-selector {
+            display: none;
+            align-items: center;
+            gap: 10px;
+            padding: 10px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 8px;
+            margin-top: 10px;
+        }
+
+        .robot-style-selector.active {
+            display: flex;
+        }
+
+        .robot-style-selector select {
+            padding: 8px 15px;
+            border-radius: 20px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            background: rgba(0, 0, 0, 0.3);
+            color: #fff;
+            font-size: 0.9rem;
+            cursor: pointer;
+            outline: none;
+            transition: all 0.3s ease;
+        }
+
+        .robot-style-selector select:hover {
+            border-color: #00d2ff;
+            background: rgba(0, 0, 0, 0.5);
+        }
+
+        .robot-style-selector select:focus {
+            border-color: #00d2ff;
+            box-shadow: 0 0 10px rgba(0, 210, 255, 0.3);
+        }
+
+        .robot-style-selector select option {
+            background: #1a1a2e;
+            color: #fff;
+            padding: 10px;
+        }
+
+        .pitch-label {
+            color: #fff;
+            font-size: 0.85rem;
+            white-space: nowrap;
+        }
+
+        .pitch-value {
+            color: #00d2ff;
+            font-size: 0.85rem;
+            width: 45px;
+            text-align: center;
+        }
+
+        input[type='range'] {
+            -webkit-appearance: none;
+            width: 120px;
+            height: 6px;
+            border-radius: 3px;
+            background: rgba(255, 255, 255, 0.2);
+            outline: none;
+            cursor: pointer;
+        }
+
+        input[type='range']::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #00d2ff 0%, #3a7bd5 100%);
+            cursor: pointer;
+            transition: transform 0.2s ease;
+        }
+
+        input[type='range']::-webkit-slider-thumb:hover {
+            transform: scale(1.2);
+        }
+
+        button {
+            padding: 15px 30px;
+            border: none;
+            border-radius: 50px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        #recordBtn {
+            background: linear-gradient(135deg, #ff4757 0%, #ff6b81 100%);
+            color: white;
+        }
+
+        #recordBtn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(255, 71, 87, 0.3);
+        }
+
+        #stopBtn {
+            background: linear-gradient(135deg, #535c68 0%, #747d8c 100%);
+            color: white;
+        }
+
+        #stopBtn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(83, 92, 104, 0.3);
+        }
+
+        #playBtn {
+            background: linear-gradient(135deg, #2ed573 0%, #7bed9f 100%);
+            color: white;
+        }
+
+        #playBtn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(46, 213, 115, 0.3);
+        }
+
+        #downloadBtn {
+            background: linear-gradient(135deg, #1e90ff 0%, #70a1ff 100%);
+            color: white;
+        }
+
+        #downloadBtn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(30, 144, 255, 0.3);
+        }
+
+        .recorder-info {
+            text-align: center;
+            color: rgba(255, 255, 255, 0.7);
+            font-size: 0.9rem;
+        }
+
+        .time-display {
+            font-family: 'Courier New', monospace;
+            font-size: 1.2rem;
+            margin-left: 5px;
+        }
+
+        .recording-dot {
+            width: 10px;
+            height: 10px;
+            background: #ff4757;
+            border-radius: 50%;
+            display: inline-block;
+        }
+
+        .audio-list {
+            margin-top: 20px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+
+        .audio-item {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .audio-item button {
+            padding: 8px 15px;
+            font-size: 0.8rem;
+        }
+
+        .audio-item .delete-btn {
+            background: linear-gradient(135deg, #ff6b6b 0%, #ee5a5a 100%);
+            margin-left: auto;
+        }
+
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎙️ Audio Recorder</h1>
+        
+        <div class="status" id="status">Ready to record</div>
+        
+        <div class="effects">
+            <div class="toggle-container">
+                <span>🤖 Robotic Effect</span>
+                <div class="toggle-switch" id="roboticToggle"></div>
+            </div>
+            <div class="effect-indicator" id="effectIndicator">🤖 ROBOTIC MODE ACTIVE</div>
+            
+            <div class="robot-style-selector" id="robotStyleSelector">
+                <span class="pitch-label">🎭 Robot Style:</span>
+                <select id="robotStyle">
+                    <option value="terminator">Terminator (T-800)</option>
+                    <option value="r2d2">R2-D2</option>
+                    <option value="wall-e">Wall-E</option>
+                    <option value="c3po">C-3PO</option>
+                </select>
+            </div>
+            
+            <div class="pitch-slider" id="pitchSlider">
+                <span class="pitch-label">🎵 Pitch:</span>
+                <input type="range" id="pitchRange" min="0.5" max="2" step="0.1" value="1">
+                <span class="pitch-value" id="pitchValue">1x</span>
+            </div>
+        </div>
+        
+        <div class="visualizer" id="visualizer">
+            <canvas id="visualizerCanvas"></canvas>
+            <div class="visualizer-hint" id="visualizerHint">Ready to record</div>
+        </div>
+
+        <div class="controls">
+            <button id="recordBtn">
+                <span>●</span> Record
+            </button>
+            <button id="stopBtn" disabled>
+                <span>■</span> Stop
+            </button>
+            <button id="playBtn" disabled>
+                <span>▶</span> Play
+            </button>
+            <button id="downloadBtn" disabled>
+                <span>↓</span> Download
+            </button>
+        </div>
+
+        <p class="recorder-info">
+            Recording time: <span class="time-display" id="timer">00:00:00</span>
+        </p>
+
+        <div class="audio-list" id="audioList"></div>
+    </div>
+
+    <script>
+        // State variables
+        let mediaRecorder = null;
+        let audioChunks = [];
+        let audioBlob = null;
+        let audioUrl = null;
+        let startTime = null;
+        let timerInterval = null;
+        let animationFrame = null;
+        let analyser = null;
+        let dataArray = null;
+        
+        // Robotic effect variables
+        let audioContext = null;
+        let sourceNode = null;
+        let roboticEffectNode = null;
+        let isRoboticEffectEnabled = false;
+        let currentRobotStyle = 'terminator';
+        let pitchFactor = 1;
+        let stream = null;
+        
+        // Store all recordings
+        const recordings = [];
+        let currentRecordingId = 0;
+
+        // Check browser support
+        function checkBrowserSupport() {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                return false;
+            }
+            
+            if (!window.MediaRecorder) {
+                return false;
+            }
+            
+            return true;
+        }
+
+        // Enhanced error logging
+        function logError(message, error) {
+            console.error(`[${new Date().toLocaleTimeString()}] ${message}:`, error);
+            updateStatus(`Error: ${message}. Check browser console for details.`, 'error');
+        }
+
+        // DOM Elements
+        const recordBtn = document.getElementById('recordBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const playBtn = document.getElementById('playBtn');
+        const downloadBtn = document.getElementById('downloadBtn');
+        const status = document.getElementById('status');
+        const timer = document.getElementById('timer');
+        const visualizer = document.getElementById('visualizer');
+        const audioList = document.getElementById('audioList');
+        
+        // Check support on page load
+        if (!checkBrowserSupport()) {
+            updateStatus('Your browser does not support audio recording. Try Chrome, Firefox, or Edge.', 'error');
+        } else {
+            updateStatus('Ready to record', 'ready');
+        }
+
+        // Canvas for audio visualization (global variables)
+        let canvas = null;
+        let ctx = null;
+        let visualizerHint = null;
+        
+        // Robotic effect DOM elements
+        let roboticToggle = null;
+        let effectIndicator = null;
+        let robotStyleSelector = null;
+        let robotStyle = null;
+        let pitchSlider = null;
+        let pitchRange = null;
+        let pitchValue = null;
+        
+        // Initialize canvas and robotic effect when DOM is ready
+        document.addEventListener('DOMContentLoaded', () => {
+            canvas = document.getElementById('visualizerCanvas');
+            ctx = canvas ? canvas.getContext('2d') : null;
+            visualizerHint = document.getElementById('visualizerHint');
+            
+            roboticToggle = document.getElementById('roboticToggle');
+            effectIndicator = document.getElementById('effectIndicator');
+            robotStyleSelector = document.getElementById('robotStyleSelector');
+            robotStyle = document.getElementById('robotStyle');
+            pitchSlider = document.getElementById('pitchSlider');
+            pitchRange = document.getElementById('pitchRange');
+            pitchValue = document.getElementById('pitchValue');
+            
+            // Initialize pitch effect
+            if (pitchRange && pitchValue) {
+                pitchFactor = parseFloat(pitchRange.value);
+                pitchValue.textContent = pitchRange.value + 'x';
+            }
+            
+            if (!canvas || !ctx) {
+                console.error('Canvas not found. Make sure the HTML includes <canvas id="visualizerCanvas"></canvas>');
+                if (visualizerHint) {
+                    visualizerHint.textContent = 'Canvas element missing';
+                }
+            } else {
+                console.log('Canvas initialized');
+            }
+            
+            // Setup robotic effect toggle
+            if (roboticToggle) {
+                roboticToggle.addEventListener('click', toggleRoboticEffect);
+            }
+            
+            // Setup robot style selector
+            if (robotStyle) {
+                robotStyle.addEventListener('change', updateRobotStyle);
+            }
+            
+            // Setup pitch slider
+            if (pitchRange && pitchValue) {
+                pitchRange.addEventListener('input', updatePitchValue);
+                // Initialize current value
+                pitchValue.textContent = pitchRange.value + 'x';
+            }
+            
+            console.log('All elements initialized');
+        });
+
+        // Start recording
+        async function startRecording() {
+            console.log('Starting recording...');
+            
+            // Check browser support
+            if (!checkBrowserSupport()) {
+                updateStatus('Browser not supported. Try Chrome, Firefox, or Edge.', 'error');
+                return;
+            }
+            
+            try {
+                console.log('Requesting microphone access...');
+                stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                audioChunks = [];
+
+                let recordingStream = stream;
+                
+                // Apply robotic effect if enabled
+                if (isRoboticEffectEnabled) {
+                    console.log('🤖 APPLYING EXTREME ROBOTIC EFFECT...');
+                    
+                    // Create audio context
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    
+                    // Create TERMINATOR-style robotic effect (T-800)
+                    const robotEffect = {
+                        // Minimal distortion for metallic edge
+                        distortion: audioContext.createWaveShaper(),
+                        // Lowpass for deep muffled sound
+                        lowpass: audioContext.createBiquadFilter(),
+                        // Highpass to remove mud
+                        highpass: audioContext.createBiquadFilter(),
+                        // Short delay for echo
+                        delay: audioContext.createDelay(),
+                        delayFeedback: audioContext.createGain(),
+                        // LFO for subtle mechanical modulation
+                        lfo: audioContext.createOscillator(),
+                        lfoGain: audioContext.createGain(),
+                        // Gains
+                        dryGain: audioContext.createGain(),
+                        wetGain: audioContext.createGain(),
+                        delayGain: audioContext.createGain()
+                    };
+                    
+                    // Light distortion - just enough for metallic edge
+                    robotEffect.distortion.curve = createDistortionCurve(100);
+                    robotEffect.distortion.oversample = '4x';
+                    
+                    // Lowpass for deep Terminator sound
+                    robotEffect.lowpass.type = 'lowpass';
+                    robotEffect.lowpass.frequency.value = 1500;
+                    robotEffect.lowpass.Q.value = 2;
+                    
+                    // Highpass to remove muddy lows
+                    robotEffect.highpass.type = 'highpass';
+                    robotEffect.highpass.frequency.value = 150;
+                    
+                    // Short delay for robotic echo
+                    robotEffect.delay.delayTime.value = 0.08; // 80ms
+                    robotEffect.delayFeedback.gain.value = 0.3; // Light feedback
+                    robotEffect.delayGain.gain.value = 0.5; // Delay volume
+                    
+                    // VERY SLOW LFO for mechanical modulation
+                    robotEffect.lfo.type = 'sine';
+                    robotEffect.lfo.frequency.value = 0.5; // Very slow (2 second cycle)
+                    robotEffect.lfoGain.gain.value = 100; // Subtle modulation
+                    robotEffect.lfo.connect(robotEffect.lfoGain);
+                    robotEffect.lfoGain.connect(robotEffect.lowpass.frequency);
+                    robotEffect.lfo.start();
+                    
+                    // Mix: mostly effect, slight dry for presence
+                    robotEffect.dryGain.gain.value = 0.2; // Small amount of clean
+                    robotEffect.wetGain.gain.value = 1.0; // Full effect
+                    
+                    // Create microphone source
+                    const micSource = audioContext.createMediaStreamSource(stream);
+                    console.log('Microphone source created');
+                    
+                    // Signal chain: mic -> distortion -> filters -> wet output
+                    micSource.connect(robotEffect.dryGain); // Clean voice
+                    micSource.connect(robotEffect.distortion); // Processed voice
+                    robotEffect.distortion.connect(robotEffect.highpass);
+                    robotEffect.highpass.connect(robotEffect.lowpass);
+                    robotEffect.lowpass.connect(robotEffect.wetGain);
+                    
+                    // Add delay feedback loop
+                    robotEffect.wetGain.connect(robotEffect.delay);
+                    robotEffect.delay.connect(robotEffect.delayFeedback);
+                    robotEffect.delayFeedback.connect(robotEffect.delay);
+                    robotEffect.delay.connect(robotEffect.delayGain);
+                    robotEffect.delayGain.connect(robotEffect.wetGain);
+                    
+                    // Create destination
+                    const destination = audioContext.createMediaStreamDestination();
+                    robotEffect.dryGain.connect(destination);
+                    robotEffect.wetGain.connect(destination);
+                    
+                    console.log('🤖 TERMINATOR EFFECT ACTIVE - I will be back!');
+                    recordingStream = destination.stream;
+                }
+
+                mediaRecorder = new MediaRecorder(recordingStream);
+                
+                mediaRecorder.ondataavailable = (event) => {
+                    if (event.data.size > 0) {
+                        audioChunks.push(event.data);
+                    }
+                };
+
+                mediaRecorder.onstop = () => {
+                    stream.getTracks().forEach(track => track.stop());
+                    audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                    const newRecordingId = ++currentRecordingId;
+                    const newAudioUrl = URL.createObjectURL(audioBlob);
+                    
+                    // Store this recording
+                    recordings.push({
+                        id: newRecordingId,
+                        url: newAudioUrl,
+                        blob: audioBlob,
+                        timestamp: Date.now()
+                    });
+                    
+                    // Set as current recording
+                    audioUrl = newAudioUrl;
+                    
+                    stopTimer();
+                    playBtn.disabled = false;
+                    downloadBtn.disabled = false;
+                    addAudioToHistory(newRecordingId);
+                    updateStatus('Recording saved! Press Play to listen.', 'ready');
+                };
+
+                mediaRecorder.start(100); // Collect data every 100ms
+                startTime = Date.now();
+                startTimer();
+                
+                // Setup audio visualizer
+                const visualizerAudioContext = new AudioContext();
+                const source = visualizerAudioContext.createMediaStreamSource(stream);
+                analyser = visualizerAudioContext.createAnalyser();
+                analyser.fftSize = 64;
+                source.connect(analyser);
+                dataArray = new Uint8Array(analyser.frequencyBinCount);
+                
+                // Store reference to close later
+                window.visualizerAudioContext = visualizerAudioContext;
+                
+                animateVisualizer();
+                
+                recordBtn.disabled = true;
+                stopBtn.disabled = false;
+                updateStatus('🔴 Recording...', 'recording');
+
+            } catch (error) {
+                logError('Error accessing microphone', error);
+                
+                // Specific error messages
+                if (error.name === 'NotAllowedError') {
+                    updateStatus('Microphone permission denied. Please enable it in your browser settings.', 'error');
+                } else if (error.name === 'NotFoundError') {
+                    updateStatus('No microphone found. Please connect a microphone.', 'error');
+                } else if (error.name === 'AbortError') {
+                    updateStatus('Request for microphone timed out.', 'error');
+                } else {
+                    updateStatus(`Error: ${error.message || 'Unknown error'}. Check browser console.`, 'error');
+                }
+            }
+        }
+
+        // Stop recording
+        function stopRecording() {
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                mediaRecorder.stop();
+                stopVisualizer();
+                recordBtn.disabled = false;
+            }
+        }
+
+        // Play audio
+        function playAudio() {
+            const lastRecording = recordings[recordings.length - 1];
+            if (lastRecording) {
+                const audio = new Audio(lastRecording.url);
+                
+                // Setup visualizer for playback
+                setupAudioVisualizer(audio);
+                
+                audio.play();
+                updateStatus('▶ Playing...', 'playing');
+                audio.onended = () => {
+                    updateStatus('Playback finished', 'ready');
+                    stopPlaybackVisualizer();
+                };
+            }
+        }
+
+        // Download audio
+        function downloadAudio() {
+            const lastRecording = recordings[recordings.length - 1];
+            if (lastRecording && lastRecording.blob) {
+                const url = URL.createObjectURL(lastRecording.blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `recording_${lastRecording.id}.webm`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                updateStatus('Recording downloaded!', 'ready');
+            }
+        }
+
+        // Timer functions
+        function startTimer() {
+            timerInterval = setInterval(() => {
+                const elapsed = Date.now() - startTime;
+                timer.textContent = formatTime(elapsed);
+            }, 100);
+        }
+
+        function stopTimer() {
+            if (timerInterval) {
+                clearInterval(timerInterval);
+                timerInterval = null;
+            }
+        }
+
+        function formatTime(ms) {
+            const totalSeconds = Math.floor(ms / 1000);
+            const hours = Math.floor(totalSeconds / 3600);
+            const minutes = Math.floor((totalSeconds % 3600) / 60);
+            const seconds = totalSeconds % 60;
+            return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+        }
+
+        // Visualizer animation - draw waveform
+        function animateVisualizer() {
+            if (!analyser || !ctx) {
+                console.log('Analyser or ctx not ready yet');
+                return;
+            }
+            
+            analyser.getByteTimeDomainData(dataArray);
+            
+            // Clear canvas
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            // Set canvas size to match display size
+            const rect = canvas.getBoundingClientRect();
+            canvas.width = rect.width;
+            canvas.height = rect.height;
+            
+            // Draw waveform
+            ctx.lineWidth = 2;
+            ctx.strokeStyle = '#00d2ff';
+            ctx.shadowBlur = 10;
+            ctx.shadowColor = '#00d2ff';
+            
+            ctx.beginPath();
+            
+            const sliceWidth = canvas.width / dataArray.length;
+            let x = 0;
+            
+            for (let i = 0; i < dataArray.length; i++) {
+                const v = dataArray[i] / 128.0;
+                const y = (v * canvas.height) / 2;
+                
+                if (i === 0) {
+                    ctx.moveTo(x, y);
+                } else {
+                    ctx.lineTo(x, y);
+                }
+                
+                x += sliceWidth;
+            }
+            
+            ctx.lineTo(canvas.width, canvas.height / 2);
+            ctx.stroke();
+            
+            // Update hint text
+            const maxAmplitude = Math.max(...dataArray);
+            if (maxAmplitude > 200) {
+                visualizerHint.textContent = '🔴 Recording... Loud';
+                visualizerHint.style.color = '#ff4757';
+            } else if (maxAmplitude > 150) {
+                visualizerHint.textContent = '🔴 Recording...';
+                visualizerHint.style.color = '#ffd23f';
+            } else if (maxAmplitude > 50) {
+                visualizerHint.textContent = '🔴 Recording... Quiet';
+                visualizerHint.style.color = '#2ed573';
+            } else {
+                visualizerHint.textContent = '🔴 Recording... (speak louder)';
+                visualizerHint.style.color = '#7bed9f';
+            }
+            
+            animationFrame = requestAnimationFrame(animateVisualizer);
+        }
+
+        function stopVisualizer() {
+            if (animationFrame) {
+                cancelAnimationFrame(animationFrame);
+                animationFrame = null;
+            }
+            
+            // Close visualizer audio context
+            if (window.visualizerAudioContext) {
+                window.visualizerAudioContext.close();
+                window.visualizerAudioContext = null;
+            }
+            
+            // Clear canvas (check if canvas exists)
+            if (ctx && canvas) {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+            }
+            
+            // Reset hint
+            visualizerHint.textContent = 'Ready to record';
+            visualizerHint.style.color = 'rgba(255, 255, 255, 0.5)';
+        }
+
+        // Update status
+        function updateStatus(message, type = 'ready') {
+            status.textContent = message;
+            status.className = 'status ' + type;
+        }
+
+        // Add audio to history
+        function addAudioToHistory(recordingId) {
+            const item = document.createElement('div');
+            item.className = 'audio-item';
+            item.dataset.recordingId = recordingId;
+            item.innerHTML = `
+                <span>Recording ${new Date(Date.now()).toLocaleTimeString()}</span>
+                <button class="play-btn">Play</button>
+                <button class="delete-btn">Delete</button>
+            `;
+            
+            item.querySelector('.play-btn').onclick = () => {
+                try {
+                    const recording = recordings.find(r => r.id === recordingId);
+                    if (recording) {
+                        const audio = new Audio(recording.url);
+                        
+                        // Setup visualizer for playback
+                        if (ctx && canvas) {
+                            setupAudioVisualizer(audio);
+                        }
+                        
+                        audio.play();
+                        updateStatus('▶ Playing recording...', 'playing');
+                        audio.onended = () => {
+                            updateStatus('Playback finished', 'ready');
+                            stopPlaybackVisualizer();
+                        };
+                    }
+                } catch (err) {
+                    logError('Error playing audio from history', err);
+                }
+            };
+            
+            item.querySelector('.delete-btn').onclick = () => {
+                item.remove();
+            };
+            
+            audioList.prepend(item);
+        }
+
+        // Event listeners
+        recordBtn.addEventListener('click', startRecording);
+        stopBtn.addEventListener('click', stopRecording);
+        playBtn.addEventListener('click', playAudio);
+        downloadBtn.addEventListener('click', downloadAudio);
+
+        // Setup audio visualizer for playback
+        let playbackAudioContext = null;
+        let playbackSource = null;
+        let playbackAnalyser = null;
+        let playbackAnimationId = null;
+        
+        function setupAudioVisualizer(audioElement) {
+            // Create audio context for playback visualization
+            if (playbackAudioContext) {
+                playbackAudioContext.close();
+            }
+            
+            playbackAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+            playbackAnalyser = playbackAudioContext.createAnalyser();
+            playbackAnalyser.fftSize = 256;
+            
+            playbackSource = playbackAudioContext.createMediaElementSource(audioElement);
+            playbackSource.connect(playbackAnalyser);
+            playbackAnalyser.connect(playbackAudioContext.destination);
+            
+            // Start visualization
+            visualizePlayback();
+        }
+        
+        function visualizePlayback() {
+            if (!ctx || !canvas) return;
+            
+            const playbackDataArray = new Uint8Array(playbackAnalyser.frequencyBinCount);
+            
+            function draw() {
+                if (!playbackAnalyser) return;
+                
+                playbackAnalyser.getByteTimeDomainData(playbackDataArray);
+                
+                // Clear canvas
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                
+                // Set canvas size to match display size
+                const rect = canvas.getBoundingClientRect();
+                canvas.width = rect.width;
+                canvas.height = rect.height;
+                
+                // Draw waveform
+                ctx.lineWidth = 2;
+                ctx.strokeStyle = '#2ed573'; // Green color for playback
+                ctx.shadowBlur = 10;
+                ctx.shadowColor = '#2ed573';
+                
+                ctx.beginPath();
+                
+                const sliceWidth = canvas.width / playbackDataArray.length;
+                let x = 0;
+                
+                for (let i = 0; i < playbackDataArray.length; i++) {
+                    const v = playbackDataArray[i] / 128.0;
+                    const y = (v * canvas.height) / 2;
+                    
+                    if (i === 0) {
+                        ctx.moveTo(x, y);
+                    } else {
+                        ctx.lineTo(x, y);
+                    }
+                    
+                    x += sliceWidth;
+                }
+                
+                ctx.lineTo(canvas.width, canvas.height / 2);
+                ctx.stroke();
+                
+                // Update hint
+                if (visualizerHint) {
+                    visualizerHint.textContent = '▶ Playback...';
+                    visualizerHint.style.color = '#7bed9f';
+                }
+                
+                playbackAnimationId = requestAnimationFrame(draw);
+            }
+            
+            draw();
+        }
+        
+        function stopPlaybackVisualizer() {
+            if (playbackAnimationId) {
+                cancelAnimationFrame(playbackAnimationId);
+                playbackAnimationId = null;
+            }
+            
+            if (playbackAudioContext) {
+                playbackAudioContext.close();
+                playbackAudioContext = null;
+                playbackAnalyser = null;
+                playbackSource = null;
+            }
+            
+            // Clear canvas
+            if (ctx && canvas) {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+            }
+            
+            // Reset hint
+            if (visualizerHint) {
+                visualizerHint.textContent = 'Ready to record';
+                visualizerHint.style.color = 'rgba(255, 255, 255, 0.5)';
+            }
+        }
+
+        // Toggle robotic effect
+        function toggleRoboticEffect() {
+            isRoboticEffectEnabled = !isRoboticEffectEnabled;
+            
+            if (isRoboticEffectEnabled) {
+                roboticToggle.classList.add('active');
+                if (effectIndicator) {
+                    effectIndicator.classList.add('active');
+                }
+                // Show robot style selector when robotic effect is enabled
+                if (robotStyleSelector) {
+                    robotStyleSelector.classList.add('active');
+                }
+                // Show pitch slider when robotic effect is enabled
+                if (pitchSlider) {
+                    pitchSlider.classList.add('active');
+                }
+                updateEffectIndicator();
+                console.log('🤖 Robotic effect enabled');
+            } else {
+                roboticToggle.classList.remove('active');
+                if (effectIndicator) {
+                    effectIndicator.classList.remove('active');
+                }
+                // Hide robot style selector when robotic effect is disabled
+                if (robotStyleSelector) {
+                    robotStyleSelector.classList.remove('active');
+                }
+                // Hide pitch slider when robotic effect is disabled
+                if (pitchSlider) {
+                    pitchSlider.classList.remove('active');
+                }
+                console.log('Robotic effect disabled');
+            }
+        }
+        
+        // Update robot style
+        function updateRobotStyle() {
+            if (robotStyle) {
+                currentRobotStyle = robotStyle.value;
+                updateEffectIndicator();
+                console.log(`🤖 Robot style changed to: ${currentRobotStyle}`);
+            }
+        }
+        
+        // Update effect indicator text based on robot style
+        function updateEffectIndicator() {
+            if (!effectIndicator) return;
+            
+            const styleNames = {
+                'terminator': '🤖 TERMINATOR (T-800)',
+                'r2d2': '🤖 R2-D2',
+                'wall-e': '🤖 WALL-E',
+                'c3po': '🤖 C-3PO'
+            };
+            
+            effectIndicator.textContent = styleNames[currentRobotStyle] || '🤖 ROBOTIC MODE ACTIVE';
+        }
+        
+        // Update pitch value display
+        function updatePitchValue() {
+            if (pitchRange && pitchValue) {
+                pitchFactor = parseFloat(pitchRange.value);
+                pitchValue.textContent = pitchFactor + 'x';
+                
+                if (pitchFactor > 1) {
+                    pitchValue.style.color = '#ff6b6b';
+                } else if (pitchFactor < 1) {
+                    pitchValue.style.color = '#2ed573';
+                } else {
+                    pitchValue.style.color = '#00d2ff';
+                }
+            }
+        }
+
+        // Apply super robotic audio effect using Wave Shaper
+        function createRoboticEffect(audioCtx) {
+            const audioContext = audioCtx || (window.AudioContext || window.webkitAudioContext)();
+            
+            // EXTREME distortion - very aggressive wave shaping
+            const waveShaper1 = audioContext.createWaveShaper();
+            waveShaper1.curve = createDistortionCurve(400);
+            waveShaper1.oversample = '4x';
+            
+            const waveShaper2 = audioContext.createWaveShaper();
+            waveShaper2.curve = createDistortionCurve(7000);
+            waveShaper2.oversample = '4x';
+            
+            // EXTREME Lowpass filter for muffled robot voice
+            const lowpass = audioContext.createBiquadFilter();
+            lowpass.type = 'lowpass';
+            lowpass.frequency.value = 800;
+            lowpass.Q.value = 15;
+            
+            // Multiple bandpass filters for formant shifting
+            const bandpass1 = audioContext.createBiquadFilter();
+            bandpass1.type = 'bandpass';
+            bandpass1.frequency.value = 700;
+            bandpass1.Q.value = 15;
+            
+            const bandpass2 = audioContext.createBiquadFilter();
+            bandpass2.type = 'bandpass';
+            bandpass2.frequency.value = 1800;
+            bandpass2.Q.value = 25;
+            
+            // Highpass filter for electronic tone
+            const highpass = audioContext.createBiquadFilter();
+            highpass.type = 'highpass';
+            highpass.frequency.value = 80;
+            highpass.Q.value = 0.5;
+            
+            // Gain nodes for effect mixing
+            const dryGain = audioContext.createGain();
+            const wetGain = audioContext.createGain();
+            const effectMix = audioContext.createGain();
+            
+            // Almost pure robotic - eliminate dry signal
+            dryGain.gain.value = 0.5;
+            wetGain.gain.value = 1.8;
+            effectMix.gain.value = 4.0; // Maximum effect boost
+            
+            // EXTREME Fast LFO for robot wobble
+            const lfo1 = audioContext.createOscillator();
+            const lfo1Gain = audioContext.createGain();
+            lfo1.frequency.value = 20; // Very fast modulation
+            lfo1Gain.gain.value = 10000; // MASSIVE robot modulation
+            lfo1.connect(lfo1Gain);
+            lfo1Gain.connect(bandpass1.frequency);
+            lfo1Gain.connect(bandpass2.frequency);
+            lfo1.start();
+            
+            // Second LFO for additional modulation
+            const lfo2 = audioContext.createOscillator();
+            const lfo2Gain = audioContext.createGain();
+            lfo2.frequency.value = 8; // Faster modulation
+            lfo2Gain.gain.value = 5000; // EXTREME wah modulation
+            lfo2.connect(lfo2Gain);
+            lfo2Gain.connect(lowpass.frequency);
+            lfo2Gain.connect(highpass.frequency);
+            lfo2.start();
+            
+            // Third LFO for extreme wah-wah effect
+            const lfo3 = audioContext.createOscillator();
+            const lfo3Gain = audioContext.createGain();
+            lfo3.frequency.value = 5; 
+            lfo3Gain.gain.value = 8000; // MASSIVE wah effect
+            lfo3.connect(lfo3Gain);
+            lfo3Gain.connect(lowpass.frequency);
+            lfo3.start();
+            
+            return {
+                waveShaper1,
+                waveShaper2,
+                lowpass,
+                highpass,
+                bandpass1,
+                bandpass2,
+                dryGain,
+                wetGain,
+                effectMix,
+                lfo1,
+                lfo2,
+                lfo3
+            };
+        }
+
+        // Create distortion curve for robotic effect
+        function createDistortionCurve(amount) {
+            const k = typeof amount === 'number' ? amount : 50;
+            const n_samples = 44100;
+            const curve = new Float32Array(n_samples);
+            const deg = Math.PI / 180;
+            
+            for (let i = 0; i < n_samples; ++i) {
+                const x = (i * 2) / n_samples - 1;
+                curve[i] = (3 + k) * x * 20 * deg / (Math.PI + k * Math.abs(x));
+            }
+            
+            return curve;
+        }
+
+        // Handle page unload
+        window.addEventListener('beforeunload', () => {
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                mediaRecorder.stop();
+            }
+            if (audioContext) {
+                audioContext.close();
+            }
+            if (playbackAudioContext) {
+                playbackAudioContext.close();
+            }
+        });
+    </script>
+</body>
+</html>
