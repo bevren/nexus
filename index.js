@@ -91,8 +91,8 @@ const BRACKETED_PASTE_START = "\u001b[200~";
 const BRACKETED_PASTE_END = "\u001b[201~";
 const ENABLE_BRACKETED_PASTE = "\u001b[?2004h";
 const DISABLE_BRACKETED_PASTE = "\u001b[?2004l";
-const ENABLE_MOUSE_TRACKING = "\u001b[?1002h\u001b[?1006h";
-const DISABLE_MOUSE_TRACKING = "\u001b[?1002l\u001b[?1006l";
+const ENABLE_MOUSE_TRACKING = "\u001b[?1000h\u001b[?1006h";
+const DISABLE_MOUSE_TRACKING = "\u001b[?1000l\u001b[?1006l";
 const ENTER_ALT_SCREEN = "\u001b[?1049h";
 const EXIT_ALT_SCREEN = "\u001b[?1049l";
 const APP_MOUSE_TRACKING_ENABLED = process.env.TUI_ENABLE_MOUSE !== "0";
@@ -296,10 +296,6 @@ let mouseSelectionMode = false;
 let mouseSelectionTimer = null;
 let mouseSelectionStartedAt = 0;
 let mouseSequenceRemainder = "";
-let selectionAnchor = null; // { row, col, offset }
-let selectionEnd = null;    // { row, col }
-let selectionActive = false;
-let lastChatViewport = { chatStartRow: 0, chatAreaHeight: 0, lines: [] };
 let pasteParserBuffer = "";
 let imagePasteCounter = 0;
 const imageTokenPayloads = new Map();
@@ -5602,9 +5598,8 @@ function scrollChatToTop() {
   return true;
 }
 
-function handleMouseEvent(buttonCode, action, x, y) {
+function handleMouseEvent(buttonCode, action) {
   if (activeBuffer !== "main") {
-    clearSelection();
     exitMouseSelectionMode();
     return;
   }
@@ -5613,44 +5608,23 @@ function handleMouseEvent(buttonCode, action, x, y) {
   const buttonBase = buttonCode & 3;
 
   if (!isWheel) {
-    const isLeftButton = buttonBase === 0;
+    const isLeftDown = action === "M" && buttonBase === 0;
     const isRelease = action === "m" || buttonBase === 3;
-
-    if (action === "M" && isLeftButton) {
-      // Left press OR drag. On first press set the anchor; on subsequent
-      // M events (drag) only extend the end -- never re-anchor.
-      const row = Math.max(0, y - 1);
-      const col = Math.max(0, x - 1);
-      if (!selectionActive || !selectionAnchor) {
-        selectionAnchor = { row, col, offset: chatScrollOffset };
-        selectionEnd = { row, col };
-        selectionActive = true;
-      } else {
-        selectionEnd = { row, col };
-      }
-      markDirty();
-      renderFrame(false);
+    if (isLeftDown) {
+      enterMouseSelectionMode();
       return;
     }
-
     if (isRelease) {
-      // Keep the highlight; wheel scroll works again after release.
-      // A plain click (no drag distance) clears any existing selection.
-      if (selectionActive && selectionAnchor && selectionEnd) {
-        const moved =
-          selectionAnchor.row !== selectionEnd.row ||
-          selectionAnchor.col !== selectionEnd.col;
-        if (!moved) {
-          clearSelection();
-        }
+      // Re-enable mouse tracking on release so wheel scrolling works again immediately.
+      if (mouseSelectionMode) {
+        exitMouseSelectionMode();
       }
-      if (selectionActive) {
-        markDirty();
-        renderFrame(true);
-      }
-      exitMouseSelectionMode();
       return;
     }
+  }
+
+  if (mouseSelectionMode) {
+    return;
   }
 
   if (action !== "M") {
@@ -5659,12 +5633,6 @@ function handleMouseEvent(buttonCode, action, x, y) {
 
   // Wheel events use bit 6 (64): 64=up, 65=down (+ modifier bits).
   if (!isWheel) {
-    // Left-button drag while a selection is active extends it.
-    if (selectionActive && selectionAnchor && buttonBase === 0) {
-      selectionEnd = { row: Math.max(0, y - 1), col: Math.max(0, x - 1) };
-      markDirty();
-      renderFrame(false);
-    }
     return;
   }
 
@@ -5679,175 +5647,6 @@ function handleMouseEvent(buttonCode, action, x, y) {
   burstMode = false;
   markDirty();
   renderFrame(true);
-}
-
-function clearSelection() {
-  const wasActive = selectionActive;
-  selectionAnchor = null;
-  selectionEnd = null;
-  selectionActive = false;
-  if (wasActive) {
-    dirty = true;
-  }
-}
-
-const SELECT_BG = "\u001b[48;5;238m";
-const SELECT_BG_RESET = "\u001b[0m";
-
-function copySelectionToClipboard() {
-  if (!selectionActive || !selectionAnchor || !selectionEnd) {
-    return;
-  }
-  const startRow = Math.min(selectionAnchor.row, selectionEnd.row);
-  const endRow = Math.max(selectionAnchor.row, selectionEnd.row);
-  const anchorCol = selectionAnchor.col;
-  const endCol = selectionEnd.col;
-
-  const startLine = Math.max(0, startRow - lastChatViewport.chatStartRow);
-  const endLine = Math.max(0, endRow - lastChatViewport.chatStartRow);
-  const lines = lastChatViewport.lines || [];
-
-  const parts = [];
-  for (let i = startLine; i <= endLine && i < lines.length; i += 1) {
-    const lineText = lines[i]?.text || "";
-    let slice = lineText;
-    if (i === startLine && i === endLine) {
-      const a = Math.min(anchorCol, endCol);
-      const b = Math.max(anchorCol, endCol);
-      slice = lineText.slice(a, b + 1);
-    } else if (i === startLine) {
-      slice = lineText.slice(Math.min(anchorCol, endCol));
-    } else if (i === endLine) {
-      slice = lineText.slice(0, Math.max(anchorCol, endCol) + 1);
-    }
-    parts.push(slice);
-  }
-  const text = parts.join("\n");
-  if (!text.trim()) {
-    return;
-  }
-
-  const safeText = text.replace(/'/g, "''");
-  const ps = [
-    `$text = @'`,
-    safeText,
-    `'@`,
-    `Set-Clipboard -Value $text`,
-  ].join("\r\n");
-  execFile(
-    "powershell.exe",
-    ["-NoProfile", "-STA", "-Command", ps],
-    { windowsHide: true, timeout: 3000 },
-    () => {}
-  );
-}
-
-function lineInSelection(row) {
-  return (
-    selectionActive &&
-    selectionAnchor &&
-    selectionEnd &&
-    row >= Math.min(selectionAnchor.row, selectionEnd.row) &&
-    row <= Math.max(selectionAnchor.row, selectionEnd.row)
-  );
-}
-
-function getSelectionColRange(row) {
-  if (!selectionActive || !selectionAnchor || !selectionEnd) {
-    return null;
-  }
-  const r1 = selectionAnchor.row;
-  const r2 = selectionEnd.row;
-  const c1 = selectionAnchor.col;
-  const c2 = selectionEnd.col;
-  const top = Math.min(r1, r2);
-  const bottom = Math.max(r1, r2);
-  if (row < top || row > bottom) {
-    return null;
-  }
-
-  let start;
-  let end;
-  if (top === bottom) {
-    start = Math.min(c1, c2);
-    end = Math.max(c1, c2);
-  } else if (row === top) {
-    start = row === r1 ? c1 : c2;
-    end = Infinity;
-  } else if (row === bottom) {
-    start = 0;
-    end = row === r1 ? c1 : c2;
-  } else {
-    start = 0;
-    end = Infinity;
-  }
-  if (start < 0) {
-    start = 0;
-  }
-  if (end === Infinity || end < start) {
-    end = start + 9999;
-  }
-  return { start, end };
-}
-
-function writeSelectedLine(row, line, cols) {
-  // Character-level highlight: only the cells within the selection column
-  // range get the background; the rest renders normally (no whole-line tint).
-  const plain = String(line?.text ?? "");
-  const range = getSelectionColRange(row);
-  readline.cursorTo(process.stdout, 0, row);
-  let out = "";
-  if (!range) {
-    out = `${SELECT_BG}${plain.padEnd(cols, " ")}${SELECT_BG_RESET}`;
-  } else {
-    for (let i = 0; i < cols; i += 1) {
-      if (i >= range.start && i <= range.end) {
-        out += `${SELECT_BG}${i < plain.length ? plain[i] : " "}${SELECT_BG_RESET}`;
-      } else {
-        out += i < plain.length ? plain[i] : " ";
-      }
-    }
-  }
-  process.stdout.write(`${out}${SELECT_BG_RESET}`);
-}
-
-function isRowSelected(row) {
-  if (!selectionActive || !selectionAnchor || !selectionEnd) {
-    return false;
-  }
-  const a = selectionAnchor.row;
-  const b = selectionEnd.row;
-  const start = Math.min(a, b);
-  const end = Math.max(a, b);
-  return row >= start && row <= end;
-}
-
-function isCellSelected(row, col) {
-  if (!selectionActive || !selectionAnchor || !selectionEnd) {
-    return false;
-  }
-  const aRow = selectionAnchor.row;
-  const bRow = selectionEnd.row;
-  const aCol = selectionAnchor.col;
-  const bCol = selectionEnd.col;
-  const startRow = Math.min(aRow, bRow);
-  const endRow = Math.max(aRow, bRow);
-  if (row < startRow || row > endRow) {
-    return false;
-  }
-  if (row > startRow && row < endRow) {
-    return true;
-  }
-  if (startRow === endRow) {
-    const minCol = Math.min(aCol, bCol);
-    const maxCol = Math.max(aCol, bCol);
-    return col >= minCol && col <= maxCol;
-  }
-  if (row === startRow) {
-    const minCol = Math.min(aCol, bCol);
-    return col >= (row === aRow ? aCol : bCol) && col >= minCol;
-  }
-  return col <= Math.min(aCol, bCol);
 }
 
 function looksLikeMouseSequenceFragment(text) {
@@ -5882,11 +5681,11 @@ function stripMouseSequences(chunk) {
   let matchedMouse = false;
   let cleaned = input.replace(
     /\u001b\[<(\d+);(\d+);(\d+)([mM])/g,
-    (_full, buttonStr, xStr, yStr, action) => {
+    (_full, buttonStr, _x, _y, action) => {
       matchedMouse = true;
       const buttonCode = Number(buttonStr);
       if (Number.isFinite(buttonCode)) {
-        handleMouseEvent(buttonCode, action, Number(xStr), Number(yStr));
+        handleMouseEvent(buttonCode, action);
       }
       return "";
     }
@@ -5902,7 +5701,7 @@ function stripMouseSequences(chunk) {
       const buttonCode = Number(m[1]);
       const action = m[4];
       if (Number.isFinite(buttonCode)) {
-        handleMouseEvent(buttonCode, action, Number(m[2]), Number(m[3]));
+        handleMouseEvent(buttonCode, action);
       }
     }
     return "";
@@ -6726,14 +6525,6 @@ function renderFrame(forceChatRefresh = false) {
   const chatEnd = Math.max(0, allChatLines.length - chatScrollOffset);
   const chatStart = Math.max(0, chatEnd - chatAreaHeight);
   const chatVisualLines = allChatLines.slice(chatStart, chatEnd);
-  lastChatViewport = {
-    chatStartRow: chatStart,
-    chatAreaHeight,
-    lines: chatVisualLines.map((l) => ({
-      text: l.text ? stripAnsiSgr(l.text) : "",
-      styledText: l.styledText || "",
-    })),
-  };
   const menuLayoutChanged =
     lastMenuTop === null ||
     lastMenuTop !== menuTop ||
@@ -6768,12 +6559,9 @@ function renderFrame(forceChatRefresh = false) {
     lastRenderableMessageCount = -1;
   }
 
-  const selectionOnlyChatRefresh =
-    selectionActive && !forceChatRefresh;
   const needsChatRefresh =
     !APPEND_CHAT_TO_SCROLLBACK &&
     (forceChatRefresh ||
-      selectionActive ||
       currentRenderableMessageCount !== lastRenderableMessageCount ||
       statusLayoutChanged ||
       lastChatAreaHeight === null ||
@@ -6783,39 +6571,29 @@ function renderFrame(forceChatRefresh = false) {
   if (needsChatRefresh) {
     const oldChatHeight = lastChatAreaHeight ?? 0;
     const chatClearHeight = Math.max(chatAreaHeight, oldChatHeight);
-    // During a selection drag we repaint rows anyway; clearing the whole
-    // region each motion causes flicker. Skip the clear when only the
-    // selection changed and no layout/messages changed.
-    if (!selectionOnlyChatRefresh) {
-      for (let y = 0; y < chatClearHeight; y += 1) {
-        writeLine(y, "", cols);
-      }
+    for (let y = 0; y < chatClearHeight; y += 1) {
+      writeLine(y, "", cols);
     }
 
     const chatStartRow = Math.max(0, chatAreaHeight - chatVisualLines.length);
     for (let i = 0; i < chatVisualLines.length; i += 1) {
-      const row = chatStartRow + i;
-      if (lineInSelection(row)) {
-        writeSelectedLine(row, chatVisualLines[i], cols);
-        continue;
-      }
       if (chatVisualLines[i].styledText) {
         writeStyledLine(
-          row,
+          chatStartRow + i,
           chatVisualLines[i].text,
           chatVisualLines[i].styledText,
           cols
         );
       } else if (chatVisualLines[i].color === GREEN_COLOR) {
-        writeColoredLine(row, chatVisualLines[i].text, cols, GREEN_COLOR);
+        writeColoredLine(chatStartRow + i, chatVisualLines[i].text, cols, GREEN_COLOR);
       } else if (chatVisualLines[i].color === RED_COLOR) {
-        writeColoredLine(row, chatVisualLines[i].text, cols, RED_COLOR);
+        writeColoredLine(chatStartRow + i, chatVisualLines[i].text, cols, RED_COLOR);
       } else if (chatVisualLines[i].color === PLACEHOLDER_COLOR) {
-        writeColoredLine(row, chatVisualLines[i].text, cols, PLACEHOLDER_COLOR);
+        writeColoredLine(chatStartRow + i, chatVisualLines[i].text, cols, PLACEHOLDER_COLOR);
       } else {
-        writeLine(row, chatVisualLines[i].text, cols);
+        writeLine(chatStartRow + i, chatVisualLines[i].text, cols);
         if (chatVisualLines[i].assistantBulletMuted) {
-          readline.cursorTo(process.stdout, CHAT_LEFT_PADDING.length, row);
+          readline.cursorTo(process.stdout, CHAT_LEFT_PADDING.length, chatStartRow + i);
           process.stdout.write(`${PLACEHOLDER_COLOR}\u2022${RESET_COLOR}`);
         }
       }
@@ -7198,7 +6976,6 @@ function submit() {
     return false;
   }
 
-  clearSelection();
   ensureSystemMessageAtTop();
   messages.push({ role: "user", content: resolvedContent });
   appendHistoryEntry("user", resolvedContent);
@@ -7738,13 +7515,6 @@ process.stdin.on("keypress", async (str, key) => {
   const noCommandsWasVisible = isNoCommandsState();
 
   if (key?.ctrl && key.name === "c") {
-    if (selectionActive && selectionAnchor && selectionEnd) {
-      copySelectionToClipboard();
-      clearSelection();
-      markDirty();
-      renderFrame(true);
-      return;
-    }
     cleanupTerminal({ clearScreen: true });
     process.exit(0);
   }
@@ -7753,12 +7523,6 @@ process.stdin.on("keypress", async (str, key) => {
     activeBuffer === "main" &&
     (key?.name === "escape" || key?.sequence === "\u001b" || str === "\u001b");
   if (isMainBufferEscape) {
-    if (selectionActive) {
-      clearSelection();
-      markDirty();
-      renderFrame(true);
-      return;
-    }
     if (isAssistantThinking()) {
       handleStopRequest();
       return;
@@ -8360,7 +8124,6 @@ process.stdin.on("keypress", async (str, key) => {
 });
 
 process.stdout.on("resize", () => {
-  clearSelection();
   markDirty();
   renderFrame(true);
 });
