@@ -311,6 +311,8 @@ let thinkingAnimationTimer = null;
 let thinkingFrameIndex = 0;
 let shineFrameIndex = 0;
 let shineAnimationTimer = null;
+let spinnerFrameIndex = 0;
+let spinnerAnimationTimer = null;
 let thinkingStartedAt = 0;
 let activeToolRun = null; // { label, startedAt, done, ok }
 let contextLeftPercentByModel = {};
@@ -1115,6 +1117,10 @@ function cleanupTerminal(options = {}) {
   if (shineAnimationTimer) {
     clearInterval(shineAnimationTimer);
     shineAnimationTimer = null;
+  }
+  if (spinnerAnimationTimer) {
+    clearInterval(spinnerAnimationTimer);
+    spinnerAnimationTimer = null;
   }
   clearMouseSelectionTimer();
   mouseSelectionMode = false;
@@ -4930,7 +4936,7 @@ function getStatusBarText() {
   if (activeToolRun) {
     const label = activeToolRun.label || "code execution";
     const elapsed = Math.floor((Date.now() - activeToolRun.startedAt) / 1000);
-    const frame = SPINNER_FRAMES[thinkingFrameIndex % SPINNER_FRAMES.length];
+    const frame = SPINNER_FRAMES[spinnerFrameIndex % SPINNER_FRAMES.length];
     if (!activeToolRun.done) {
       return `${frame} ${SHINE_BRIGHT}Running:${SHINE_RESET} ${label} (${elapsed}s)`;
     }
@@ -4980,8 +4986,13 @@ function updateThinkingAnimationState() {
       clearInterval(shineAnimationTimer);
       shineAnimationTimer = null;
     }
+    if (spinnerAnimationTimer) {
+      clearInterval(spinnerAnimationTimer);
+      spinnerAnimationTimer = null;
+    }
     thinkingFrameIndex = 0;
     shineFrameIndex = 0;
+    spinnerFrameIndex = 0;
     return;
   }
 
@@ -5014,6 +5025,22 @@ function updateThinkingAnimationState() {
       markDirty();
       renderFrame(false);
     }, SHINE_ANIMATION_INTERVAL_MS);
+  }
+
+  // High-frequency spinner: ~60ms per frame -> smooth, complete 10-frame loop.
+  if (!spinnerAnimationTimer) {
+    spinnerAnimationTimer = setInterval(() => {
+      if (activeBuffer !== "main" || !isAssistantThinking()) {
+        updateThinkingAnimationState();
+        markDirty();
+        renderFrame(false);
+        return;
+      }
+
+      spinnerFrameIndex = (spinnerFrameIndex + 1) % SPINNER_FRAMES.length;
+      markDirty();
+      renderFrame(false);
+    }, 60);
   }
 }
 
