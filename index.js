@@ -316,6 +316,8 @@ let spinnerFrameIndex = 0;
 let spinnerAnimationTimer = null;
 let thinkingStartedAt = 0;
 let activeToolRun = null; // { label, startedAt, done, ok }
+let stopRequested = false;
+let pendingAssistantMessageIndex = -1;
 let contextLeftPercentByModel = {};
 let currentSessionUid = createSessionUid();
 let sessionFilePath = getSessionFilePath(currentSessionUid);
@@ -1868,6 +1870,7 @@ function createPendingAssistantMessage(generation) {
 
   const index = messages.length;
   messages.push({ role: "assistant", content: "thinking...", ephemeral: true });
+  pendingAssistantMessageIndex = index;
   scrollChatToBottom();
   forceFullClearOnNextRender = true;
   markDirty();
@@ -1879,6 +1882,7 @@ function finalizePendingAssistantMessage(index, text, generation, options = {}) 
   if (generation !== chatGeneration) {
     return;
   }
+  pendingAssistantMessageIndex = -1;
 
   const role = typeof options.role === "string" ? options.role : "assistant";
   const persistHistory =
@@ -2449,6 +2453,7 @@ function removePendingAssistantMessage(index, generation) {
     return false;
   }
 
+  pendingAssistantMessageIndex = -1;
   messages.splice(index, 1);
   markDirty();
   renderFrame(true);
@@ -2652,12 +2657,19 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
 
     let latestAssistantContent = assistantContent;
     for (;;) {
+      if (stopRequested) {
+        emitStopNotice();
+        break;
+      }
       const pythonBlocks = extractAllPythonCodeBlocks(latestAssistantContent);
       if (pythonBlocks.length === 0) {
         break;
       }
 
       for (const pythonCode of pythonBlocks) {
+        if (stopRequested) {
+          break;
+        }
         activeToolRun = {
           label: getToolRunLabel(pythonCode),
           startedAt: Date.now(),
@@ -2665,7 +2677,11 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
           ok: false,
         };
         const execResult = await executeCodeWithPythonTool(pythonCode);
-        if (activeToolRun) {
+        if (stopRequested) {
+          // User pressed Esc while the process was running: per request,
+          // let the running process finish, show its output, then stop.
+          activeToolRun = { ...activeToolRun, done: true, ok: false, cancelled: true };
+        } else if (activeToolRun) {
           activeToolRun.done = true;
           activeToolRun.ok = Boolean(execResult?.ok);
         }
@@ -2698,6 +2714,12 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
         if (generation !== chatGeneration) {
           return;
         }
+      }
+
+      if (stopRequested) {
+        activeToolRun = null;
+        emitStopNotice();
+        break;
       }
 
       const followUpMessages = buildOpenRouterMessagesFromHistory(resolvedModel);
@@ -2740,6 +2762,9 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
 
 function queueAssistantReply(modelId) {
   const wasThinking = pendingAssistantRequests > 0;
+  if (!wasThinking) {
+    stopRequested = false;
+  }
   pendingAssistantRequests += 1;
   if (!wasThinking) {
     thinkingStartedAt = Date.now();
@@ -4912,6 +4937,87 @@ function getAppendReservedBottomRows(cols, includeStatus = true) {
 
 function isAssistantThinking() {
   return pendingAssistantRequests > 0;
+}
+
+function cancelAndClearActiveToolRun() {
+  activeToolRun = {
+    label: activeToolRun?.label || "code execution",
+    startedAt: activeToolRun?.startedAt || Date.now(),
+    done: true,
+    ok: false,
+    cancelled: true,
+  };
+  markDirty();
+  renderFrame(false);
+  updateThinkingAnimationState();
+}
+
+function resetStopRequested() {
+  stopRequested = false;
+}
+
+function handleStopRequest() {
+  if (stopRequested) {
+    return;
+  }
+  stopRequested = true;
+
+  const toolRunning =
+    activeToolRun && !activeToolRun.done && isAssistantThinking();
+
+  if (toolRunning) {
+    // A process is still running: wait for it to finish (per user request),
+    // show its result, then emit the stop notice after it.
+    activeToolRun = { ...activeToolRun, cancelPending: true };
+    markDirty();
+    renderFrame(false);
+    return;
+  }
+
+  // Nothing is mid-process: write the stop notice immediately.
+  const text = "■ Stopped by user (Esc pressed).";
+  const idx = pendingAssistantMessageIndex;
+  const candidate =
+    idx >= 0 && idx < messages.length && messages[idx]?.role === "assistant"
+      ? messages[idx]
+      : null;
+  if (candidate && candidate.ephemeral === true) {
+    candidate.content = text;
+    candidate.ephemeral = false;
+    candidate.role = "assistant";
+    pendingAssistantMessageIndex = -1;
+  } else {
+    messages.push({ role: "assistant", content: text });
+  }
+  appendHistoryEntry("assistant", text);
+  cancelAndClearActiveToolRun();
+  scrollChatToBottom();
+  forceFullClearOnNextRender = true;
+  markDirty();
+  renderFrame(true);
+}
+
+function emitStopNotice() {
+  const text = "■ Stopped by user (Esc pressed).";
+  const idx = pendingAssistantMessageIndex;
+  const candidate =
+    idx >= 0 && idx < messages.length && messages[idx]?.role === "assistant"
+      ? messages[idx]
+      : null;
+  if (candidate && candidate.ephemeral === true) {
+    candidate.content = text;
+    candidate.ephemeral = false;
+    candidate.role = "assistant";
+    pendingAssistantMessageIndex = -1;
+  } else {
+    messages.push({ role: "assistant", content: text });
+  }
+  appendHistoryEntry("assistant", text);
+  cancelAndClearActiveToolRun();
+  scrollChatToBottom();
+  forceFullClearOnNextRender = true;
+  markDirty();
+  renderFrame(true);
 }
 
 function getViewportChatInputGapRows(statusVisible) {
@@ -7403,6 +7509,23 @@ process.stdin.on("keypress", async (str, key) => {
   if (key?.ctrl && key.name === "c") {
     cleanupTerminal({ clearScreen: true });
     process.exit(0);
+  }
+
+  const isMainBufferEscape =
+    activeBuffer === "main" &&
+    (key?.name === "escape" || key?.sequence === "\u001b" || str === "\u001b");
+  if (isMainBufferEscape) {
+    if (isAssistantThinking()) {
+      handleStopRequest();
+      return;
+    }
+    if (input.length > 0) {
+      input = "";
+      inputCursorIndex = 0;
+      markDirty();
+      renderFrame(true);
+    }
+    return;
   }
 
   if (mouseSelectionMode) {
