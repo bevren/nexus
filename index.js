@@ -4925,7 +4925,7 @@ function getStatusBarText() {
     const elapsed = Math.floor((Date.now() - activeToolRun.startedAt) / 1000);
     const frame = SPINNER_FRAMES[thinkingFrameIndex % SPINNER_FRAMES.length];
     if (!activeToolRun.done) {
-      return `${frame} Running: ${label} (${elapsed}s)`;
+      return `${frame} ${SHINE_BRIGHT}Running:${SHINE_RESET} ${label} (${elapsed}s)`;
     }
     const mark = activeToolRun.ok ? "\u2713" : "\u2717";
     return `${mark} ${label} (${elapsed}s)`;
