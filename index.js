@@ -80,7 +80,7 @@ const THINKING_FRAMES = ["Thinking   ", "Thinking.  ", "Thinking.. ", "Thinking.
 const SPINNER_FRAMES = ["\u280b", "\u2819", "\u2839", "\u2838", "\u283c", "\u2834", "\u2826", "\u2827", "\u2807", "\u280f"];
 const APPEND_COMPOSER_FIXED_ROWS = 8;
 const MOUSE_KEYPRESS_SUPPRESS_MS = 650;
-const MOUSE_SELECTION_REENABLE_MS = 1800;
+const MOUSE_SELECTION_REENABLE_MS = 5000;
 const PASTED_CONTENT_TOKEN_RE = /^\[Pasted Content \d+ chars\]$/i;
 const PASTED_CONTENT_INLINE_TOKEN_RE = /\[Pasted Content \d+ chars\]/gi;
 const IMAGE_INLINE_TOKEN_RE = /\[Image #\d+\]/gi;
@@ -3334,7 +3334,12 @@ function getMainFooterText() {
   const contextLeft = Math.round(getContextLeftPercent(selectedModel));
   const safeContextLeft = Math.max(0, Math.min(100, contextLeft));
   const modelLabel = selectedModel && selectedModel.trim().length > 0 ? selectedModel.trim() : "no model";
-  return `Current model: ${modelLabel} | ${safeContextLeft}% context left | ${formatWorkspacePathForFooter(WORKSPACE_ROOT)}`;
+  let text = `Current model: ${modelLabel} | ${safeContextLeft}% context left | ${formatWorkspacePathForFooter(WORKSPACE_ROOT)}`;
+  const mouseManuallyOff = APP_MOUSE_TRACKING_ENABLED && !mouseTrackingEnabled && !mouseSelectionMode;
+  if (mouseManuallyOff) {
+    text += " | drag to select/copy · Alt+M mouse · PgUp/PgDn scroll";
+  }
+  return text;
 }
 
 function getSessionsVisibleCount() {
@@ -5610,11 +5615,10 @@ function handleMouseEvent(buttonCode, action) {
       return;
     }
     if (isRelease) {
-      // If tracking was just disabled for selection, ignore same-click release noise.
-      if (!mouseTrackingEnabled || (Date.now() - mouseSelectionStartedAt) < 120) {
-        return;
+      // Re-enable mouse tracking on release so wheel scrolling works again immediately.
+      if (mouseSelectionMode) {
+        exitMouseSelectionMode();
       }
-      exitMouseSelectionMode();
       return;
     }
   }
