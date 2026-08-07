@@ -5791,12 +5791,14 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
         // Only color +/- lines as diff hunks when the whole output actually
         // looks like a unified diff; otherwise "- some text" from a tool
         // result would get a misleading red/red background.
-        const diffBgColor =
-          isToolCall && looksLikeDiff && !(i === 0 && w === 0)
-            ? getDiffBackgroundColor(wrappedLine.body)
-            : null;
-        if (diffBgColor) {
-          line = `${diffBgColor}${visibleText.padEnd(contentWidth, " ")}${RESET_COLOR}`;
+        // Decide the diff style once per logical line from the unwrapped
+        // body so every wrapped continuation chunk keeps the background
+        // (a long + line wraps into chunks whose first text is raw code,
+        // not a +/- prefix, so per-chunk detection would miss them).
+        const lineDiffBgColor =
+          isToolCall && looksLikeDiff && i > 0 ? getDiffBackgroundColor(body) : null;
+        if (lineDiffBgColor) {
+          line = `${lineDiffBgColor}${visibleText.padEnd(contentWidth, " ")}${RESET_COLOR}`;
         } else {
           const color = i === 0 && w === 0 ? toolColor : PLACEHOLDER_COLOR;
           const editedHeaderStyled =
@@ -8464,6 +8466,17 @@ function runFormatSelfTest() {
     const diffToolJoined = diffToolLines.join("\n");
     if (!diffToolJoined.includes(DIFF_REMOVE_BG_COLOR) || !diffToolJoined.includes(DIFF_ADD_BG_COLOR)) {
       out("FORMAT_FAIL: real diff lines should get diff backgrounds");
+      return 1;
+    }
+
+    // Wrapped continuations of a long diff line must keep the diff
+    // background on every chunk, not just the first one.
+    const longAddLine = "+" + "x".repeat(200);
+    const longDiff = "diff --git a/f.js b/f.js\nindex 111..222 100644\n--- a/f.js\n+++ b/f.js\n@@ -1,1 +1,1 @@\n-console.log(1);\n" + longAddLine;
+    const wrappedDiffLines = buildTranscriptLinesForEntry({ role: "tool", content: longDiff }, 40);
+    const addBgChunks = wrappedDiffLines.filter((l) => l.includes(DIFF_ADD_BG_COLOR));
+    if (addBgChunks.length < 2) {
+      out(`FORMAT_FAIL: wrapped long diff add-line should keep background on each chunk (got ${addBgChunks.length})`);
       return 1;
     }
 
