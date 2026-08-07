@@ -517,10 +517,21 @@ function getContextLeftPercent(modelId = selectedModel) {
   }
 
   const raw = Number(contextLeftPercentByModel[key]);
-  if (!Number.isFinite(raw)) {
-    return 100;
+  if (Number.isFinite(raw)) {
+    return Math.max(0, Math.min(100, raw));
   }
-  return Math.max(0, Math.min(100, raw));
+
+  // No live usage data yet (e.g. resumed a session before the first new
+  // completion). Estimate from the current messages using the same
+  // chars-per-token heuristic as compaction, so the footer shows a
+  // meaningful percentage instead of a stale 100%.
+  const contextLength = getModelContextLength(modelId);
+  const estimatedTokens = messages.length > 0 ? estimateMessagesInChatTokens(messages) : 0;
+  if (Number.isFinite(contextLength) && contextLength > 0 && estimatedTokens > 0) {
+    const percentLeft = ((contextLength - estimatedTokens) / contextLength) * 100;
+    return Math.max(0, Math.min(100, Math.round(percentLeft)));
+  }
+  return 100;
 }
 
 function setContextLeftPercent(modelId, percent) {
