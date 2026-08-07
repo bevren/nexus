@@ -2529,16 +2529,26 @@ function extractWhenFromText(text) {
     return null;
   }
 
-  // Relative: "in 45 minutes"
+  // Relative: "in 45 minutes". Seconds count down to real seconds for
+  // one-shots (no cron floor), so "in 3 seconds" fires in 3 seconds.
   const rel =
     /\bin\s+(\d+)\s*(s|sec|second|seconds|m|min|minute|minutes|h|hr|hour|hours|d|day|days)\b/i.exec(
       source
     );
   if (rel) {
+    const before = source.slice(0, rel.index).trim();
+    const after = source.slice(rel.index + rel[0].length).trim();
+    const unit = rel[2].toLowerCase();
+    const count = parseInt(rel[1], 10);
+    if (unit.startsWith("s")) {
+      return {
+        when: Date.now() + count * 1000,
+        display: `in ${count} second${count === 1 ? "" : "s"}`,
+        rest: `${before} ${after}`.trim(),
+      };
+    }
     const minutes = parseLoopIntervalToken(`${rel[1]}${rel[2]}`);
     if (minutes !== null) {
-      const before = source.slice(0, rel.index).trim();
-      const after = source.slice(rel.index + rel[0].length).trim();
       return {
         when: Date.now() + minutes * 60 * 1000,
         display: `in ${rel[1]} ${rel[2]}`,
@@ -2547,15 +2557,24 @@ function extractWhenFromText(text) {
     }
   }
 
-  // Leading interval token: "15m check build", "2h ship"
+  // Leading interval token: "15m check build", "2h ship", "30s ping"
   const lead =
     /^(\d+)\s*(s|sec|second|seconds|m|min|minute|minutes|h|hr|hour|hours|d|day|days)\b/i.exec(
       source
     );
   if (lead) {
+    const after = source.slice(lead[0].length).trim();
+    const unit = lead[2].toLowerCase();
+    const count = parseInt(lead[1], 10);
+    if (unit.startsWith("s")) {
+      return {
+        when: Date.now() + count * 1000,
+        display: `in ${count} second${count === 1 ? "" : "s"}`,
+        rest: after,
+      };
+    }
     const minutes = parseLoopIntervalToken(lead[0]);
     if (minutes !== null) {
-      const after = source.slice(lead[0].length).trim();
       return {
         when: Date.now() + minutes * 60 * 1000,
         display: `in ${lead[0]}`,
@@ -9237,6 +9256,18 @@ async function runLoopSelfTest() {
     }
 
     // Time parsing (extractWhenFromText)
+    // Seconds resolve to real seconds (no cron floor for one-shots).
+    const secWhen = extractWhenFromText("in 3 seconds check it");
+    if (
+      !secWhen ||
+      secWhen.display !== "in 3 seconds" ||
+      secWhen.rest !== "check it" ||
+      Math.abs(secWhen.when - (Date.now() + 3000)) > 1500
+    ) {
+      out(`LOOP_FAIL: seconds when parse wrong: ${JSON.stringify(secWhen)}\n`);
+      return 1;
+    }
+
     const relWhen = extractWhenFromText("in 45 minutes check deploy");
     if (!relWhen || relWhen.display !== "in 45 minutes" || relWhen.rest !== "check deploy") {
       out(`LOOP_FAIL: relative when parse wrong: ${JSON.stringify(relWhen)}\n`);
