@@ -6407,8 +6407,14 @@ function buildChatVisualLines(cols, sourceEntries = messages) {
     const reasoningLines = [];
     if (reasoningText) {
       const logical = reasoningText.split("\n");
-      for (const line of logical) {
-        const wrapped = wrapLineWithPrefixes(line, "◦ ", "  ", contentWidth);
+      for (let reasoningIndex = 0; reasoningIndex < logical.length; reasoningIndex += 1) {
+        const line = logical[reasoningIndex];
+        const wrapped = wrapLineWithPrefixes(
+          line,
+          reasoningIndex === 0 ? "◦ " : "  ",
+          "  ",
+          contentWidth
+        );
         for (const part of wrapped) {
           reasoningLines.push(`${PLACEHOLDER_COLOR}${part.fullText}${RESET_COLOR}`);
         }
