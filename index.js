@@ -69,6 +69,18 @@ const TOOL_RESULT_TRUNCATE_WRAP_COLS = 120;
 const TOOL_RESULT_TRUNCATE_MAX_LINES = 14;
 const TOOL_RESULT_TRUNCATE_HEAD_LINES = 2;
 const TOOL_RESULT_TRUNCATE_TAIL_LINES = 2;
+// Context compaction (Codex-style local path): when accumulated history is
+// near the model's context window, summarize old turns into a single
+// "compaction summary" user message and keep only the most recent user-role
+// messages, so long sessions survive instead of hitting the provider ceiling.
+const COMPACTION_DEFAULT_FRACTION = 0.9; // hard ceiling: min(user, window * 90%)
+const COMPACTION_RECENT_USER_TOKENS = 20000; // keep this many recent user tokens
+const COMPACTION_SUMMARY_PREFIX = "_summary"; // marker prefix for summaries
+const COMPACTION_DEFAULT_CUSTOM_INSTRUCTION =
+  "Summarize this coding session as a structured handoff for another AI engineer. " +
+  "Include: current task, files modified (with brief description of each change), " +
+  "decisions made and their rationale, blockers encountered, and clear next steps. " +
+  "Use bullet lists. Be concise but complete.";
 const MAX_REASONING_DISPLAY_CHARS = 4000;
 const MAX_INPUT_HISTORY_ITEMS = 500;
 const DEFAULT_LLM_REQUEST_TIMEOUT_MS = 120000;
@@ -144,6 +156,7 @@ const COMMANDS = [
   { name: "/rename", description: "rename the current thread" },
   { name: "/new", description: "start a new chat with a new uid" },
   { name: "/mcp", description: "show MCP server status and available tools (/mcp reload to restart servers)" },
+  { name: "/compact", description: "manually compact context: /compact [optional instruction]" },
 ];
 const FALLBACK_TOOL_DESCRIPTIONS = {
   insert_memory:
@@ -2045,6 +2058,194 @@ function getOpenRouterClient() {
   return openRouterClient;
 }
 
+// Rough token estimate: ~4 chars per token is the common heuristic. Used only
+// for compaction thresholds, not exact billing.
+function estimateTokensForText(text) {
+  const source = String(text ?? "");
+  return Math.max(1, Math.ceil(source.length / 4));
+}
+
+function estimateMessageTokens(message) {
+  const role = typeof message?.role === "string" ? message.role : "";
+  const content = typeof message?.content === "string" ? message.content : "";
+  let tokens = estimateTokensForText(content) + 4; // role + separators
+  if (Array.isArray(message?.reasoning_details)) {
+    for (const part of message.reasoning_details) {
+      if (part && typeof part === "object") {
+        tokens += estimateTokensForText(String(part?.text || ""));
+      } else if (typeof part === "string") {
+        tokens += estimateTokensForText(part);
+      }
+    }
+  }
+  return tokens;
+}
+
+function estimateRequestTokens(messagesForRequest) {
+  return messagesForRequest.reduce((sum, message) => sum + estimateMessageTokens(message), 0);
+}
+
+function estimateMessagesInChatTokens(entries) {
+  return entries.reduce((sum, entry) => sum + estimateMessageTokens(entry), 0);
+}
+
+function isCompactionSummaryEntry(entry) {
+  return (
+    entry?.role === "user" &&
+    typeof entry?.content === "string" &&
+    entry.content.startsWith(COMPACTION_SUMMARY_PREFIX)
+  );
+}
+
+function getCompactionThreshold() {
+  const configLimit = Number(nexusConfig?.model_auto_compact_token_limit);
+  // Fall back to a sane default (128k) when the model's context length is
+  // unknown, so a missing entry can never collapse the threshold to ~1 token
+  // and force compaction on every single request.
+  const rawWindow = getModelContextLength(selectedModel);
+  const windowLength = Number.isFinite(rawWindow) && rawWindow > 0 ? rawWindow : 128000;
+  const hardCap = Math.max(1, Math.floor(windowLength * COMPACTION_DEFAULT_FRACTION));
+  if (Number.isFinite(configLimit) && configLimit > 0) {
+    return Math.min(configLimit, hardCap);
+  }
+  return hardCap;
+}
+
+function getToolOutputTokenLimit() {
+  const configLimit = Number(nexusConfig?.tool_output_token_limit);
+  if (Number.isFinite(configLimit) && configLimit > 0) {
+    return configLimit;
+  }
+  return 16000;
+}
+
+async function runCompaction(customInstruction = "") {
+  // Codex local path: ask the model to summarize the conversation into a
+  // single user-role "_summary" message, then keep only the most recent user
+  // messages (default 20k tokens) below it. Older assistant/tool turns are
+  // dropped from the in-memory messages array.
+  const client = getOpenRouterClient();
+  if (!client) {
+    return { ok: false, error: "LLM provider is not configured." };
+  }
+  const resolvedModel = selectedModel;
+  if (!resolvedModel || String(resolvedModel).trim().length === 0) {
+    return { ok: false, error: "Model is not configured. Use /set model <name>." };
+  }
+
+  ensureSystemMessageAtTop(resolvedModel);
+  const requestMessages = buildOpenRouterMessagesFromHistory(resolvedModel);
+  if (requestMessages.length === 0) {
+    return { ok: false, error: "Nothing to compact." };
+  }
+
+  const contextLength = getModelContextLength(resolvedModel);
+  const maxSummaryChars = Math.max(2000, Math.floor(contextLength * 0.02));
+  const instruction =
+    typeof customInstruction === "string" && customInstruction.trim().length > 0
+      ? customInstruction.trim()
+      : COMPACTION_DEFAULT_CUSTOM_INSTRUCTION;
+
+  const summaryPrompt = [
+    `You are compacting a long coding session into a handoff summary for another AI engineer.`,
+    ``,
+    `INSTRUCTIONS:`,
+    instruction,
+    ``,
+    `RULES:`,
+    `- Write the summary in plain text (no markdown fences, no code blocks).`,
+    `- Keep it under ${maxSummaryChars} characters.`,
+    `- Do not mention this prompt.`,
+    ``,
+    `CONVERSATION TO COMPACT:`,
+    ...requestMessages
+      .filter((message) => message.role !== "system")
+      .map((message) => {
+        const roleLabel = message.role === "tool" || message.role === "tool_result" ? "tool" : message.role;
+        const content = typeof message?.content === "string" ? message.content : "";
+        if (Array.isArray(content)) {
+          return `${roleLabel}: ${content.map((part) => (typeof part === "object" && typeof part?.text === "string" ? part.text : "")).join(" ")}`;
+        }
+        return `${roleLabel}: ${content}`;
+      })
+      .join(String.fromCharCode(10, 10))
+      .slice(-Math.max(2000, Math.floor(contextLength * 0.6))),
+  ].join(String.fromCharCode(10));
+
+  let summaryText = "";
+  try {
+    const completion = await client.chat.completions.create({
+      model: resolvedModel,
+      messages: [...requestMessages.filter((message) => message.role === "system"), { role: "user", content: summaryPrompt }],
+    });
+    const content = completion?.choices?.[0]?.message?.content;
+    summaryText = typeof content === "string" ? content.trim() : "";
+  } catch (error) {
+    return { ok: false, error: `Compaction failed: ${getOpenRouterErrorMessage(error)}` };
+  }
+
+  if (summaryText.length === 0) {
+    return { ok: false, error: "Compaction failed: model returned an empty summary." };
+  }
+
+  // Replace the conversation with: system + [freshest summary] + the most
+  // recent tail of the conversation that fits the recent-token budget.
+  // Everything older (assistant replies, tool results, read file contents)
+  // is dropped, matching Codex's local-path compaction tradeoff.
+  const keptTail = [];
+  const recentBudget = COMPACTION_RECENT_USER_TOKENS;
+  let recentTokens = 0;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const entry = messages[i];
+    if (!entry || entry.ephemeral === true) {
+      continue;
+    }
+    if (isCompactionSummaryEntry(entry)) {
+      continue;
+    }
+    const tokens = estimateMessageTokens(entry);
+    if (recentTokens + tokens > recentBudget) {
+      break;
+    }
+    recentTokens += tokens;
+    keptTail.unshift(entry);
+  }
+
+  const systemEntries = [];
+  for (const entry of messages) {
+    if (entry && entry.ephemeral !== true && entry.role === "system") {
+      systemEntries.push(entry);
+    }
+  }
+
+  messages.length = 0;
+  messages.push(
+    ...systemEntries,
+    { role: "user", content: COMPACTION_SUMMARY_PREFIX + "\n" + summaryText },
+    ...keptTail.filter((entry) => !isCompactionSummaryEntry(entry))
+  );
+
+  printedMessageCount = Math.min(printedMessageCount, messages.length);
+  forceTranscriptReplay = true;
+  await rewriteSessionWithCurrentMessages().catch(() => {});
+  markDirty();
+  renderFrame(true);
+  return { ok: true, summary: summaryText, keptRecentUserMessages: survivingUserMessages.length };
+}
+
+async function maybeCompactBeforeTurn() {
+  if (APPEND_CHAT_TO_SCROLLBACK) {
+    return { ran: false };
+  }
+  const currentTokens = estimateMessagesInChatTokens(messages);
+  const threshold = getCompactionThreshold();
+  if (currentTokens <= threshold) {
+    return { ran: false };
+  }
+  const result = await runCompaction();
+  return { ran: true, result };
+}
+
 function buildOpenRouterMessagesFromHistory(modelId = selectedModel) {
   ensureSystemMessageAtTop(modelId);
   const includeReasoningDetails = getReasoningEnabledForModel(modelId);
@@ -2722,6 +2923,22 @@ print(json.dumps(result))
   }
 }
 
+function capToolHistoryText(text, limit) {
+  const source = String(text ?? "");
+  if (source.length === 0) {
+    return source;
+  }
+  const maxChars = Math.max(500, Math.floor((Number(limit) || 16000) * 4));
+  if (source.length <= maxChars) {
+    return source;
+  }
+  const head = Math.floor(maxChars * 0.5);
+  const tail = maxChars - head;
+  return `${source.slice(0, head)}
+... [tool result truncated: ${source.length} chars > ${maxChars}] ...
+${source.slice(-tail)}`;
+}
+
 function buildToolResultPayload(result) {
   const output = typeof result?.output === "string" ? result.output.trimEnd() : "";
   const error = typeof result?.error === "string" ? result.error.trimEnd() : "";
@@ -2757,7 +2974,8 @@ function buildToolResultPayload(result) {
     if (editSummaries.length > 0) {
       historyParts.push(editSummaries.join("\n"));
     }
-    const historyText = historyParts.length > 0 ? historyParts.join("\n") : "(no output)";
+    const joinedHistory = historyParts.length > 0 ? historyParts.join("\n") : "(no output)";
+    const historyText = capToolHistoryText(joinedHistory, getToolOutputTokenLimit());
     return { displayText, historyText };
   }
 
@@ -2784,7 +3002,10 @@ function buildToolResultPayload(result) {
 
   return {
     displayText: displayParts.length > 0 ? displayParts.join("\n") : "Tool execution failed.",
-    historyText: historyParts.length > 0 ? historyParts.join("\n") : "Tool execution failed.",
+    historyText: capToolHistoryText(
+      historyParts.length > 0 ? historyParts.join("\n") : "Tool execution failed.",
+      getToolOutputTokenLimit()
+    ),
   };
 }
 
@@ -3029,6 +3250,20 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
   const resolvedModel = modelId || selectedModel;
   ensureSystemMessageAtTop(resolvedModel);
 
+  // Pre-turn compaction (Codex-style): if accumulated history exceeds the
+  // compaction threshold, summarize before sending the user's request into
+  // the freshened window.
+  if (!APPEND_CHAT_TO_SCROLLBACK) {
+    const currentTokens = estimateMessagesInChatTokens(messages);
+    if (currentTokens > getCompactionThreshold()) {
+      try {
+        await runCompaction();
+      } catch {
+        // non-fatal: proceed with an oversized request if compaction fails
+      }
+    }
+  }
+
   const client = getOpenRouterClient();
   if (!client) {
     const message = OpenAI
@@ -3228,6 +3463,17 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
         activeToolRun = null;
         emitStopNotice();
         break;
+      }
+
+      // Mid-turn compaction: the tool chain may have grown the context past
+      // the threshold; compact at the loop boundary before continuing.
+      const midTurnTokens = estimateMessagesInChatTokens(messages);
+      if (midTurnTokens > getCompactionThreshold()) {
+        try {
+          await runCompaction();
+        } catch {
+          // non-fatal
+        }
       }
 
       const followUpMessages = buildOpenRouterMessagesFromHistory(resolvedModel);
@@ -3843,7 +4089,9 @@ function formatWorkspacePathForFooter(workspacePath) {
 
 function getMainFooterText() {
   const modelLabel = selectedModel && selectedModel.trim().length > 0 ? selectedModel.trim() : "no model";
-  let text = `Current model: ${modelLabel} | ${formatWorkspacePathForFooter(WORKSPACE_ROOT)}`;
+  const contextLeft = Math.round(getContextLeftPercent(selectedModel));
+  const safeContextLeft = Math.max(0, Math.min(100, contextLeft));
+  let text = `Current model: ${modelLabel} | ${safeContextLeft}% context left | ${formatWorkspacePathForFooter(WORKSPACE_ROOT)}`;
   const mouseManuallyOff = APP_MOUSE_TRACKING_ENABLED && !mouseTrackingEnabled && !mouseSelectionMode;
   if (mouseManuallyOff) {
     text += " | drag to select/copy · Alt+M mouse · PgUp/PgDn scroll";
@@ -4603,6 +4851,31 @@ async function runSlashCommand(commandName, commandArgs = "") {
       excludeFromRequest: true,
       persistHistory: false,
     });
+    await rewriteSessionWithCurrentMessages();
+    refreshMainBufferAfterCommand();
+    return true;
+  }
+
+  if (commandName === "/compact") {
+    const instruction = String(commandArgs ?? "").trim();
+    appendAssistantMessage(
+      instruction
+        ? `Compacting context with instruction: ${instruction}...`
+        : "Compacting context...",
+      { excludeFromRequest: true, persistHistory: false }
+    );
+    const compactResult = await runCompaction(instruction);
+    if (!compactResult?.ok) {
+      appendAssistantMessage(`Compaction failed: ${compactResult?.error || "unknown error"}`, {
+        excludeFromRequest: true,
+        persistHistory: false,
+      });
+    } else {
+      appendAssistantMessage(
+        `Compaction complete. Summary (${compactResult.summary.length} chars) plus the most recent context retained.`,
+        { excludeFromRequest: true, persistHistory: false }
+      );
+    }
     await rewriteSessionWithCurrentMessages();
     refreshMainBufferAfterCommand();
     return true;
@@ -8029,6 +8302,81 @@ function runFormatSelfTest() {
     out(`FORMAT_FAIL: ${String(error?.message || error)}\n`);
     return 1;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Compaction self-test: exercises token estimation, the tool-output cap, and
+// summary detection without needing a live LLM call.
+// ---------------------------------------------------------------------------
+function runCompactionSelfTest() {
+  const out = (s) => process.stdout.write(s);
+  try {
+    // Token estimation
+    if (estimateTokensForText("") !== 1) {
+      out("COMPACT_FAIL: empty text should estimate to 1 token\n");
+      return 1;
+    }
+    if (estimateTokensForText("abcd") !== 1) {
+      out("COMPACT_FAIL: 4 chars should estimate to 1 token\n");
+      return 1;
+    }
+    if (estimateTokensForText("abcdefghijklmnop") !== 4) {
+      out("COMPACT_FAIL: 16 chars should estimate to 4 tokens\n");
+      return 1;
+    }
+
+    // Tool output cap
+    const short = capToolHistoryText("hello world", 16000);
+    if (short !== "hello world") {
+      out("COMPACT_FAIL: short text should pass through unchanged\n");
+      return 1;
+    }
+    const big = capToolHistoryText("x".repeat(10000), 500); // 500 tokens => 2000 chars
+    if (big.length >= 10000 || !big.includes("tool result truncated")) {
+      out("COMPACT_FAIL: oversized tool output should be capped with a marker\n");
+      return 1;
+    }
+    if (big.length < 1500 || big.length > 2600) {
+      // head 1000 + marker + tail 1000 = ~2100
+      out(`COMPACT_FAIL: capped output wrong size: ${big.length}\n`);
+      return 1;
+    }
+
+    // Summary detection
+    if (!isCompactionSummaryEntry({ role: "user", content: "_summary\nhandoff text" })) {
+      out("COMPACT_FAIL: _summary-prefixed user entry should be detected\n");
+      return 1;
+    }
+    if (isCompactionSummaryEntry({ role: "assistant", content: "_summary\nhandoff" })) {
+      out("COMPACT_FAIL: assistant entries should never be summaries\n");
+      return 1;
+    }
+    if (isCompactionSummaryEntry({ role: "user", content: "normal user text" })) {
+      out("COMPACT_FAIL: normal user text should not be a summary\n");
+      return 1;
+    }
+
+    // Threshold math (without touching live config)
+    if (getCompactionThreshold() < 1) {
+      out("COMPACT_FAIL: compaction threshold must be positive\n");
+      return 1;
+    }
+    if (getToolOutputTokenLimit() < 1) {
+      out("COMPACT_FAIL: tool output limit must be positive\n");
+      return 1;
+    }
+
+    out("COMPACT_OK\n");
+    return 0;
+  } catch (error) {
+    out(`COMPACT_FAIL: ${String(error?.message || error)}\n`);
+    return 1;
+  }
+}
+
+if (process.argv.includes("--self-test-compact")) {
+  const code = runCompactionSelfTest();
+  process.exit(code);
 }
 
 // ---------------------------------------------------------------------------
