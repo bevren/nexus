@@ -2174,12 +2174,6 @@ def skill_python_path() -> str:
         return "error: " + str(exc)
 
 FUNCTIONS = {
-    "insert_memory": insert_memory,
-    "retrieve_memory": retrieve_memory,
-    "memory_keywords": memory_keywords,
-    "remove_memory": remove_memory,
-    "update_memory": update_memory,
-    "exclude_history_messages": exclude_history_messages,
     "create_plan": create_plan,
     "update_plan": update_plan,
     "get_current_plan": get_current_plan,
@@ -2197,10 +2191,6 @@ FUNCTIONS = {
     "write_file": write_file,
     "replace_in_file": replace_in_file,
     "run_shell": run_shell,
-    "get_git_status": get_git_status,
-    "get_git_diff": get_git_diff,
-    "get_git_log": get_git_log,
-    "get_file_info": get_file_info,
     "read_file_summary": read_file_summary,
     "fetch_url": fetch_url,
     "list_skills": list_skills,
@@ -2220,12 +2210,6 @@ FUNCTIONS = {
 }
 
 FUNCTION_DESCRIPTIONS = {
-    "insert_memory": "insert_memory(memory: str, keyword: str|list[str]) -> dict: Save persistent memory with one or more keywords. Preference statements (like/dislike/prefer/love/hate) are auto-upserted by topic to prevent conflicting duplicates.",
-    "retrieve_memory": "retrieve_memory(query: str = '', use_regex: bool = False, case_sensitive: bool = False, regex_flags: str = '', keywords: str|list[str]|None = None, max_results: int = 20) -> list[dict]: Retrieve memories by string/regex and/or keyword filters.",
-    "memory_keywords": "memory_keywords() -> list[dict]: List all inserted memory keywords with usage counts.",
-    "remove_memory": "remove_memory(id: str) -> dict: Remove one memory record by id.",
-    "update_memory": "update_memory(id: str, memory: str|None = None, keyword: str|list[str]|None = None) -> dict: Update one memory record by id (memory text and/or keywords).",
-    "exclude_history_messages": "exclude_history_messages(latest_n: int = 0, role: str = '', query: str = '', use_regex: bool = False, case_sensitive: bool = False, regex_flags: str = '', max_matches: int = 200, include_system: bool = False) -> dict: Exclude matching existing chat messages from future LLM requests.",
     "create_plan": "create_plan(entries: str|list[str]) -> dict: Create a new workspace to-do plan and return the full plan.",
     "update_plan": "update_plan(completed: int|str|list[int|str]|None = None, new_entries: str|list[str]|None = None) -> dict: Mark plan entries completed and/or add new plan entries, then return updated entries and current plan.",
     "get_current_plan": "get_current_plan() -> dict: Get current workspace plan with [ ]/[✓] style formatted output.",
@@ -2243,10 +2227,6 @@ FUNCTION_DESCRIPTIONS = {
     "write_file": "write_file(path: str, content: str) -> dict: Write text file (create/overwrite) in workspace.",
     "replace_in_file": "replace_in_file(path: str, old: str, new: str, count: int = -1, use_regex: bool = False, regex_flags: str = '') -> dict: Replace text in a file (literal or regex).",
     "run_shell": "run_shell(command: str, timeout: int|float = 10) -> dict: Run shell command with timeout seconds.",
-    "get_git_status": "get_git_status() -> dict: Return git status summary.",
-    "get_git_diff": "get_git_diff(path: str = '', staged: bool = False, context_lines: int = 3, max_chars: int = 60000) -> dict: Return git diff text.",
-    "get_git_log": "get_git_log(max_count: int = 20) -> dict: Return recent git commits.",
-    "get_file_info": "async get_file_info(path: str) -> dict: Return file metadata inside workspace.",
     "read_file_summary": "async read_file_summary(path: str) -> dict: Return summary/preview for large files.",
     "fetch_url": "fetch_url(url: str, max_chars: int = 20000) -> dict: Fetch a URL and extract visible text content (HTML stripped). Returns {url, title, text, truncated, error}.",
     "skill_python_path": "skill_python_path() -> str: Return the shared skill venv python executable (creates venv if needed). Use with run_shell to run skill scripts that depend on requirements.txt packages.",

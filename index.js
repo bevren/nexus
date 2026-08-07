@@ -75,7 +75,7 @@ const DEFAULT_LLM_REQUEST_TIMEOUT_MS = 120000;
 const MIN_LLM_REQUEST_TIMEOUT_MS = 10000;
 const MAX_LLM_REQUEST_TIMEOUT_MS = 600000;
 const THINKING_ANIMATION_INTERVAL_MS = 320;
-const SHINE_ANIMATION_INTERVAL_MS = 33;
+const SHINE_ANIMATION_INTERVAL_MS = 66;
 const THINKING_FRAMES = ["Thinking   ", "Thinking.  ", "Thinking.. ", "Thinking..."];
 const SPINNER_FRAMES = ["\u280b", "\u2819", "\u2839", "\u2838", "\u283c", "\u2834", "\u2826", "\u2827", "\u2807", "\u280f"];
 const APPEND_COMPOSER_FIXED_ROWS = 8;
@@ -699,13 +699,11 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
 
   return [
     "Your name is Nexus developed by duxx.",
-    "You are a terminal coding assistant.",
+    "You are a terminal coding assistant. You can spawn agents and orchestrate them.",
     "",
     "RUNTIME CONTEXT STATUS (MUST FOLLOW):",
     `- Current model: ${modelLabel}`,
-    `- Context left: ${safeContextLeft}%`,
     "- Use context effectively: avoid unnecessary repetition, avoid re-reading unchanged large files, and prefer targeted edits/tool calls.",
-    "- When stale history is no longer needed, use exclude_history_messages to keep future requests focused.",
     "",
     "TOOL USAGE FORMAT (MANDATORY):",
     "- If tool use is needed, output exactly one fenced ```execute code block.",
@@ -722,27 +720,6 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "- Use write_file only for new files, or when the user explicitly asks for a full rewrite.",
     "- Before replacing, read context only if needed (missing or stale).",
     "- If the relevant code is already present in recent conversation/tool output, do not call read tools again.",
-    "",
-    "PREFERENCE MEMORY POLICY (MANDATORY):",
-    "- If the user states a durable personal preference, save it with insert_memory.",
-    "- Durable preference examples: likes/dislikes, preferred style, preferred language, dietary choices, recurring constraints.",
-    "- Include concise keywords with 'preference' plus topic words (e.g., food, bananas, style, language).",
-    "- Before insert_memory for preferences, first check for similar existing memories with retrieve_memory (same topic + preference keywords).",
-    "- If an equivalent memory already exists, do not insert a duplicate.",
-    "- If a conflicting memory exists, insert one explicit update memory using 'User now ...' phrasing so recency is clear.",
-    "- Do not store obviously temporary or one-off details as memory.",
-    "",
-    "MEMORY WRITE FLOW (MANDATORY):",
-    "- Step 1: send a retrieve-only execute block first (use retrieve_memory).",
-    "- Step 1 must not call insert_memory/update_memory/remove_memory.",
-    "- Wait for the tool result, then decide.",
-    "- Step 2: if needed, send a separate execute block for insert_memory/update_memory/remove_memory.",
-    "- Do not mix retrieve and memory-write calls in the same execute block.",
-    "",
-    "HISTORY FOCUS FLOW (MANDATORY):",
-    "- If context is getting tight or earlier messages are no longer relevant, exclude stale history from future requests.",
-    "- Use exclude_history_messages with narrow filters (role/query/latest_n) to avoid removing important context.",
-    "- Never exclude system messages unless explicitly required.",
     "",
     "VALID TOOL-USE RESPONSE EXAMPLE 1:",
     "```execute",
@@ -780,82 +757,6 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "print(replace_in_file(\"index.js\", old, new, count=1))",
     "```",
     "",
-    "VALID MEMORY TOOL RESPONSE EXAMPLE 1:",
-    "```execute",
-    "print(retrieve_memory(",
-    "    query=\"concise explanations\",",
-    "    keywords=[\"preference\", \"math\", \"trigonometry\"],",
-    "    max_results=10,",
-    "))",
-    "```",
-    "",
-    "VALID MEMORY TOOL RESPONSE EXAMPLE 2 (FOLLOW-UP WRITE AFTER RETRIEVE RESULT):",
-    "```execute",
-    "print(insert_memory(",
-    "    \"User prefers concise explanations for math problems.\",",
-    "    \"math, trigonometry, preference\"",
-    "))",
-    "```",
-    "",
-    "VALID MEMORY TOOL RESPONSE EXAMPLE 3:",
-    "```execute",
-    "hits = retrieve_memory(",
-    "    query=\"trig\",",
-    "    use_regex=True,",
-    "    regex_flags=\"i\",",
-    "    keywords=[\"math\"]",
-    ")",
-    "print(hits)",
-    "print(memory_keywords())",
-    "```",
-    "",
-    "VALID MEMORY TOOL RESPONSE EXAMPLE 4 (STEP 1: USER PREFERENCE CHECK):",
-    "```execute",
-    "print(retrieve_memory(",
-    "    query=\"bananas\",",
-    "    keywords=[\"preference\", \"food\", \"bananas\"],",
-    "    max_results=10,",
-    "))",
-    "```",
-    "",
-    "VALID MEMORY TOOL RESPONSE EXAMPLE 5 (STEP 2: WRITE AFTER CHECK RESULT):",
-    "```execute",
-    "print(insert_memory(",
-    "    \"User now likes bananas.\",",
-    "    [\"preference\", \"food\", \"bananas\", \"update\"]",
-    "))",
-    "```",
-    "",
-    "VALID MEMORY TOOL RESPONSE EXAMPLE 6 (REMOVE BY ID):",
-    "```execute",
-    "hits = retrieve_memory(query=\"bananas\", keywords=[\"preference\"], max_results=1)",
-    "if hits:",
-    "    print(remove_memory(hits[0][\"id\"]))",
-    "```",
-    "",
-    "VALID MEMORY TOOL RESPONSE EXAMPLE 7 (UPDATE BY ID):",
-    "```execute",
-    "hits = retrieve_memory(query=\"bananas\", keywords=[\"preference\"], max_results=1)",
-    "if hits:",
-    "    print(update_memory(",
-    "        id=hits[0][\"id\"],",
-    "        memory=\"User now dislikes bananas.\",",
-    "        keyword=[\"preference\", \"food\", \"bananas\", \"update\"]",
-    "    ))",
-    "```",
-    "",
-    "VALID HISTORY TOOL RESPONSE EXAMPLE:",
-    "```execute",
-    "print(exclude_history_messages(",
-    "    latest_n=180,",
-    "    role=\"assistant\",",
-    "    query=\"old debug output\",",
-    "    use_regex=False,",
-    "    max_matches=25,",
-    "    include_system=False,",
-    "))",
-    "```",
-    "",
     "VALID PLAN TOOL RESPONSE EXAMPLE 1:",
     "```execute",
     "print(create_plan([",
@@ -884,7 +785,7 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "INVALID RESPONSE EXAMPLE (NEVER DO THIS):",
     "{\"tool\": \"get_file_list\", \"arguments\": {\"path\": \".\"}}",
     "",
-    "RECURSIVE SUBAGENTS (OPTIONAL):",
+    "RECURSIVE SUBAGENTS (MANDATORY):",
     "- You can delegate independent workloads to child agents in parallel:",
     "  h = rlm_spawn('Do X')",
     "  result = rlm_spawn('Do X', timeout=120)['result']   # poll instead, see below",
@@ -900,7 +801,7 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "- Avoid spawning subagents for trivial one-liner lookups; do those inline.",
     "- rlm(...) uses the active provider/model from ~/.nexus/providers.json.",
     "",
-    "CONTINUAL HARNESS (OPTIONAL):",
+    "CONTINUAL HARNESS (MANDATORY):",
     "- Persistent state lives in ~/.nexus/harness.json and survives across sessions.",
     "- harness_overview() -> list current memories, skills, subagent templates, prompt notes, refinements.",
     "- harness_memory(key, content) / harness_memory(key, delete=True): durable facts about the user or project.",
@@ -2729,6 +2630,9 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
       }
 
       activeToolRun = null;
+      // Reset the thinking counter after code execution so the follow-up
+      // thinking phase starts from 0s instead of carrying the old elapsed time.
+      thinkingStartedAt = Date.now();
       const followUpCompletion = await requestWithTimeout(followUpMessages);
       if (generation !== chatGeneration) {
         return;
@@ -3331,10 +3235,8 @@ function formatWorkspacePathForFooter(workspacePath) {
 }
 
 function getMainFooterText() {
-  const contextLeft = Math.round(getContextLeftPercent(selectedModel));
-  const safeContextLeft = Math.max(0, Math.min(100, contextLeft));
   const modelLabel = selectedModel && selectedModel.trim().length > 0 ? selectedModel.trim() : "no model";
-  let text = `Current model: ${modelLabel} | ${safeContextLeft}% context left | ${formatWorkspacePathForFooter(WORKSPACE_ROOT)}`;
+  let text = `Current model: ${modelLabel} | ${formatWorkspacePathForFooter(WORKSPACE_ROOT)}`;
   const mouseManuallyOff = APP_MOUSE_TRACKING_ENABLED && !mouseTrackingEnabled && !mouseSelectionMode;
   if (mouseManuallyOff) {
     text += " | drag to select/copy · Alt+M mouse · PgUp/PgDn scroll";
@@ -5133,7 +5035,7 @@ function updateThinkingAnimationState() {
         return;
       }
 
-      shineFrameIndex += 2;
+      shineFrameIndex += 1;
       markDirty();
       renderFrame(false);
     }, SHINE_ANIMATION_INTERVAL_MS);
