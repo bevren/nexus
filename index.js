@@ -319,6 +319,8 @@ let mcpBridgeReadyResolve = null;
 let mcpBridgeReadyPromise = null;
 let mcpBridgeState = "";
 let mcpBridgeError = "";
+let mcpStartupActive = false;
+let mcpStartupHasConfig = false;
 let answerRevealTimer = null;
 let answerRevealSettlePending = false;
 let forceChatRefreshFlag = false;
@@ -5434,7 +5436,7 @@ function getMainFrameTopForCurrentLayout(rows, cols) {
   const inputVisualLines = buildInputVisualLines(cols);
   const menuLines = getCommandMenuVisualLines(cols);
   const menuHeight = menuLines.length;
-  const statusVisible = isAssistantThinking();
+  const statusVisible = isAssistantThinking() || isMcpStartupStatusVisible();
   const statusRows = statusVisible ? STATUS_BAR_ROWS : 0;
   const statusChatGapRows = statusVisible ? STATUS_CHAT_GAP : 0;
   const statusInputGapRows = statusVisible ? STATUS_INPUT_GAP : 0;
@@ -5502,6 +5504,10 @@ function getAppendReservedBottomRows(cols, includeStatus = true) {
 
 function isAssistantThinking() {
   return pendingAssistantRequests > 0;
+}
+
+function isMcpStartupStatusVisible() {
+  return mcpStartupActive && mcpStartupHasConfig;
 }
 
 function cancelAndClearActiveToolRun() {
@@ -5599,6 +5605,12 @@ function getStatusBarText() {
     return "";
   }
 
+  if (isMcpStartupStatusVisible()) {
+    const frame = SPINNER_FRAMES[spinnerFrameIndex % SPINNER_FRAMES.length];
+    const text = "Starting MCP Servers...";
+    return `${frame} ${applyShineEffect(text, shineFrameIndex, 8)}`;
+  }
+
   if (!isAssistantThinking()) {
     activeToolRun = null;
     return "";
@@ -5647,7 +5659,9 @@ function applyShineEffect(text, frameIndex, windowWidth) {
 }
 
 function updateThinkingAnimationState() {
-  const shouldAnimate = activeBuffer === "main" && isAssistantThinking();
+  const shouldAnimate =
+    activeBuffer === "main" &&
+    (isAssistantThinking() || isMcpStartupStatusVisible());
 
   if (!shouldAnimate) {
     if (thinkingAnimationTimer) {
@@ -6135,7 +6149,7 @@ function getChatViewportInfo(cols, rows) {
   const footerHeight = menuHeight > 0 ? 0 : 1;
   const activeBottomPadding = menuHeight > 0 ? BOTTOM_PADDING : INPUT_BOTTOM_PADDING_NO_MENU;
   const frameHeight = inputVisualLines.length;
-  const statusVisible = isAssistantThinking();
+  const statusVisible = isAssistantThinking() || isMcpStartupStatusVisible();
   const chatInputGapRows = getViewportChatInputGapRows(statusVisible);
   const footerBlockHeight = menuHeight > 0 ? 0 : MAIN_FOOTER_GAP + footerHeight;
   const menuBlockHeight = footerBlockHeight + (menuHeight > 0 ? MENU_INPUT_GAP + menuHeight : 0);
@@ -7021,7 +7035,7 @@ function renderFrame(forceChatRefresh = false) {
   const frameHeight = inputVisualLines.length;
   const cursorMetrics = getInputCursorMetrics(cols);
   const statusText = getStatusBarText();
-  const statusVisible = statusText.length > 0;
+  const statusVisible = statusText.length > 0 || isMcpStartupStatusVisible();
   const statusRows = statusVisible ? STATUS_BAR_ROWS : 0;
   const statusChatGapRows = statusVisible ? STATUS_CHAT_GAP : 0;
   const statusInputGapRows = statusVisible ? STATUS_INPUT_GAP : 0;
@@ -8958,7 +8972,21 @@ async function initializeApp() {
   // Launch MCP servers and the bridge in parallel with the rest of startup.
   // The bridge becomes reachable whenever the HTTP listener binds; startup
   // continues regardless so a broken server config never blocks the TUI.
-  initMcp().catch(() => {});
+  // Show a "Starting MCP Servers..." status bar while servers spin up.
+  const mcpConfigServers = loadMcpConfig()?.mcpServers || {};
+  mcpStartupHasConfig = Object.keys(mcpConfigServers).length > 0;
+  if (mcpStartupHasConfig) {
+    mcpStartupActive = true;
+  }
+  initMcp()
+    .catch(() => {})
+    .finally(() => {
+      if (mcpStartupHasConfig) {
+        mcpStartupActive = false;
+        markDirty();
+        renderFrame(false);
+      }
+    });
 
   await ensureSystemPromptReady();
   await ensureSessionFileReady();
