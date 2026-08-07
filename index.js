@@ -2808,15 +2808,21 @@ function loadHooksConfig() {
   hooksProject = {};
   hooksUser = {};
   const targetPaths = [
-    [path.join(WORKSPACE_ROOT, ".claude", "settings.json"), (v) => { hooksProject = v; }],
-    [path.join(os.homedir(), ".claude", "settings.json"), (v) => { hooksUser = v; }],
+    [path.join(WORKSPACE_ROOT, ".nexus", "hooks.json"), (v) => { hooksProject = v; }],
+    [path.join(NEXUS_DIR, "hooks.json"), (v) => { hooksUser = v; }],
   ];
   for (const [filePath, assign] of targetPaths) {
     try {
       if (fsSync.existsSync(filePath)) {
         const parsed = JSON.parse(fsSync.readFileSync(filePath, "utf8"));
-        const hooks = parsed && typeof parsed.hooks === "object" ? parsed.hooks : {};
-        assign(hooks);
+        // Accept either { "hooks": { Event: [...] } } or the bare hooks map.
+        const hooks =
+          parsed && typeof parsed.hooks === "object"
+            ? parsed.hooks
+            : parsed && typeof parsed === "object"
+              ? parsed
+              : {};
+        assign(hooks && typeof hooks === "object" ? hooks : {});
       } else {
         assign({});
       }
@@ -6273,7 +6279,7 @@ async function runSlashCommand(commandName, commandArgs = "") {
       }
     }
     if (total === 0) {
-      lines.push("No hooks configured. Add a hooks block to .claude/settings.json or ~/.claude/settings.json.");
+      lines.push("No hooks configured. Add a hooks block to .nexus/hooks.json (project) or ~/.nexus/hooks.json (user).");
     }
     appendAssistantMessage(`Configured hooks (${total}):\n${lines.join("\n")}`, {
       excludeFromRequest: true,
