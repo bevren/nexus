@@ -5634,6 +5634,29 @@ function styleEditedToolHeaderLine(visibleText, toolColor) {
   return `${bulletColor}${bullet}${RESET_COLOR} ${BOLD_WHITE}Edited${RESET_COLOR} ${filePath} (${GREEN_COLOR}+${plusCount}${RESET_COLOR} ${RED_COLOR}-${minusCount}${RESET_COLOR})`;
 }
 
+function isUnifiedDiffText(text) {
+  const source = String(text ?? "");
+  const lines = source.replace(/\r\n/g, "\n").split("\n").map((l) => l.trim());
+  let sawTripleDash = false;
+  let sawTriplePlus = false;
+  for (const line of lines) {
+    if (line.startsWith("diff --git ") || line.startsWith("index ")) {
+      return true;
+    }
+    if (line.startsWith("--- ")) {
+      sawTripleDash = true;
+    } else if (line.startsWith("+++ ")) {
+      sawTriplePlus = true;
+    } else if (/^@@\s+-\d+,\d+\s+\+\d+,\d+\s+@@/.test(line)) {
+      return true;
+    }
+    if (sawTripleDash && sawTriplePlus) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function getDiffBackgroundColor(toolLineText) {
   const raw = String(toolLineText ?? "");
   if (!raw) {
@@ -5720,6 +5743,9 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
 
   const isToolCall =
     role === "tool" || (logicalLines.length > 0 && logicalLines[0].trim().startsWith("\u2022 Ran "));
+  // Unified-diff detection for the whole tool payload; +/- lines only get
+  // the diff background when the output genuinely contains a patch.
+  const looksLikeDiff = isToolCall && isUnifiedDiffText(message);
   const isErrorMessage = role === "error";
   const toolColor = isToolCall
     ? (structuredToolOk === true
@@ -5762,7 +5788,13 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
       if (isErrorMessage) {
         line = `${RED_COLOR}${visibleText}${RESET_COLOR}`;
       } else if (isToolCall) {
-        const diffBgColor = i === 0 && w === 0 ? null : getDiffBackgroundColor(wrappedLine.body);
+        // Only color +/- lines as diff hunks when the whole output actually
+        // looks like a unified diff; otherwise "- some text" from a tool
+        // result would get a misleading red/red background.
+        const diffBgColor =
+          isToolCall && looksLikeDiff && !(i === 0 && w === 0)
+            ? getDiffBackgroundColor(wrappedLine.body)
+            : null;
         if (diffBgColor) {
           line = `${diffBgColor}${visibleText.padEnd(contentWidth, " ")}${RESET_COLOR}`;
         } else {
@@ -8386,6 +8418,47 @@ function runFormatSelfTest() {
         out("FORMAT_FAIL: preserved multiline blank lines should stay blank\n");
         return 1;
       }
+    }
+
+    // Diff detection: a real unified diff should be detected, plain tool
+    // text starting with "-" must NOT be treated as a diff hunk.
+    const realDiff = [
+      "diff --git a/index.js b/index.js",
+      "index abc123..def456 100644",
+      "--- a/index.js",
+      "+++ b/index.js",
+      "@@ -10,3 +10,4 @@ async function start() {",
+      " console.log(\"start\");",
+      "-console.log(\"removed\");",
+      "+console.log(\"added\");",
+      " console.log(\"end\");",
+    ].join("\n");
+    if (!isUnifiedDiffText(realDiff)) {
+      out("FORMAT_FAIL: real unified diff should be detected");
+      return 1;
+    }
+    if (isUnifiedDiffText("- some bullet text\nnothing else")) {
+      out("FORMAT_FAIL: plain tool text starting with '-' must not be a diff");
+      return 1;
+    }
+
+    // Rendering: only lines inside a genuine diff get diff backgrounds;
+    // "- something" from ordinary tool output must stay plain.
+    const plainToolLines = buildTranscriptLinesForEntry(
+      { role: "tool", content: "- some bullet text\nnormal line" },
+      80
+    );
+    const plainToolJoined = plainToolLines.join("\n");
+    if (plainToolJoined.includes(DIFF_REMOVE_BG_COLOR) || plainToolJoined.includes(DIFF_ADD_BG_COLOR)) {
+      out("FORMAT_FAIL: plain tool text should not get diff background");
+      return 1;
+    }
+
+    const diffToolLines = buildTranscriptLinesForEntry({ role: "tool", content: realDiff }, 80);
+    const diffToolJoined = diffToolLines.join("\n");
+    if (!diffToolJoined.includes(DIFF_REMOVE_BG_COLOR) || !diffToolJoined.includes(DIFF_ADD_BG_COLOR)) {
+      out("FORMAT_FAIL: real diff lines should get diff backgrounds");
+      return 1;
     }
 
     out("FORMAT_OK\n");
