@@ -6374,7 +6374,6 @@ function buildChatVisualLines(cols, sourceEntries = messages) {
     const reasoningText = role === "assistant" ? extractReasoningDisplayText(entry?.reasoningDetails) : "";
     const reasoningLines = [];
     if (reasoningText) {
-      reasoningLines.push(`${PLACEHOLDER_COLOR}◦ reasoning${RESET_COLOR}`);
       const logical = reasoningText.split("\n");
       for (const line of logical) {
         const wrapped = wrapLineWithPrefixes(line, "  ", "  ", contentWidth);
