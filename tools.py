@@ -2173,6 +2173,42 @@ def skill_python_path() -> str:
     except Exception as exc:
         return "error: " + str(exc)
 
+def set_reminder(when: str, prompt: str) -> dict:
+    """Schedule a one-shot session reminder via the TUI bridge.
+
+    when:    a human time phrase, e.g. "in 5 minutes", "in 2 hours", "at 3pm",
+             "tomorrow 9am".
+    prompt:  the exact action/message to run when the reminder fires.
+    Returns: {ok: true, text: "...", result: {...}} or {ok: false, error: "..."}.
+    """
+    import urllib.request
+
+    if not isinstance(when, str) or not when.strip():
+        return {"ok": False, "error": "set_reminder: 'when' must be a non-empty string"}
+    if not isinstance(prompt, str) or not prompt.strip():
+        return {"ok": False, "error": "set_reminder: 'prompt' must be a non-empty string"}
+
+    info = _read_mcp_bridge_info()
+    if not info:
+        return {
+            "ok": False,
+            "error": "set_reminder: TUI bridge not available. Is the TUI running?",
+        }
+
+    url = f"http://127.0.0.1:{info['port']}/"
+    payload = json.dumps(
+        {"method": "reminder", "when": when.strip(), "prompt": prompt.strip()}
+    ).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            url, data=payload, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        return {"ok": False, "error": f"set_reminder: bridge request failed: {exc}"}
+
+
 def _read_mcp_bridge_info() -> dict:
     bridge_file = NEXUS_DIR / "mcp_bridge.json"
     try:
@@ -2279,6 +2315,7 @@ FUNCTIONS = {
     "web_search": web_search,
     "mcp_list": mcp_list,
     "mcp_call": mcp_call,
+    "set_reminder": set_reminder,
 }
 
 FUNCTION_DESCRIPTIONS = {
@@ -2317,6 +2354,7 @@ FUNCTION_DESCRIPTIONS = {
     "refine_reflection": "refine_reflection(auto: bool = True) -> dict: Auto-synthesize a refinement from recent subagent results and prompt notes.",
     "mcp_list": "mcp_list() -> dict: List all configured MCP servers and the tool names each exposes. Returns {ok: bool, servers?: {name: {status, error?, tools: [name]}}, error?: str}.",
     "mcp_call": "mcp_call(server: str, tool: str, args: dict | None = None) -> dict: Call a tool exposed by an MCP server (configured in ~/.nexus/mcp_config.json). Returns the server's result as {ok: bool, result?: object, text?: str, error?: str}.",
+    "set_reminder": "set_reminder(when: str, prompt: str) -> dict: Schedule a one-shot session reminder via the TUI bridge. when is a human phrase like 'in 5 minutes', 'in 2 hours', 'at 3pm', 'tomorrow 9am'. prompt is the exact action/message to run when it fires. Fires once as a normal user turn. Use whenever the user asks to be reminded or to remember something later.",
 }
 
 

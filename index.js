@@ -215,6 +215,8 @@ const FALLBACK_TOOL_DESCRIPTIONS = {
     "get_git_log(max_count: int = 20) -> dict: Return recent git commits.",
   get_file_info: "async get_file_info(path: str) -> dict: Return file metadata inside workspace.",
   read_file_summary: "async read_file_summary(path: str) -> dict: Return summary/preview for large files.",
+  set_reminder:
+    "set_reminder(when: str, prompt: str) -> dict: Schedule a one-shot session reminder. when is a human phrase like 'in 5 minutes', 'in 2 hours', 'at 3pm', 'tomorrow 9am'. prompt is the exact action/message to run when it fires. Fires once as a normal user turn. Use whenever the user asks to be reminded or to remember something later.",
 };
 
 let input = "";
@@ -900,6 +902,14 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "Predefined Python helper functions available in the execution environment:",
     ...(lines.length > 0 ? lines : ["- (none)"]),
     "",
+    "REMINDERS:",
+    "- When the user asks to be reminded or to remember something later, call set_reminder in an execute block:",
+    "```execute",
+    "print(set_reminder(when='in 5 minutes', prompt='do this'))",
+    "```",
+    "- when accepts human phrases: 'in 5 minutes', 'in 2 hours', 'at 3pm', 'tomorrow 9am'. Do not invent a timestamp; pass the user's phrase.",
+    "- After the tool returns, confirm briefly with the scheduled time.",
+    "",
     "MCP TOOLS (Model Context Protocol servers, optional):",
     "- MCP servers are separate processes exposing extra capabilities as tools.",
     "- Call them from within an execute block using: mcp_call(server, tool, args) -> dict",
@@ -1295,6 +1305,44 @@ async function startMcpBridgeServer() {
 async function handleMcpBridgeRequest(parsed) {
   if (!parsed || typeof parsed !== "object") {
     return { ok: false, error: "bad request" };
+  }
+
+  // Internal "reminder" method: used by the Python set_reminder tool to
+  // schedule a one-shot loop through the TUI (same engine as /loop once).
+  if (parsed.method === "reminder") {
+    const when = typeof parsed.when === "string" ? parsed.when.trim() : "";
+    const prompt = typeof parsed.prompt === "string" ? parsed.prompt.trim() : "";
+    if (!when || !prompt) {
+      return { ok: false, error: "set_reminder requires 'when' and 'prompt' strings" };
+    }
+    if (loopTasks.length >= LOOP_MAX_TASKS) {
+      return { ok: false, error: `this session already has ${LOOP_MAX_TASKS} scheduled loops` };
+    }
+    const extracted = extractWhenFromText(when);
+    if (!extracted) {
+      return {
+        ok: false,
+        error:
+          `could not parse reminder time from "${when}". Use formats like ` +
+          '"in 5 minutes", "in 2 hours", "at 3pm", "tomorrow 9am".',
+      };
+    }
+    const task = scheduleLoopTask(extracted.when, prompt, {
+      oneshot: true,
+      dynamic: false,
+      fireAt: extracted.when,
+    });
+    startLoopScheduler();
+    if (process.stdout.isTTY) {
+      markDirty();
+      renderFrame(true);
+    }
+    await rewriteSessionWithCurrentMessages().catch(() => {});
+    return {
+      ok: true,
+      result: { id: task.id, whenDisplay: extracted.display },
+      text: `Reminder set for ${extracted.display} (${task.id}). Fires once and sends: "${prompt}"`,
+    };
   }
 
   const serverName = typeof parsed.server === "string" ? parsed.server : "";
@@ -2609,30 +2657,6 @@ function extractWhenFromText(text) {
   }
 
   return null;
-}
-
-// Natural-language one-shot reminder detection:
-//   "remind me at 3pm to push the release branch"
-//   "remind me in 45 minutes to check the tests"
-//   "set a reminder for tomorrow 9am to call mom"
-// Returns null when the input isn't a schedulable reminder, so the message
-// falls through to the normal LLM turn.
-function parseReminderInput(text) {
-  const raw = String(text ?? "").trim();
-  if (!/^(remind me|set a reminder)\b/i.test(raw)) {
-    return null;
-  }
-  let rest = raw.replace(/^(remind me|set a reminder)\b/i, "").trim();
-  rest = rest.replace(/^(?:to|that|for)\s+/, "").trim();
-  const extracted = extractWhenFromText(rest);
-  if (!extracted) {
-    return null;
-  }
-  const prompt = extracted.rest.replace(/^(?:to|that|for)\s+/, "").trim();
-  if (!prompt) {
-    return null;
-  }
-  return { when: extracted.when, whenDisplay: extracted.display, promptRaw: raw, prompt };
 }
 
 async function runCompaction(customInstruction = "") {
@@ -9089,7 +9113,7 @@ function runFormatSelfTest() {
 // or live LLM call. Because parseLoopCommandArgs/scheduleLoopTask live in the
 // module scope, we can drive them directly here.
 // ---------------------------------------------------------------------------
-function runLoopSelfTest() {
+async function runLoopSelfTest() {
   const out = (s) => process.stdout.write(s);
   try {
     // Interval token parsing
@@ -9240,25 +9264,32 @@ function runLoopSelfTest() {
       return 1;
     }
 
-    // Natural-language reminders
-    const rem1 = parseReminderInput("remind me at 3pm to push the release branch");
-    if (!rem1 || rem1.whenDisplay.includes("3:00") !== true || rem1.prompt !== "push the release branch") {
-      out(`LOOP_FAIL: parseReminderInput(remind me at 3pm) wrong: ${JSON.stringify(rem1)}\n`);
+    // Reminder bridge method (the set_reminder tool backend): a valid
+    // phrase schedules exactly one one-shot; a bad phrase or missing
+    // prompt return errors without scheduling anything.
+    const savedBridgeTasks = loopTasks;
+    loopTasks = [];
+    const bridge = await handleMcpBridgeRequest({ method: "reminder", when: "in 1 minute", prompt: "bridge test" });
+    if (!bridge || bridge.ok !== true || !bridge.result || !bridge.result.id) {
+      out(`LOOP_FAIL: reminder bridge method failed: ${JSON.stringify(bridge)}\n`);
       return 1;
     }
-    const rem2 = parseReminderInput("set a reminder for in 10 minutes to check the tests");
-    if (!rem2 || rem2.prompt !== "check the tests") {
-      out(`LOOP_FAIL: parseReminderInput(set a reminder for in 10m) wrong: ${JSON.stringify(rem2)}\n`);
+    if (loopTasks.length !== 1 || loopTasks[0].oneshot !== true || loopTasks[0].prompt !== "bridge test") {
+      out("LOOP_FAIL: reminder bridge should schedule exactly one one-shot task\n");
       return 1;
     }
-    if (parseReminderInput("can you remind me later") !== null) {
-      out("LOOP_FAIL: 'can you remind me later' should not schedule\n");
+    loopTasks = [];
+    const badBridge = await handleMcpBridgeRequest({ method: "reminder", when: "sometime later", prompt: "x" });
+    if (!badBridge || badBridge.ok !== false || loopTasks.length !== 0) {
+      out(`LOOP_FAIL: reminder bridge should reject unparseable time: ${JSON.stringify(badBridge)}\n`);
       return 1;
     }
-    if (parseReminderInput("what time is it") !== null) {
-      out("LOOP_FAIL: non-reminder text should return null\n");
+    const missingBridge = await handleMcpBridgeRequest({ method: "reminder", when: "at 3pm" });
+    if (!missingBridge || missingBridge.ok !== false) {
+      out("LOOP_FAIL: reminder bridge should reject a missing prompt\n");
       return 1;
     }
+    loopTasks = savedBridgeTasks;
 
     // One-shot schedule via fireAt
     const shot = scheduleLoopTask(null, "notify", { oneshot: true, dynamic: false, fireAt: Date.now() + 60 * 60 * 1000 });
@@ -9362,8 +9393,7 @@ if (process.argv.includes("--self-test-compact")) {
 }
 
 if (process.argv.includes("--self-test-loop")) {
-  const code = runLoopSelfTest();
-  process.exit(code);
+  runLoopSelfTest().then((code) => process.exit(code));
 }
 
 // ---------------------------------------------------------------------------
@@ -10255,33 +10285,8 @@ process.stdin.on("keypress", async (str, key) => {
 
     cancelIdleFlush();
     burstMode = false;
-    // Natural-language reminder interception: "remind me at 3pm to ..." or
-    // "set a reminder for tomorrow 9am ..." schedule a one-shot loop instead
-    // of sending the text to the model.
-    const reminder = parseReminderInput(trimmedInput);
-    if (reminder) {
-      if (loopTasks.length >= LOOP_MAX_TASKS) {
-        appendTuiErrorMessage("/loop", "failed because this session already has the maximum number of scheduled loops");
-        return;
-      }
-      const task = scheduleLoopTask(reminder.when, reminder.prompt, {
-        oneshot: true,
-        dynamic: false,
-        fireAt: reminder.when,
-      });
-      startLoopScheduler();
-      resetComposerState();
-      cancelIdleFlush();
-      burstMode = false;
-      appendAssistantMessage(
-        `Reminder set for ${reminder.whenDisplay} (${task.id}). I'll send: "${reminder.prompt}"`,
-        { excludeFromRequest: true, persistHistory: false }
-      );
-      await rewriteSessionWithCurrentMessages();
-      refreshMainBufferAfterCommand();
-      return;
-    }
-
+    // Reminders go through the model via the set_reminder tool, which the
+    // agent calls when the user asks to be reminded ("remind me in 5 min").
     const modelAtSubmit = selectedModel;
     const didAppend = submit();
     if (didAppend) {
