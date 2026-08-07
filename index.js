@@ -291,6 +291,12 @@ let providerEditorDraft = { name: "", base_url: "", api_key: "", model: "" };
 let lastProviderEditorRenderedRows = [];
 let lastProviderEditorRenderedCols = 0;
 let lastProviderEditorRenderedHeight = 0;
+let loopsSelected = 0;
+let loopsScroll = 0;
+let loopsMessage = "";
+let lastLoopsRenderedRows = [];
+let lastLoopsRenderedCols = 0;
+let lastLoopsRenderedHeight = 0;
 let commandBufferQuery = "";
 let lastCommandRenderedRows = [];
 let lastCommandRenderedCols = 0;
@@ -1627,6 +1633,7 @@ async function rewriteSessionWithCurrentMessages() {
       intervalMs: task.intervalMs,
       dynamic: task.dynamic === true,
       oneshot: task.oneshot === true,
+      paused: task.paused === true,
       createdAt: task.createdAt,
       nextFireAt: task.nextFireAt,
       lastDelayMs: task.lastDelayMs,
@@ -2271,6 +2278,7 @@ function normalizeLoopTask(entry) {
     intervalMs: normalizedInterval,
     dynamic,
     oneshot,
+    paused: entry.paused === true,
     createdAt,
     nextFireAt,
     lastRunMessageCount: 0,
@@ -2358,6 +2366,7 @@ function scheduleLoopTask(intervalMinutes, prompt, options = {}) {
     intervalMs,
     dynamic: options.dynamic === true,
     oneshot: options.oneshot === true,
+    paused: options.paused === true,
     createdAt: Date.now(),
     nextFireAt,
     display: options.displayLabel || "",
@@ -2410,7 +2419,7 @@ async function checkDueLoops() {
     return;
   }
   const now = Date.now();
-  const due = loopTasks.filter((task) => task.nextFireAt <= now);
+  const due = loopTasks.filter((task) => task.nextFireAt <= now && task.paused !== true);
   if (due.length === 0) {
     return;
   }
@@ -5513,7 +5522,12 @@ async function runSlashCommand(commandName, commandArgs = "") {
   if (commandName === "/loop" || commandName === "/loops") {
     const args = String(commandArgs ?? "").trim();
 
-    if (commandName === "/loops" || args.toLowerCase().startsWith("cancel")) {
+    if (commandName === "/loops" && !args.toLowerCase().startsWith("cancel")) {
+      openLoopsBuffer();
+      return true;
+    }
+
+    if (args.toLowerCase().startsWith("cancel")) {
       const cancelId = args.toLowerCase().startsWith("cancel")
         ? args.slice("cancel".length).trim()
         : "";
@@ -5838,6 +5852,200 @@ function closeProvidersBuffer() {
   burstMode = false;
   markDirty();
   renderFrame(true);
+}
+
+function getLoopsVisibleCount() {
+  const rows = process.stdout.rows || 24;
+  return Math.max(1, Math.min(20, rows - 4));
+}
+
+function updateLoopsSelectionState() {
+  if (loopTasks.length === 0) {
+    loopsSelected = 0;
+    loopsScroll = 0;
+    return;
+  }
+
+  if (loopsSelected >= loopTasks.length) {
+    loopsSelected = loopTasks.length - 1;
+  }
+
+  if (loopsSelected < loopsScroll) {
+    loopsScroll = loopsSelected;
+  }
+
+  const visibleCount = getLoopsVisibleCount();
+  const maxScroll = Math.max(0, loopTasks.length - visibleCount);
+  if (loopsScroll > maxScroll) {
+    loopsScroll = maxScroll;
+  }
+}
+
+function toggleLoopPaused(id) {
+  const task = loopTasks.find((entry) => entry.id === id);
+  if (!task) {
+    return false;
+  }
+  if (task.paused) {
+    task.paused = false;
+    // A paused recurring loop restarts its countdown when resumed. A paused
+    // one-shot whose time already passed fires on the next scheduler tick.
+    if (!task.oneshot && task.nextFireAt <= Date.now()) {
+      task.nextFireAt = Date.now() + (task.dynamic ? LOOP_DEFAULT_INTERVAL_MS : task.intervalMs);
+    }
+  } else {
+    task.paused = true;
+  }
+  return true;
+}
+
+function formatLoopFireTime(ms) {
+  const at = new Date(ms);
+  return `${formatDayLabel(ms)} at ${formatTimeOfDay(at)}`;
+}
+
+function openLoopsBuffer() {
+  commandBufferQuery = "";
+  lastCommandRenderedRows = [];
+  lastCommandRenderedCols = 0;
+  lastCommandRenderedHeight = 0;
+  input = "";
+  inputCursorIndex = 0;
+  pendingPastedPayloads = [];
+  commandMenuDismissed = false;
+  commandMenuSelected = 0;
+  commandMenuScroll = 0;
+  activeBuffer = "loops";
+  enterAltScreenIfNeeded();
+  isBracketedPasteActive = false;
+  bracketedPasteBuffer = "";
+  pasteParserBuffer = "";
+  loopsSelected = 0;
+  loopsScroll = 0;
+  loopsMessage = "";
+  lastLoopsRenderedRows = [];
+  lastLoopsRenderedCols = 0;
+  lastLoopsRenderedHeight = 0;
+  forceFullClearOnNextRender = true;
+  cancelIdleFlush();
+  burstMode = false;
+  markDirty();
+  renderFrame(true);
+}
+
+function closeLoopsBuffer() {
+  exitAltScreenIfNeeded();
+  activeBuffer = "main";
+  lastLoopsRenderedRows = [];
+  lastLoopsRenderedCols = 0;
+  lastLoopsRenderedHeight = 0;
+  forceFullClearOnNextRender = true;
+  cancelIdleFlush();
+  burstMode = false;
+  markDirty();
+  renderFrame(true);
+}
+
+function renderLoopsBuffer() {
+  process.stdout.write(HIDE_CURSOR);
+
+  const rows = process.stdout.rows || 24;
+  const cols = process.stdout.columns || 80;
+  const panelWidth = Math.min(Math.max(60, Math.floor(cols * 0.85)), cols);
+  const panelLeft = Math.max(0, Math.floor((cols - panelWidth) / 2));
+  const visibleCount = getLoopsVisibleCount();
+  updateLoopsSelectionState();
+
+  if (!hasInitializedScreen) {
+    readline.cursorTo(process.stdout, 0, 0);
+    readline.clearScreenDown(process.stdout);
+    hasInitializedScreen = true;
+  }
+
+  if (forceFullClearOnNextRender) {
+    readline.cursorTo(process.stdout, 0, 0);
+    readline.clearScreenDown(process.stdout);
+    forceFullClearOnNextRender = false;
+    lastLoopsRenderedRows = [];
+    lastLoopsRenderedCols = 0;
+    lastLoopsRenderedHeight = 0;
+  }
+
+  if (lastLoopsRenderedCols !== cols || lastLoopsRenderedHeight !== rows) {
+    lastLoopsRenderedRows = [];
+    lastLoopsRenderedCols = cols;
+    lastLoopsRenderedHeight = rows;
+  }
+
+  const frameRows = Array.from({ length: rows }, () => ({
+    text: " ".repeat(cols),
+    color: null,
+  }));
+
+  const setPanelRow = (y, content, color = null) => {
+    if (y < 0 || y >= rows) {
+      return;
+    }
+    const clipped = content.slice(0, panelWidth).padEnd(panelWidth, " ");
+    const left = " ".repeat(panelLeft);
+    const right = " ".repeat(Math.max(0, cols - panelLeft - panelWidth));
+    frameRows[y] = { text: `${left}${clipped}${right}`.slice(0, cols), color };
+  };
+
+  setPanelRow(0, `Loops (${loopTasks.length} scheduled)`);
+
+  if (loopsMessage) {
+    setPanelRow(1, loopsMessage, PLACEHOLDER_COLOR);
+  }
+
+  if (loopTasks.length === 0) {
+    setPanelRow(2, "no scheduled loops - use /loop <interval> <prompt>", PLACEHOLDER_COLOR);
+  } else {
+    const end = Math.min(loopTasks.length, loopsScroll + visibleCount);
+    for (let i = loopsScroll; i < end; i += 1) {
+      const row = 2 + (i - loopsScroll) + (loopsMessage ? 1 : 0);
+      const task = loopTasks[i];
+      const marker = i === loopsSelected ? "●" : "○";
+      const intervalLabel = task.paused
+        ? "paused"
+        : task.dynamic
+          ? "dynamic"
+          : task.oneshot
+            ? "once"
+            : `every ${formatLoopIntervalLabel(task.intervalMs)}`;
+      const promptPreview = task.prompt.replace(/\r?\n/g, " ").slice(0, 48);
+      const nextText = task.paused || task.oneshot ? "" : `  next: ${formatLoopFireTime(task.nextFireAt)}`;
+      const text = `  ${marker} ${intervalLabel.padEnd(10)} ${promptPreview}${nextText}`;
+      if (i === loopsSelected) {
+        setPanelRow(row, text, BLUE_COLOR);
+      } else if (task.paused) {
+        setPanelRow(row, text, PLACEHOLDER_COLOR);
+      }
+    }
+  }
+
+  setPanelRow(rows - 1, "Enter: pause/resume  Del: delete  Esc: return", PLACEHOLDER_COLOR);
+
+  for (let y = 0; y < rows; y += 1) {
+    const nextRow = frameRows[y];
+    const prevRow = lastLoopsRenderedRows[y];
+    if (prevRow && prevRow.text === nextRow.text && prevRow.color === nextRow.color) {
+      continue;
+    }
+
+    if (nextRow.color === BLUE_COLOR) {
+      writeColoredLine(y, nextRow.text, cols, BLUE_COLOR);
+    } else if (nextRow.color === GREEN_COLOR) {
+      writeColoredLine(y, nextRow.text, cols, GREEN_COLOR);
+    } else if (nextRow.color === PLACEHOLDER_COLOR) {
+      writeColoredLine(y, nextRow.text, cols, PLACEHOLDER_COLOR);
+    } else {
+      writeLine(y, nextRow.text, cols);
+    }
+  }
+
+  lastLoopsRenderedRows = frameRows;
+  dirty = false;
 }
 
 function openProviderEditorBuffer(mode, index) {
@@ -8073,6 +8281,10 @@ function renderFrame(forceChatRefresh = false) {
     renderProviderEditorBuffer();
     return;
   }
+  if (activeBuffer === "loops") {
+    renderLoopsBuffer();
+    return;
+  }
 
   if (!dirty && !forceChatRefresh) {
     return;
@@ -9359,6 +9571,45 @@ async function runLoopSelfTest() {
       return 1;
     }
 
+    // Paused flag: normalize honors it, toggleLoopPaused flips it, and a
+    // paused one-shot is excluded from the resume-expiry cleanup.
+    const pausedStored = normalizeLoopTask({ ...stored, paused: true, oneshot: true });
+    if (!pausedStored || pausedStored.paused !== true) {
+      out("LOOP_FAIL: paused flag should round-trip through normalizeLoopTask\n");
+      return 1;
+    }
+    const savedToggleTasks = loopTasks;
+    loopTasks = [pausedStored];
+    if (!toggleLoopPaused(pausedStored.id) || pausedStored.paused !== false) {
+      out("LOOP_FAIL: toggleLoopPaused should resume a paused task\n");
+      return 1;
+    }
+    if (!toggleLoopPaused(pausedStored.id) || pausedStored.paused !== true) {
+      out("LOOP_FAIL: toggleLoopPaused should pause a running task\n");
+      return 1;
+    }
+    const nowCheck = Date.now();
+    const expiredPausedOneShot = normalizeLoopTask({
+      ...stored,
+      paused: true,
+      oneshot: true,
+      nextFireAt: nowCheck - 1000,
+    });
+    if (!expiredPausedOneShot) {
+      out("LOOP_FAIL: expired paused one-shot should normalize\n");
+      return 1;
+    }
+    loopTasks = [expiredPausedOneShot];
+    const keptAfterExpiryCheck = loopTasks.filter(
+      (task) => !(task.oneshot && task.paused !== true && task.nextFireAt <= nowCheck)
+    );
+    if (keptAfterExpiryCheck.length !== 1) {
+      out("LOOP_FAIL: expired paused one-shot should survive expiry cleanup\n");
+      return 1;
+    }
+    loopTasks = savedToggleTasks;
+    stopLoopScheduler();
+
     // loop.md fallback: getLoopMaintenancePrompt falls back to the built-in
     // prompt when no file exists (no .claude dir in this workspace).
     const pmt = getLoopMaintenancePrompt();
@@ -9697,6 +9948,8 @@ process.stdin.on("data", (rawChunk) => {
     closeSessionsBuffer();
   } else if (activeBuffer === "providers" && chunk === "\u001b") {
     closeProvidersBuffer();
+  } else if (activeBuffer === "loops" && chunk === "\u001b") {
+    closeLoopsBuffer();
   } else if (activeBuffer === "provider_editor" && chunk === "\u001b") {
     ignoreNextProvidersEscape = true;
     suppressKeypressUntil = Date.now() + 200;
@@ -9932,6 +10185,80 @@ process.stdin.on("keypress", async (str, key) => {
     if (key?.sequence === "\r" || key?.name === "return" || key?.name === "enter") {
       await loadSelectedSessionIntoChat();
       closeSessionsBuffer();
+      return;
+    }
+
+    return;
+  }
+
+  if (activeBuffer === "loops") {
+    if (key?.ctrl) {
+      return;
+    }
+
+    if (
+      key?.name === "escape" ||
+      key?.sequence === "\u001b" ||
+      str === "\u001b"
+    ) {
+      closeLoopsBuffer();
+      return;
+    }
+
+    if (key?.name === "up" || key?.name === "down") {
+      if (loopTasks.length > 0) {
+        if (key.name === "up") {
+          loopsSelected = Math.max(0, loopsSelected - 1);
+        } else {
+          loopsSelected = Math.min(loopTasks.length - 1, loopsSelected + 1);
+        }
+
+        if (loopsSelected < loopsScroll) {
+          loopsScroll = loopsSelected;
+        } else {
+          const visibleCount = getLoopsVisibleCount();
+          if (loopsSelected >= loopsScroll + visibleCount) {
+            loopsScroll = loopsSelected - visibleCount + 1;
+          }
+        }
+      }
+
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+
+    if (key?.name === "delete") {
+      const target = loopTasks[loopsSelected];
+      if (target) {
+        const id = target.id;
+        const removed = removeLoopTask(id);
+        loopsMessage = removed ? `Deleted loop ${id}.` : "Could not delete loop.";
+        if (loopTasks.length === 0) {
+          stopLoopScheduler();
+        }
+        updateLoopsSelectionState();
+        await rewriteSessionWithCurrentMessages().catch(() => {});
+      }
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+
+    if (key?.sequence === "\r" || key?.name === "return" || key?.name === "enter") {
+      const target = loopTasks[loopsSelected];
+      if (target) {
+        const toggled = toggleLoopPaused(target.id);
+        loopsMessage = toggled
+          ? target.paused
+            ? `Paused loop ${target.id}.`
+            : `Resumed loop ${target.id}.`
+          : "Could not update loop.";
+        startLoopScheduler();
+        await rewriteSessionWithCurrentMessages().catch(() => {});
+      }
+      markDirty();
+      renderFrame(true);
       return;
     }
 
