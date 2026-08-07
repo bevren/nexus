@@ -4968,7 +4968,7 @@ function parseSessionHistory(raw) {
         loopTasks = storedLoops
           .map(normalizeLoopTask)
           .filter(Boolean)
-          .filter((task) => !(task.oneshot && task.nextFireAt <= now))
+          .filter((task) => !(task.oneshot && task.paused !== true && task.nextFireAt <= now))
           .slice(0, LOOP_MAX_TASKS);
         if (loopTasks.length > 0) {
           startLoopScheduler();
