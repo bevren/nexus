@@ -2265,7 +2265,7 @@ async function runCompaction(customInstruction = "") {
   await rewriteSessionWithCurrentMessages().catch(() => {});
   markDirty();
   renderFrame(true);
-  return { ok: true, summary: summaryText, keptRecentUserMessages: survivingUserMessages.length };
+  return { ok: true, summary: summaryText, keptRecentUserMessages: keptTail.length };
 }
 
 async function maybeCompactBeforeTurn() {
