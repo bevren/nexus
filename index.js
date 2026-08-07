@@ -157,6 +157,8 @@ const COMMANDS = [
   { name: "/new", description: "start a new chat with a new uid" },
   { name: "/mcp", description: "show MCP server status and available tools (/mcp reload to restart servers)" },
   { name: "/compact", description: "manually compact context: /compact [optional instruction]" },
+  { name: "/loop", description: "run a prompt on an interval: /loop [interval] [prompt]" },
+  { name: "/loops", description: "list or cancel scheduled loops: /loops | /loops cancel <id>" },
 ];
 const FALLBACK_TOOL_DESCRIPTIONS = {
   insert_memory:
@@ -1567,8 +1569,26 @@ async function rewriteSessionWithCurrentMessages() {
     })
     .join("\n");
 
+  const loopPayload = {
+    role: "loop",
+    content: "",
+    loops: loopTasks.map((task) => ({
+      id: task.id,
+      prompt: task.prompt,
+      intervalMs: task.intervalMs,
+      dynamic: task.dynamic === true,
+      oneshot: task.oneshot === true,
+      createdAt: task.createdAt,
+      nextFireAt: task.nextFireAt,
+      lastDelayMs: task.lastDelayMs,
+    })),
+  };
+  const fullLines = loopTasks.length > 0
+    ? `${lines}${lines.length > 0 ? "\n" : ""}${JSON.stringify(loopPayload)}\n`
+    : lines.length > 0 ? `${lines}\n` : "";
+
   try {
-    await fs.writeFile(sessionFilePath, lines.length > 0 ? `${lines}\n` : "", "utf8");
+    await fs.writeFile(sessionFilePath, fullLines, "utf8");
     sessionPersistenceInitialized = lines.length > 0;
     return true;
   } catch {
@@ -1603,6 +1623,7 @@ function cleanupTerminal(options = {}) {
     clearInterval(answerRevealTimer);
     answerRevealTimer = null;
   }
+  stopLoopScheduler();
   if (mcpBridgeServer) {
     try {
       mcpBridgeServer.close();
@@ -2152,6 +2173,257 @@ function getToolOutputTokenLimit() {
     return configLimit;
   }
   return 16000;
+}
+
+// ---------------------------------------------------------------------------
+// Scheduled loops (/loop, /loops): session-scoped recurring prompts that fire
+// between turns, in the spirit of Claude Code's /loop skill. Tasks ride the
+// session JSONL (role:"loop" lines) and are restored on resume. A fresh
+// conversation (/new, /clear) clears them.
+// ---------------------------------------------------------------------------
+const LOOP_DEFAULT_INTERVAL_MS = 60 * 1000; // 1 minute
+const LOOP_MIN_INTERVAL_MS = 60 * 1000; // cron-like floor: 1 minute
+const LOOP_MAX_TASKS = 50;
+const LOOP_MAINTENANCE_PROMPT =
+  "Continue any unfinished work from the conversation. Tend to the current " +
+  "branch's pull request: review comments, failed CI runs, merge conflicts. " +
+  "Run cleanup passes such as bug hunts or simplification when nothing else " +
+  "is pending. Do not start new initiatives outside that scope.";
+
+let loopTasks = [];
+let loopSchedulerTimer = null;
+let loopFiring = false;
+
+function normalizeLoopTask(entry) {
+  if (!entry || typeof entry !== "object") {
+    return null;
+  }
+  const id = typeof entry.id === "string" && entry.id ? entry.id : createSessionUid();
+  const prompt =
+    typeof entry.prompt === "string" && entry.prompt.trim()
+      ? entry.prompt.trim()
+      : LOOP_MAINTENANCE_PROMPT;
+  const intervalMs = Number(entry.intervalMs);
+  const normalizedInterval =
+    Number.isFinite(intervalMs) && intervalMs >= LOOP_MIN_INTERVAL_MS
+      ? Math.max(LOOP_MIN_INTERVAL_MS, Math.floor(intervalMs))
+      : LOOP_DEFAULT_INTERVAL_MS;
+  const dynamic = entry.dynamic === true;
+  const oneshot = entry.oneshot === true;
+  const createdAt = Number.isFinite(Number(entry.createdAt)) ? Number(entry.createdAt) : Date.now();
+  let nextFireAt = Number(entry.nextFireAt);
+  if (!Number.isFinite(nextFireAt)) {
+    nextFireAt = Date.now() + normalizedInterval;
+  }
+  return {
+    id,
+    prompt,
+    intervalMs: normalizedInterval,
+    dynamic,
+    oneshot,
+    createdAt,
+    nextFireAt,
+    lastRunMessageCount: 0,
+    lastDelayMs: normalizedInterval,
+  };
+}
+
+function parseLoopIntervalToken(token) {
+  const match =
+    /^(\d+)\s*(s|sec|second|seconds|m|min|minute|minutes|h|hr|hour|hours|d|day|days)$/i.exec(
+      String(token ?? "").trim()
+    );
+  if (!match) {
+    return null;
+  }
+  const count = parseInt(match[1], 10);
+  const unit = match[2].toLowerCase();
+  if (unit.startsWith("s")) {
+    return Math.max(1, Math.ceil(count / 60));
+  }
+  if (unit.startsWith("m")) {
+    return Math.max(1, count);
+  }
+  if (unit.startsWith("h")) {
+    return Math.max(1, count * 60);
+  }
+  return Math.max(1, count * 24 * 60);
+}
+
+function parseLoopCommandArgs(args) {
+  const raw = String(args ?? "").trim();
+  const result = { ok: true, intervalMinutes: null, prompt: "", maintenance: false };
+  if (raw.startsWith("cancel")) {
+    result.cancelId = raw.slice("cancel".length).trim() || "";
+    return result;
+  }
+  if (!raw) {
+    result.prompt = LOOP_MAINTENANCE_PROMPT;
+    result.maintenance = true;
+    return result;
+  }
+  const trailingMatch =
+    /\bevery\s+(\d+)\s*(s|sec|second|seconds|m|min|minute|minutes|h|hr|hour|hours|d|day|days)\b/i.exec(
+      raw
+    );
+  if (trailingMatch) {
+    const minutes = parseLoopIntervalToken(
+      `${trailingMatch[1]}${trailingMatch[2]}`
+    );
+    const before = raw.slice(0, trailingMatch.index).trim();
+    const after = raw.slice(trailingMatch.index + trailingMatch[0].length).trim();
+    const prompt = `${before} ${after}`.trim();
+    result.intervalMinutes = minutes;
+    result.prompt = prompt || LOOP_MAINTENANCE_PROMPT;
+    result.maintenance = prompt ? false : true;
+    return result;
+  }
+  const leadingMatch =
+    /^(\d+)\s*(s|sec|second|seconds|m|min|minute|minutes|h|hr|hour|hours|d|day|days)\b/i.exec(raw);
+  if (leadingMatch) {
+    const minutes = parseLoopIntervalToken(leadingMatch[0]);
+    const prompt = raw.slice(leadingMatch[0].length).trim();
+    result.intervalMinutes = minutes;
+    result.prompt = prompt || LOOP_MAINTENANCE_PROMPT;
+    result.maintenance = prompt ? false : true;
+    return result;
+  }
+  result.prompt = raw;
+  return result;
+}
+
+function scheduleLoopTask(intervalMinutes, prompt, options = {}) {
+  const id = options.id || createSessionUid();
+  const intervalMs = Math.max(
+    LOOP_MIN_INTERVAL_MS,
+    Math.max(1, Number(intervalMinutes) || 1) * 60 * 1000
+  );
+  const task = normalizeLoopTask({
+    id,
+    prompt,
+    intervalMs,
+    dynamic: options.dynamic === true,
+    oneshot: options.oneshot === true,
+    createdAt: Date.now(),
+    nextFireAt: Date.now() + intervalMs,
+  });
+  loopTasks.push(task);
+  return task;
+}
+
+function removeLoopTask(id) {
+  const before = loopTasks.length;
+  loopTasks = loopTasks.filter((task) => task.id !== id);
+  return loopTasks.length < before;
+}
+
+function startLoopScheduler() {
+  if (loopSchedulerTimer) {
+    return;
+  }
+  loopSchedulerTimer = setInterval(() => {
+    checkDueLoops().catch(() => {});
+  }, 1000);
+  if (loopSchedulerTimer.unref) {
+    loopSchedulerTimer.unref();
+  }
+}
+
+function stopLoopScheduler() {
+  if (loopSchedulerTimer) {
+    clearInterval(loopSchedulerTimer);
+    loopSchedulerTimer = null;
+  }
+}
+
+function pickDynamicLoopDelay(task) {
+  const grew = messages.length - (task.lastRunMessageCount || 0);
+  task.lastRunMessageCount = messages.length;
+  if (grew >= 4) {
+    task.lastDelayMs = LOOP_DEFAULT_INTERVAL_MS;
+  } else {
+    task.lastDelayMs = Math.min(
+      (task.lastDelayMs || LOOP_DEFAULT_INTERVAL_MS) + 30 * 1000,
+      10 * 60 * 1000
+    );
+  }
+  return task.lastDelayMs;
+}
+
+async function checkDueLoops() {
+  if (loopFiring || loopTasks.length === 0) {
+    return;
+  }
+  const now = Date.now();
+  const due = loopTasks.filter((task) => task.nextFireAt <= now);
+  if (due.length === 0) {
+    return;
+  }
+  // Fire between turns only: never while a request is in flight or stopped.
+  if (pendingAssistantRequests > 0 || stopRequested) {
+    return;
+  }
+  loopFiring = true;
+  try {
+    for (const task of due) {
+      if (!loopTasks.includes(task)) {
+        continue;
+      }
+      if (task.oneshot) {
+        removeLoopTask(task.id);
+      } else {
+        task.nextFireAt =
+          Date.now() + (task.dynamic ? pickDynamicLoopDelay(task) : task.intervalMs);
+      }
+      const content =
+        typeof task.prompt === "string" && task.prompt.trim()
+          ? task.prompt.trim()
+          : LOOP_MAINTENANCE_PROMPT;
+      ensureSystemMessageAtTop();
+      messages.push({ role: "user", content });
+      scrollChatToBottom();
+      if (!APPEND_CHAT_TO_SCROLLBACK) {
+        forceFullClearOnNextRender = true;
+      }
+      markDirty();
+      renderFrame(false);
+      const modelAtFire = selectedModel;
+      if (modelAtFire) {
+        queueAssistantReply(modelAtFire);
+      }
+      await rewriteSessionWithCurrentMessages().catch(() => {});
+      break; // one loop per tick keeps turns orderly
+    }
+  } finally {
+    loopFiring = false;
+  }
+}
+
+function formatLoopIntervalLabel(intervalMs) {
+  const minutes = Math.round(intervalMs / 60000);
+  if (minutes < 60) {
+    return `${minutes}m`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const remMinutes = minutes % 60;
+  return remMinutes > 0 ? `${hours}h ${remMinutes}m` : `${hours}h`;
+}
+
+function buildLoopsSummaryText() {
+  if (loopTasks.length === 0) {
+    return "No scheduled loops.";
+  }
+  const lines = loopTasks.map((task) => {
+    const intervalLabel = task.dynamic
+      ? "dynamic"
+      : task.oneshot
+        ? "once"
+        : formatLoopIntervalLabel(task.intervalMs);
+    const promptPreview = task.prompt.replace(/\r?\n/g, " ").slice(0, 60);
+    const truncated = promptPreview.length < task.prompt.length ? "…" : "";
+    return `- ${task.id} | every ${intervalLabel} | ${promptPreview}${truncated}`;
+  });
+  return `Scheduled loops (${loopTasks.length}):\n${lines.join("\n")}\n\nCancel with: /loops cancel <id>`;
 }
 
 async function runCompaction(customInstruction = "") {
@@ -4174,7 +4446,11 @@ function getMainFooterText() {
   const contextLeft = Math.round(getContextLeftPercent(selectedModel));
   const safeContextLeft = Math.max(0, Math.min(100, contextLeft));
   const thinkingState = getReasoningEnabledForModel(selectedModel) ? "thinking on" : "thinking off";
-  let text = `Current model: ${modelLabel} | ${safeContextLeft}% context left | ${thinkingState} | ${formatWorkspacePathForFooter(WORKSPACE_ROOT)}`;
+  let text = `Current model: ${modelLabel} | ${safeContextLeft}% context left | ${thinkingState}`;
+  if (loopTasks.length > 0) {
+    text += ` | ${loopTasks.length} loop${loopTasks.length === 1 ? "" : "s"} active`;
+  }
+  text += ` | ${formatWorkspacePathForFooter(WORKSPACE_ROOT)}`;
   const mouseManuallyOff = APP_MOUSE_TRACKING_ENABLED && !mouseTrackingEnabled && !mouseSelectionMode;
   if (mouseManuallyOff) {
     text += " | drag to select/copy · Alt+M mouse · PgUp/PgDn scroll";
@@ -4335,6 +4611,16 @@ function parseSessionHistory(raw) {
       const role = typeof parsed?.role === "string" ? parsed.role : "assistant";
       const content = parsed.content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
       const reasoningDetails = normalizeReasoningDetails(parsed?.reasoning_details);
+
+      if (role === "loop") {
+        // Session-scoped scheduled loops restored from a dedicated line.
+        const storedLoops = Array.isArray(parsed?.loops) ? parsed.loops : [];
+        loopTasks = storedLoops.map(normalizeLoopTask).filter(Boolean).slice(0, LOOP_MAX_TASKS);
+        if (loopTasks.length > 0) {
+          startLoopScheduler();
+        }
+        continue;
+      }
 
       if (role === "tool") {
         const hasStructuredToolMeta =
@@ -4506,6 +4792,8 @@ async function startNewChat() {
   sessionFilePath = getSessionFilePath(currentSessionUid);
   sessionWriteChain = Promise.resolve();
   sessionPersistenceInitialized = false;
+  loopTasks = [];
+  stopLoopScheduler();
   resetMessagesToSystemPrompt();
   resetComposerState();
   await rewriteSessionWithCurrentMessages();
@@ -4517,6 +4805,8 @@ async function clearCurrentChat() {
   chatGeneration += 1;
   sessionWriteChain = Promise.resolve();
   sessionPersistenceInitialized = false;
+  loopTasks = [];
+  stopLoopScheduler();
   resetMessagesToSystemPrompt();
   resetComposerState();
   await fs.unlink(sessionFilePath).catch(() => {});
@@ -4944,6 +5234,64 @@ async function runSlashCommand(commandName, commandArgs = "") {
       excludeFromRequest: true,
       persistHistory: false,
     });
+    await rewriteSessionWithCurrentMessages();
+    refreshMainBufferAfterCommand();
+    return true;
+  }
+
+  if (commandName === "/loop" || commandName === "/loops") {
+    const args = String(commandArgs ?? "").trim();
+
+    if (commandName === "/loops" || args.toLowerCase().startsWith("cancel")) {
+      const cancelId = args.toLowerCase().startsWith("cancel")
+        ? args.slice("cancel".length).trim()
+        : "";
+      if (cancelId) {
+        const removed = removeLoopTask(cancelId);
+        if (!removed && cancelId.startsWith("/")) {
+          // Allow: /loops cancel <id> where the id contains no slashes
+          const normalizedId = cancelId.replace(/^\/+/, "");
+          if (normalizedId && removeLoopTask(normalizedId)) {
+            removed = true;
+          }
+        }
+        appendAssistantMessage(
+          removed
+            ? `Cancelled loop ${cancelId}.`
+            : `No scheduled loop with id "${cancelId}".`,
+          { excludeFromRequest: true, persistHistory: false }
+        );
+      } else {
+        appendAssistantMessage(buildLoopsSummaryText(), {
+          excludeFromRequest: true,
+          persistHistory: false,
+        });
+      }
+      await rewriteSessionWithCurrentMessages();
+      refreshMainBufferAfterCommand();
+      return true;
+    }
+
+    const parsed = parseLoopCommandArgs(args);
+    if (!parsed.ok) {
+      appendTuiErrorMessage("/loop", `invalid usage: ${parsed.error || ""} Use '/loop [interval] [prompt]'`);
+      return true;
+    }
+    if (loopTasks.length >= LOOP_MAX_TASKS) {
+      appendTuiErrorMessage("/loop", `failed because the session already has ${LOOP_MAX_TASKS} scheduled loops`);
+      return true;
+    }
+    const task = scheduleLoopTask(parsed.intervalMinutes, parsed.prompt, {
+      dynamic: parsed.intervalMinutes === null,
+    });
+    startLoopScheduler();
+    const intervalLabel = parsed.intervalMinutes
+      ? `every ${formatLoopIntervalLabel(task.intervalMs)}`
+      : "on a dynamically chosen interval";
+    appendAssistantMessage(
+      `Scheduled loop ${task.id} (${intervalLabel}). Prompt: ${task.prompt}`,
+      { excludeFromRequest: true, persistHistory: false }
+    );
     await rewriteSessionWithCurrentMessages();
     refreshMainBufferAfterCommand();
     return true;
@@ -8489,6 +8837,144 @@ function runFormatSelfTest() {
 }
 
 // ---------------------------------------------------------------------------
+// Loop self-test: exercises interval parsing and schedule math without a TTY
+// or live LLM call. Because parseLoopCommandArgs/scheduleLoopTask live in the
+// module scope, we can drive them directly here.
+// ---------------------------------------------------------------------------
+function runLoopSelfTest() {
+  const out = (s) => process.stdout.write(s);
+  try {
+    // Interval token parsing
+    const cases = [
+      ["5m", 5],
+      ["2h", 120],
+      ["1d", 1440],
+      ["90s", 2], // rounded up to nearest minute
+      ["30s", 1], // ceil(0.5) => 1 minute
+      ["10 minutes", 10],
+    ];
+    for (const [token, expected] of cases) {
+      const got = parseLoopIntervalToken(token);
+      if (got !== expected) {
+        out(`LOOP_FAIL: parseLoopIntervalToken("${token}") expected ${expected}, got ${got}\n`);
+        return 1;
+      }
+    }
+    if (parseLoopIntervalToken("banana") !== null) {
+      out("LOOP_FAIL: non-interval token should return null\n");
+      return 1;
+    }
+
+    // /loop arg parsing: leading interval
+    const lead = parseLoopCommandArgs("10m check deploy");
+    if (lead.intervalMinutes !== 10 || lead.prompt !== "check deploy") {
+      out(`LOOP_FAIL: leading interval parse wrong: ${JSON.stringify(lead)}\n`);
+      return 1;
+    }
+
+    // Trailing "every N unit"
+    const trail = parseLoopCommandArgs("check deploy every 2 hours");
+    if (trail.intervalMinutes !== 120 || trail.prompt !== "check deploy") {
+      out(`LOOP_FAIL: trailing interval parse wrong: ${JSON.stringify(trail)}\n`);
+      return 1;
+    }
+
+    // Prompt only => dynamic (no fixed interval)
+    const promptOnly = parseLoopCommandArgs("check the build");
+    if (promptOnly.intervalMinutes !== null || promptOnly.prompt !== "check the build") {
+      out(`LOOP_FAIL: prompt-only parse wrong: ${JSON.stringify(promptOnly)}\n`);
+      return 1;
+    }
+
+    // Bare /loop => maintenance prompt
+    const bare = parseLoopCommandArgs("");
+    if (!bare.maintenance || bare.prompt !== LOOP_MAINTENANCE_PROMPT) {
+      out(`LOOP_FAIL: bare /loop should use maintenance prompt\n`);
+      return 1;
+    }
+
+    // cancel arg passthrough
+    const cancel = parseLoopCommandArgs("cancel abc123");
+    if (cancel.cancelId !== "abc123") {
+      out(`LOOP_FAIL: cancel arg parse wrong: ${JSON.stringify(cancel)}\n`);
+      return 1;
+    }
+
+    // Schedule math: a task created with a 5m interval gets ~5min window
+    const savedTasks = loopTasks;
+    loopTasks = [];
+    const task = scheduleLoopTask(5, "hello", {});
+    if (task.intervalMs !== 5 * 60 * 1000) {
+      out(`LOOP_FAIL: scheduleLoopTask interval wrong: ${task.intervalMs}\n`);
+      return 1;
+    }
+    const windowMs = task.nextFireAt - Date.now();
+    if (windowMs < 4.5 * 60 * 1000 || windowMs > 5.5 * 60 * 1000) {
+      out(`LOOP_FAIL: nextFireAt window wrong: ${windowMs}ms\n`);
+      return 1;
+    }
+    // Task id uniqueness
+    const task2 = scheduleLoopTask(1, "two", {});
+    if (task.id === task2.id) {
+      out("LOOP_FAIL: task ids should be unique\n");
+      return 1;
+    }
+    // Remove works
+    if (!removeLoopTask(task.id) || loopTasks.length !== 1) {
+      out("LOOP_FAIL: removeLoopTask failed\n");
+      return 1;
+    }
+
+    // Dynamic flag: prompt-only loops are dynamic, interval loops are not.
+    const dynTask = scheduleLoopTask(null, "watch it", { dynamic: true });
+    if (dynTask.dynamic !== true) {
+      out("LOOP_FAIL: dynamic flag should be set on prompt-only loops\n");
+      return 1;
+    }
+
+    // Persistence round-trip: a stored loop line must normalize back to the
+    // same task shape (id, prompt, interval, schedule) via normalizeLoopTask.
+    const stored = {
+      id: "dyn-test",
+      prompt: "watch it",
+      intervalMs: 60000,
+      dynamic: true,
+      oneshot: false,
+      createdAt: Date.now(),
+      nextFireAt: Date.now() + 60000,
+      lastDelayMs: 120000,
+    };
+    const restored = normalizeLoopTask(stored);
+    if (!restored || restored.id !== "dyn-test" || restored.prompt !== "watch it") {
+      out("LOOP_FAIL: normalizeLoopTask lost id/prompt\n");
+      return 1;
+    }
+    if (restored.dynamic !== true || restored.oneshot !== false) {
+      out("LOOP_FAIL: normalizeLoopTask lost dynamic/oneshot flags\n");
+      return 1;
+    }
+    if (restored.intervalMs !== 60000 || restored.nextFireAt !== stored.nextFireAt) {
+      out("LOOP_FAIL: normalizeLoopTask lost schedule fields\n");
+      return 1;
+    }
+    // Invalid stored tasks fall back to defaults instead of NaN.
+    const garbage = normalizeLoopTask({ id: "g", prompt: "x", intervalMs: "nope", nextFireAt: "bad" });
+    if (!garbage || !Number.isFinite(garbage.intervalMs) || !Number.isFinite(garbage.nextFireAt)) {
+      out("LOOP_FAIL: normalizeLoopTask should sanitize bad schedule fields\n");
+      return 1;
+    }
+
+    loopTasks = savedTasks;
+
+    out("LOOP_OK\n");
+    return 0;
+  } catch (error) {
+    out(`LOOP_FAIL: ${String(error?.message || error)}\n`);
+    return 1;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Compaction self-test: exercises token estimation, the tool-output cap, and
 // summary detection without needing a live LLM call.
 // ---------------------------------------------------------------------------
@@ -8560,6 +9046,11 @@ function runCompactionSelfTest() {
 
 if (process.argv.includes("--self-test-compact")) {
   const code = runCompactionSelfTest();
+  process.exit(code);
+}
+
+if (process.argv.includes("--self-test-loop")) {
+  const code = runLoopSelfTest();
   process.exit(code);
 }
 
