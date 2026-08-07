@@ -5025,11 +5025,78 @@ function getSolveStatusText() {
 
 function extractRawCodeFromReply(text) {
   const source = String(text ?? "");
-  const blocks = extractAllPythonCodeBlocks(source);
-  if (blocks.length > 0) {
-    return blocks.join("\n\n");
+  // Priority: execute blocks, then python-marked fences, then any fenced
+  // code block, then the whole trimmed reply.
+  const preferredOrder = [extractAllPythonCodeBlocks, extractPythonFencedBlocks, extractAnyFencedBlocks, null];
+  for (const extractor of preferredOrder) {
+    if (extractor === null) {
+      return source.trim();
+    }
+    const blocks = extractor(source);
+    if (blocks.length > 0) {
+      return blocks.join("\n\n");
+    }
   }
   return source.trim();
+}
+
+function extractPythonFencedBlocks(text) {
+  if (typeof text !== "string" || text.length === 0) {
+    return [];
+  }
+  const blocks = [];
+  const BT = String.fromCharCode(96, 96, 96);
+  const marker = BT + "python";
+  let pos = 0;
+  while (true) {
+    const start = text.indexOf(marker, pos);
+    if (start === -1) {
+      break;
+    }
+    const lineStart = text.indexOf("\n", start);
+    if (lineStart === -1) {
+      break;
+    }
+    const end = text.indexOf(BT, lineStart + 1);
+    if (end === -1) {
+      break;
+    }
+    const body = text.slice(lineStart + 1, end).trim();
+    if (body) {
+      blocks.push(body);
+    }
+    pos = end + BT.length;
+  }
+  return blocks;
+}
+
+function extractAnyFencedBlocks(text) {
+  if (typeof text !== "string" || text.length === 0) {
+    return [];
+  }
+  const blocks = [];
+  const BT = String.fromCharCode(96, 96, 96);
+  let pos = 0;
+  while (true) {
+    const start = text.indexOf(BT, pos);
+    if (start === -1) {
+      break;
+    }
+    const lineStart = text.indexOf("\n", start);
+    if (lineStart === -1) {
+      break;
+    }
+    const end = text.indexOf(BT, lineStart + 1);
+    if (end === -1) {
+      break;
+    }
+    const body = text.slice(lineStart + 1, end).trim();
+    if (body) {
+      blocks.push(body);
+    }
+    pos = end + BT.length;
+  }
+  return blocks;
 }
 
 async function runSolveLoop(taskText) {
@@ -11019,6 +11086,20 @@ async function runKernelSelfTest() {
     const solved = await kernelExec("print('done'); print('SOLVE_OK')");
     if (solved.ok !== true || !String(solved.output).includes("SOLVE_OK")) {
       out(`KERNEL_FAIL: SOLVE_OK passthrough broken: ${JSON.stringify(solved)}\n`);
+      return 1;
+    }
+
+    // /solve code extraction: a reply with a python-marked fence must yield
+    // the inner code (not markdown). Backticks are built via code points so
+    // the test source stays readable.
+    const BT = String.fromCharCode(96, 96, 96);
+    const NL = String.fromCharCode(10);
+    const fencedReply =
+      "Here is the program:" + NL + BT + "python" + NL +
+      "def f(x):" + NL + "    return x + 1" + NL + "print('SOLVE_OK')" + NL + BT;
+    const fencedCode = extractPythonFencedBlocks(fencedReply)[0] || "";
+    if (!fencedCode.includes("def f(x)") || fencedCode.includes(BT)) {
+      out(`KERNEL_FAIL: python-fenced extraction wrong: ${JSON.stringify(fencedCode)}\n`);
       return 1;
     }
 
