@@ -525,10 +525,14 @@ function getContextLeftPercent(modelId = selectedModel) {
   // completion). Estimate from the current messages using the same
   // chars-per-token heuristic as compaction, so the footer shows a
   // meaningful percentage instead of a stale 100%.
+  // Fall back to a sane 128k estimate when the model does not advertise a
+  // context length (same default compaction uses), so a resumed session
+  // never gets stuck showing a meaningless 100%.
   const contextLength = getModelContextLength(modelId);
+  const windowLength = Number.isFinite(contextLength) && contextLength > 0 ? contextLength : 128000;
   const estimatedTokens = messages.length > 0 ? estimateMessagesInChatTokens(messages) : 0;
-  if (Number.isFinite(contextLength) && contextLength > 0 && estimatedTokens > 0) {
-    const percentLeft = ((contextLength - estimatedTokens) / contextLength) * 100;
+  if (estimatedTokens > 0) {
+    const percentLeft = ((windowLength - estimatedTokens) / windowLength) * 100;
     return Math.max(0, Math.min(100, Math.round(percentLeft)));
   }
   return 100;
@@ -557,7 +561,9 @@ function updateContextBudgetFromCompletion(completion, modelId = selectedModel) 
     contextLength = getModelContextLength(modelId);
   }
   if (contextLength <= 0) {
-    return;
+    // Model does not advertise a context window; fall back to a sane 128k
+    // default so the footer keeps tracking progress after each completion.
+    contextLength = 128000;
   }
 
   const usage = completion?.usage && typeof completion.usage === "object" ? completion.usage : null;
