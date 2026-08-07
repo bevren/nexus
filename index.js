@@ -502,6 +502,13 @@ function getModelEntryForContext(modelId = selectedModel) {
 }
 
 function getModelContextLength(modelId = selectedModel) {
+  // Optional per-session window override beats everything: providers often
+  // omit context_length from /models, and a 128k fallback is wrong for
+  // models with e.g. a 1M window.
+  const override = Number(nexusConfig?.model_context_window_override);
+  if (Number.isFinite(override) && override > 0) {
+    return Math.floor(override);
+  }
   const model = getModelEntryForContext(modelId);
   const raw = Number(model?.contextLength || 0);
   if (!Number.isFinite(raw) || raw <= 0) {
