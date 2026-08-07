@@ -2298,6 +2298,9 @@ function scheduleLoopTask(intervalMinutes, prompt, options = {}) {
     LOOP_MIN_INTERVAL_MS,
     Math.max(1, Number(intervalMinutes) || 1) * 60 * 1000
   );
+  const nextFireAt = Number.isFinite(Number(options.fireAt))
+    ? Number(options.fireAt)
+    : Date.now() + intervalMs;
   const task = normalizeLoopTask({
     id,
     prompt,
@@ -2305,7 +2308,7 @@ function scheduleLoopTask(intervalMinutes, prompt, options = {}) {
     dynamic: options.dynamic === true,
     oneshot: options.oneshot === true,
     createdAt: Date.now(),
-    nextFireAt: Date.now() + intervalMs,
+    nextFireAt,
   });
   loopTasks.push(task);
   return task;
@@ -2424,6 +2427,212 @@ function buildLoopsSummaryText() {
     return `- ${task.id} | every ${intervalLabel} | ${promptPreview}${truncated}`;
   });
   return `Scheduled loops (${loopTasks.length}):\n${lines.join("\n")}\n\nCancel with: /loops cancel <id>`;
+}
+
+function getLoopMaintenancePrompt() {
+  // loop.md replaces the built-in maintenance prompt for bare /loop
+  // (project-level takes precedence over user-level), matching Claude Code.
+  const locations = [
+    path.join(WORKSPACE_ROOT, ".claude", "loop.md"),
+    path.join(HOME_DIR, ".claude", "loop.md"),
+  ];
+  for (const location of locations) {
+    try {
+      const text = fsSync.readFileSync(location, "utf8");
+      const trimmed = String(text ?? "").slice(0, 25000).trim();
+      if (trimmed.length > 0) {
+        return trimmed;
+      }
+    } catch {
+      // Try the next location; fall back to the built-in prompt.
+    }
+  }
+  return LOOP_MAINTENANCE_PROMPT;
+}
+
+function formatTimeOfDay(date) {
+  let hour = date.getHours();
+  const minute = date.getMinutes();
+  const meridiem = hour >= 12 ? "pm" : "am";
+  hour = hour % 12 || 12;
+  return `${hour}:${String(minute).padStart(2, "0")}${meridiem}`;
+}
+
+function formatDayLabel(dateMs) {
+  const at = new Date(dateMs);
+  const now = new Date();
+  if (at.toDateString() === now.toDateString()) {
+    return "today";
+  }
+  const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  if (at.toDateString() === tomorrow.toDateString()) {
+    return "tomorrow";
+  }
+  return at.toLocaleDateString();
+}
+
+// Parses a "when" phrase from free text and returns the fire time, a display
+// label, and the remaining text with the phrase removed. Supports:
+//   "in 45 minutes", "in 2 hours", "15m", "at 3pm", "at 3:30pm", "at 15:00",
+//   "3pm", "tomorrow 9am", "tomorrow at 9:30pm".
+function extractWhenFromText(text) {
+  const source = String(text ?? "").trim();
+  if (!source) {
+    return null;
+  }
+
+  // Relative: "in 45 minutes"
+  const rel =
+    /\bin\s+(\d+)\s*(s|sec|second|seconds|m|min|minute|minutes|h|hr|hour|hours|d|day|days)\b/i.exec(
+      source
+    );
+  if (rel) {
+    const minutes = parseLoopIntervalToken(`${rel[1]}${rel[2]}`);
+    if (minutes !== null) {
+      const before = source.slice(0, rel.index).trim();
+      const after = source.slice(rel.index + rel[0].length).trim();
+      return {
+        when: Date.now() + minutes * 60 * 1000,
+        display: `in ${rel[1]} ${rel[2]}`,
+        rest: `${before} ${after}`.trim(),
+      };
+    }
+  }
+
+  // Leading interval token: "15m check build", "2h ship"
+  const lead =
+    /^(\d+)\s*(s|sec|second|seconds|m|min|minute|minutes|h|hr|hour|hours|d|day|days)\b/i.exec(
+      source
+    );
+  if (lead) {
+    const minutes = parseLoopIntervalToken(lead[0]);
+    if (minutes !== null) {
+      const after = source.slice(lead[0].length).trim();
+      return {
+        when: Date.now() + minutes * 60 * 1000,
+        display: `in ${lead[0]}`,
+        rest: after,
+      };
+    }
+  }
+
+  // "tomorrow at 9am" / "tomorrow 9:30pm"
+  const tom =
+    /\btomorrow\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i.exec(source);
+  if (tom) {
+    let hour = parseInt(tom[1], 10);
+    const minute = tom[2] ? parseInt(tom[2], 10) : 0;
+    const meridiem = (tom[3] || "").toLowerCase();
+    if (!tom[2] && !tom[3]) {
+      return null; // "tomorrow 9" is ambiguous
+    }
+    if (meridiem === "pm" && hour < 12) {
+      hour += 12;
+    }
+    if (meridiem === "am" && hour === 12) {
+      hour = 0;
+    }
+    if (hour > 23 || minute > 59) {
+      return null;
+    }
+    const when = new Date();
+    when.setDate(when.getDate() + 1);
+    when.setHours(hour, minute, 0, 0);
+    const before = source.slice(0, tom.index).trim();
+    const after = source.slice(tom.index + tom[0].length).trim();
+    return {
+      when: when.getTime(),
+      display: `tomorrow at ${formatTimeOfDay(when)}`,
+      rest: `${before} ${after}`.trim(),
+    };
+  }
+
+  // "at 3:30pm" / "at 15:00" (24h requires minutes)
+  const abs = /\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i.exec(source);
+  if (abs) {
+    let hour = parseInt(abs[1], 10);
+    const minute = abs[2] ? parseInt(abs[2], 10) : 0;
+    const meridiem = (abs[3] || "").toLowerCase();
+    if (!abs[2] && !abs[3]) {
+      return null; // "at 5" is ambiguous
+    }
+    if (meridiem === "pm" && hour < 12) {
+      hour += 12;
+    }
+    if (meridiem === "am" && hour === 12) {
+      hour = 0;
+    }
+    if (hour > 23 || minute > 59) {
+      return null;
+    }
+    const when = new Date();
+    when.setHours(hour, minute, 0, 0);
+    if (when.getTime() <= Date.now()) {
+      when.setDate(when.getDate() + 1); // past time today => tomorrow
+    }
+    const before = source.slice(0, abs.index).trim();
+    const after = source.slice(abs.index + abs[0].length).trim();
+    return {
+      when: when.getTime(),
+      display: `${formatDayLabel(when.getTime())} at ${formatTimeOfDay(when)}`,
+      rest: `${before} ${after}`.trim(),
+    };
+  }
+
+  // Bare meridian time: "3pm", "3:30pm"
+  const bare = /(?:^|\s)(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i.exec(source);
+  if (bare) {
+    let hour = parseInt(bare[1], 10);
+    const minute = bare[2] ? parseInt(bare[2], 10) : 0;
+    const meridiem = bare[3].toLowerCase();
+    if (meridiem === "pm" && hour < 12) {
+      hour += 12;
+    }
+    if (meridiem === "am" && hour === 12) {
+      hour = 0;
+    }
+    if (hour > 23 || minute > 59) {
+      return null;
+    }
+    const when = new Date();
+    when.setHours(hour, minute, 0, 0);
+    if (when.getTime() <= Date.now()) {
+      when.setDate(when.getDate() + 1);
+    }
+    const before = source.slice(0, bare.index).trim();
+    const after = source.slice(bare.index + bare[0].length).trim();
+    return {
+      when: when.getTime(),
+      display: `${formatDayLabel(when.getTime())} at ${formatTimeOfDay(when)}`,
+      rest: `${before} ${after}`.trim(),
+    };
+  }
+
+  return null;
+}
+
+// Natural-language one-shot reminder detection:
+//   "remind me at 3pm to push the release branch"
+//   "remind me in 45 minutes to check the tests"
+//   "set a reminder for tomorrow 9am to call mom"
+// Returns null when the input isn't a schedulable reminder, so the message
+// falls through to the normal LLM turn.
+function parseReminderInput(text) {
+  const raw = String(text ?? "").trim();
+  if (!/^(remind me|set a reminder)\b/i.test(raw)) {
+    return null;
+  }
+  let rest = raw.replace(/^(remind me|set a reminder)\b/i, "").trim();
+  rest = rest.replace(/^(?:to|that|for)\s+/, "").trim();
+  const extracted = extractWhenFromText(rest);
+  if (!extracted) {
+    return null;
+  }
+  const prompt = extracted.rest.replace(/^(?:to|that|for)\s+/, "").trim();
+  if (!prompt) {
+    return null;
+  }
+  return { when: extracted.when, whenDisplay: extracted.display, promptRaw: raw, prompt };
 }
 
 async function runCompaction(customInstruction = "") {
@@ -4614,8 +4823,15 @@ function parseSessionHistory(raw) {
 
       if (role === "loop") {
         // Session-scoped scheduled loops restored from a dedicated line.
+        // One-shot tasks that already fired or whose time has passed are
+        // dropped on resume (no catch-up), matching Claude Code.
         const storedLoops = Array.isArray(parsed?.loops) ? parsed.loops : [];
-        loopTasks = storedLoops.map(normalizeLoopTask).filter(Boolean).slice(0, LOOP_MAX_TASKS);
+        const now = Date.now();
+        loopTasks = storedLoops
+          .map(normalizeLoopTask)
+          .filter(Boolean)
+          .filter((task) => !(task.oneshot && task.nextFireAt <= now))
+          .slice(0, LOOP_MAX_TASKS);
         if (loopTasks.length > 0) {
           startLoopScheduler();
         }
@@ -5267,6 +5483,38 @@ async function runSlashCommand(commandName, commandArgs = "") {
           persistHistory: false,
         });
       }
+      await rewriteSessionWithCurrentMessages();
+      refreshMainBufferAfterCommand();
+      return true;
+    }
+
+    // One-shot: "/loop once 3pm push the release branch"
+    const onceMatch = /^once\s+(.+)$/i.exec(args);
+    if (onceMatch) {
+      const extracted = extractWhenFromText(onceMatch[1]);
+      if (!extracted) {
+        appendTuiErrorMessage("/loop", "invalid usage. Use '/loop once <when> <prompt>' (e.g. /loop once 3pm push the release branch)");
+        return true;
+      }
+      const prompt = extracted.rest.replace(/^(?:to|that|for)\s+/, "").trim();
+      if (!prompt) {
+        appendTuiErrorMessage("/loop", "invalid usage. Use '/loop once <when> <prompt>' (e.g. /loop once in 45 minutes check tests)");
+        return true;
+      }
+      if (loopTasks.length >= LOOP_MAX_TASKS) {
+        appendTuiErrorMessage("/loop", "failed because this session already has the maximum number of scheduled loops");
+        return true;
+      }
+      const task = scheduleLoopTask(extracted.when, prompt, {
+        oneshot: true,
+        dynamic: false,
+        fireAt: extracted.when,
+      });
+      startLoopScheduler();
+      appendAssistantMessage(
+        `Scheduled one-shot loop ${task.id} for ${extracted.display}. Prompt: ${prompt}`,
+        { excludeFromRequest: true, persistHistory: false }
+      );
       await rewriteSessionWithCurrentMessages();
       refreshMainBufferAfterCommand();
       return true;
@@ -8964,6 +9212,70 @@ function runLoopSelfTest() {
       return 1;
     }
 
+    // Time parsing (extractWhenFromText)
+    const relWhen = extractWhenFromText("in 45 minutes check deploy");
+    if (!relWhen || relWhen.display !== "in 45 minutes" || relWhen.rest !== "check deploy") {
+      out(`LOOP_FAIL: relative when parse wrong: ${JSON.stringify(relWhen)}\n`);
+      return 1;
+    }
+    if (relWhen.when - Date.now() > 50 * 60 * 1000 || relWhen.when - Date.now() < 40 * 60 * 1000) {
+      out("LOOP_FAIL: relative when window wrong\n");
+      return 1;
+    }
+
+    const absWhen = extractWhenFromText("at 3pm push the release");
+    if (!absWhen || !/at 3:00/.test(absWhen.display) || absWhen.rest !== "push the release") {
+      out(`LOOP_FAIL: absolute when parse wrong: ${JSON.stringify(absWhen)}\n`);
+      return 1;
+    }
+
+    const tomWhen = extractWhenFromText("tomorrow at 9:30am call mom");
+    if (!tomWhen || !/tomorrow at 9:30/.test(tomWhen.display) || tomWhen.rest !== "call mom") {
+      out(`LOOP_FAIL: tomorrow when parse wrong: ${JSON.stringify(tomWhen)}\n`);
+      return 1;
+    }
+
+    if (extractWhenFromText("check the build") !== null) {
+      out("LOOP_FAIL: text without a time should parse to null\n");
+      return 1;
+    }
+
+    // Natural-language reminders
+    const rem1 = parseReminderInput("remind me at 3pm to push the release branch");
+    if (!rem1 || rem1.whenDisplay.includes("3:00") !== true || rem1.prompt !== "push the release branch") {
+      out(`LOOP_FAIL: parseReminderInput(remind me at 3pm) wrong: ${JSON.stringify(rem1)}\n`);
+      return 1;
+    }
+    const rem2 = parseReminderInput("set a reminder for in 10 minutes to check the tests");
+    if (!rem2 || rem2.prompt !== "check the tests") {
+      out(`LOOP_FAIL: parseReminderInput(set a reminder for in 10m) wrong: ${JSON.stringify(rem2)}\n`);
+      return 1;
+    }
+    if (parseReminderInput("can you remind me later") !== null) {
+      out("LOOP_FAIL: 'can you remind me later' should not schedule\n");
+      return 1;
+    }
+    if (parseReminderInput("what time is it") !== null) {
+      out("LOOP_FAIL: non-reminder text should return null\n");
+      return 1;
+    }
+
+    // One-shot schedule via fireAt
+    const shot = scheduleLoopTask(null, "notify", { oneshot: true, dynamic: false, fireAt: Date.now() + 60 * 60 * 1000 });
+    if (shot.oneshot !== true || Math.abs(shot.nextFireAt - (Date.now() + 60 * 60 * 1000)) > 5000) {
+      out("LOOP_FAIL: one-shot schedule fireAt wrong\n");
+      return 1;
+    }
+    removeLoopTask(shot.id);
+
+    // loop.md fallback: getLoopMaintenancePrompt falls back to the built-in
+    // prompt when no file exists (no .claude dir in this workspace).
+    const pmt = getLoopMaintenancePrompt();
+    if (pmt !== LOOP_MAINTENANCE_PROMPT || pmt.length === 0) {
+      out("LOOP_FAIL: getLoopMaintenancePrompt fallback wrong\n");
+      return 1;
+    }
+
     loopTasks = savedTasks;
 
     out("LOOP_OK\n");
@@ -9943,6 +10255,33 @@ process.stdin.on("keypress", async (str, key) => {
 
     cancelIdleFlush();
     burstMode = false;
+    // Natural-language reminder interception: "remind me at 3pm to ..." or
+    // "set a reminder for tomorrow 9am ..." schedule a one-shot loop instead
+    // of sending the text to the model.
+    const reminder = parseReminderInput(trimmedInput);
+    if (reminder) {
+      if (loopTasks.length >= LOOP_MAX_TASKS) {
+        appendTuiErrorMessage("/loop", "failed because this session already has the maximum number of scheduled loops");
+        return;
+      }
+      const task = scheduleLoopTask(reminder.when, reminder.prompt, {
+        oneshot: true,
+        dynamic: false,
+        fireAt: reminder.when,
+      });
+      startLoopScheduler();
+      resetComposerState();
+      cancelIdleFlush();
+      burstMode = false;
+      appendAssistantMessage(
+        `Reminder set for ${reminder.whenDisplay} (${task.id}). I'll send: "${reminder.prompt}"`,
+        { excludeFromRequest: true, persistHistory: false }
+      );
+      await rewriteSessionWithCurrentMessages();
+      refreshMainBufferAfterCommand();
+      return;
+    }
+
     const modelAtSubmit = selectedModel;
     const didAppend = submit();
     if (didAppend) {
