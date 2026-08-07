@@ -76,6 +76,8 @@ const MIN_LLM_REQUEST_TIMEOUT_MS = 10000;
 const MAX_LLM_REQUEST_TIMEOUT_MS = 600000;
 const THINKING_ANIMATION_INTERVAL_MS = 320;
 const SHINE_ANIMATION_INTERVAL_MS = 66;
+const ANSWER_REVEAL_MS = 500;
+const ANSWER_REVEAL_TICK_MS = 33;
 const THINKING_FRAMES = ["Thinking   ", "Thinking.  ", "Thinking.. ", "Thinking..."];
 const SPINNER_FRAMES = ["\u280b", "\u2819", "\u2839", "\u2838", "\u283c", "\u2834", "\u2826", "\u2827", "\u2807", "\u280f"];
 const APPEND_COMPOSER_FIXED_ROWS = 8;
@@ -308,6 +310,8 @@ let toolDescriptions = { ...FALLBACK_TOOL_DESCRIPTIONS };
 let systemPromptText = "";
 let skillsCatalog = [];
 let systemPromptLoadPromise = null;
+let answerRevealTimer = null;
+let forceChatRefreshFlag = false;
 let thinkingAnimationTimer = null;
 let thinkingFrameIndex = 0;
 let shineFrameIndex = 0;
@@ -1026,6 +1030,10 @@ function cleanupTerminal(options = {}) {
     clearInterval(spinnerAnimationTimer);
     spinnerAnimationTimer = null;
   }
+  if (answerRevealTimer) {
+    clearInterval(answerRevealTimer);
+    answerRevealTimer = null;
+  }
   clearMouseSelectionTimer();
   mouseSelectionMode = false;
 
@@ -1709,6 +1717,7 @@ function appendAssistantMessage(text, options = {}) {
   const reasoningDetails = normalizeReasoningDetails(options?.reasoningDetails);
   const excludeFromRequest = options?.excludeFromRequest === true;
   const persistHistory = options?.persistHistory !== false;
+  const reveal = options?.reveal === true;
   const assistantEntry = { role: "assistant", content };
   if (reasoningDetails) {
     assistantEntry.reasoningDetails = reasoningDetails;
@@ -1717,6 +1726,9 @@ function appendAssistantMessage(text, options = {}) {
     assistantEntry.excludeFromRequest = true;
   }
   messages.push(assistantEntry);
+  if (reveal) {
+    triggerAnswerReveal(assistantEntry);
+  }
   const historyExtra = {};
   if (reasoningDetails) {
     historyExtra.reasoningDetails = reasoningDetails;
@@ -1758,6 +1770,65 @@ function appendTuiErrorMessage(commandName, reason = "disabled while a task is i
     markDirty();
     renderFrame(false);
   }
+}
+
+function hasActiveAnswerReveal() {
+  for (const msg of messages) {
+    if (msg && typeof msg.revealUntil === "number" && msg.revealUntil > Date.now()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function triggerAnswerReveal(entry) {
+  if (!entry || entry.ephemeral === true || APPEND_CHAT_TO_SCROLLBACK) {
+    return;
+  }
+  entry.revealUntil = Date.now() + ANSWER_REVEAL_MS;
+  if (!answerRevealTimer) {
+    answerRevealTimer = setInterval(() => {
+      if (!hasActiveAnswerReveal()) {
+        clearInterval(answerRevealTimer);
+        answerRevealTimer = null;
+        // Reveal finished: drop the cache (it may hold a mid-fade frame) and
+        // force one final repaint so the message resolves to normal styling.
+        cachedChatLines = null;
+        forceChatRefreshFlag = true;
+        markDirty();
+        renderFrame(false);
+        return;
+      }
+      // Repaint the chat block every tick so the fade advances, even though
+      // no structural state changed.
+      forceChatRefreshFlag = true;
+      markDirty();
+      renderFrame(false);
+    }, ANSWER_REVEAL_TICK_MS);
+  }
+}
+
+const ANSWER_REVEAL_FADE_FROM = 231; // bright white
+const ANSWER_REVEAL_FADE_TO = 243;   // dim gray
+const ANSWER_REVEAL_BULLET_FG = "\u001b[96m";
+
+function applyAnswerRevealStyle(lineText, elapsed) {
+  // Fade progress 0..1: bright white -> dim gray. Returns null once the fade
+  // completes so callers fall back to the normal markdown/code styling.
+  const plain = stripAnsiSgr(String(lineText ?? ""));
+  if (elapsed >= 1) {
+    return null;
+  }
+  const progress = Math.max(0, Math.min(1, elapsed));
+  const colorIndex = Math.round(
+    ANSWER_REVEAL_FADE_FROM + (ANSWER_REVEAL_FADE_TO - ANSWER_REVEAL_FADE_FROM) * progress
+  );
+  const color = `\u001b[38;5;${colorIndex}m`;
+  let out = `${color}${plain}${RESET_COLOR}`;
+  if (plain.startsWith("\u2022 ")) {
+    out = `${ANSWER_REVEAL_BULLET_FG}\u2022${RESET_COLOR} ${color}${plain.slice(2)}${RESET_COLOR}`;
+  }
+  return out;
 }
 
 function createPendingAssistantMessage(generation) {
@@ -1804,6 +1875,10 @@ function finalizePendingAssistantMessage(index, text, generation, options = {}) 
     messages[index] = nextEntry;
   } else {
     messages.push(nextEntry);
+  }
+
+  if (role === "assistant" && !rawContent.trimStart().startsWith("■")) {
+    triggerAnswerReveal(nextEntry);
   }
 
   if (persistHistory) {
@@ -2650,7 +2725,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
         break;
       }
 
-      appendAssistantMessage(followUpContent, { reasoningDetails: followUpReasoningDetails });
+      appendAssistantMessage(followUpContent, { reasoningDetails: followUpReasoningDetails, reveal: true });
       latestAssistantContent = followUpContent;
     }
   } catch (error) {
@@ -5307,7 +5382,8 @@ function highlightPythonCodeLine(line, isFenceLine = false) {
 }
 
 function buildChatVisualLines(cols, sourceEntries = messages) {
-  if (sourceEntries === messages) {
+  const revealActive = sourceEntries === messages && hasActiveAnswerReveal();
+  if (sourceEntries === messages && !revealActive) {
     const lastRef = messages.length > 0 ? messages[messages.length - 1] : null;
     if (
       cachedChatLines &&
@@ -5369,11 +5445,27 @@ function buildChatVisualLines(cols, sourceEntries = messages) {
       visualLines.push({ text: "", styledText: "", color: null, assistantBulletMuted: false });
     }
 
+    let revealElapsed = null;
+    if (
+      role === "assistant" &&
+      typeof entry?.revealUntil === "number" &&
+      entry.revealUntil > Date.now()
+    ) {
+      const remaining = (entry.revealUntil - Date.now()) / ANSWER_REVEAL_MS;
+      revealElapsed = Math.max(0, Math.min(1, 1 - remaining));
+    }
     for (const styledLine of entryLines) {
       const plainLine = stripAnsiSgr(styledLine);
+      let lineStyled = styledLine;
+      if (revealElapsed !== null) {
+        const revealStyled = applyAnswerRevealStyle(plainLine, revealElapsed);
+        if (revealStyled) {
+          lineStyled = revealStyled;
+        }
+      }
       visualLines.push({
         text: `${CHAT_LEFT_PADDING}${plainLine}`,
-        styledText: `${CHAT_LEFT_PADDING}${styledLine}`,
+        styledText: `${CHAT_LEFT_PADDING}${lineStyled}`,
         color: null,
         assistantBulletMuted: false,
       });
@@ -5382,7 +5474,7 @@ function buildChatVisualLines(cols, sourceEntries = messages) {
     previousRole = role;
   }
 
-  if (sourceEntries === messages) {
+  if (sourceEntries === messages && !revealActive) {
     cachedChatLines = visualLines;
     cachedChatLinesCols = cols;
     cachedChatLinesLen = messages.length;
@@ -6296,6 +6388,10 @@ function renderProviderEditorBuffer() {
 }
 
 function renderFrame(forceChatRefresh = false) {
+  if (forceChatRefreshFlag) {
+    forceChatRefresh = true;
+    forceChatRefreshFlag = false;
+  }
   updateThinkingAnimationState();
 
   if (activeBuffer === "command") {
