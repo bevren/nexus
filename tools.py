@@ -2173,6 +2173,76 @@ def skill_python_path() -> str:
     except Exception as exc:
         return "error: " + str(exc)
 
+def _read_mcp_bridge_info() -> dict:
+    bridge_file = NEXUS_DIR / "mcp_bridge.json"
+    try:
+        if not bridge_file.exists():
+            return {}
+        data = json.loads(bridge_file.read_text(encoding="utf-8"))
+        port = int(data.get("port") or 0)
+        if port <= 0:
+            return {}
+        return {"port": port, "pid": data.get("pid")}
+    except Exception:
+        return {}
+
+
+def mcp_list() -> dict:
+    """List MCP servers and their tools from the TUI bridge."""
+    import urllib.request
+
+    info = _read_mcp_bridge_info()
+    if not info:
+        return {
+            "ok": False,
+            "error": "MCP bridge not available. Is the TUI running with MCP enabled, and are servers configured in ~/.nexus/mcp_config.json?",
+        }
+    url = f"http://127.0.0.1:{info['port']}/"
+    payload = json.dumps({"method": "list"}).encode("utf-8")
+    try:
+        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        return {"ok": False, "error": f"MCP bridge request failed: {exc}"}
+
+
+def mcp_call(server: str, tool: str, args: dict | None = None) -> dict:
+    """
+    Call a tool exposed by an MCP server through the TUI bridge.
+
+    server:  the MCP server name as configured in ~/.nexus/mcp_config.json
+    tool:    the tool name exposed by that server
+    args:    a dict of arguments the tool accepts (matching its inputSchema)
+    Returns: the bridge reply, normally {ok: true, result: {...}, text: "..."}.
+    """
+    import urllib.request
+
+    info = _read_mcp_bridge_info()
+    if not info:
+        return {
+            "ok": False,
+            "error": "MCP bridge not available. Is the TUI running with MCP enabled, and are servers configured in ~/.nexus/mcp_config.json?",
+        }
+    if not isinstance(server, str) or not server.strip():
+        return {"ok": False, "error": "mcp_call: 'server' must be a non-empty string"}
+    if not isinstance(tool, str) or not tool.strip():
+        return {"ok": False, "error": "mcp_call: 'tool' must be a non-empty string"}
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        return {"ok": False, "error": "mcp_call: 'args' must be a dict"}
+
+    url = f"http://127.0.0.1:{info['port']}/"
+    payload = json.dumps({"method": "call", "server": server, "tool": tool, "arguments": args}).encode("utf-8")
+    try:
+        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        return {"ok": False, "error": f"MCP bridge request failed: {exc}"}
+
+
 FUNCTIONS = {
     "create_plan": create_plan,
     "update_plan": update_plan,
@@ -2207,6 +2277,8 @@ FUNCTIONS = {
     "refine_reflection": refine_reflection,
     "skill_python_path": skill_python_path,
     "web_search": web_search,
+    "mcp_list": mcp_list,
+    "mcp_call": mcp_call,
 }
 
 FUNCTION_DESCRIPTIONS = {
@@ -2243,7 +2315,11 @@ FUNCTION_DESCRIPTIONS = {
     "harness_skill": "harness_skill(name: str, description: str = '', body: str = '', delete: bool = False) -> dict: Create/update/delete a skill in the continual harness.",
     "record_refinement": "record_refinement(summary: str, evidence: str = '') -> dict: Persist a reusable pattern into the continual harness with evidence.",
     "refine_reflection": "refine_reflection(auto: bool = True) -> dict: Auto-synthesize a refinement from recent subagent results and prompt notes.",
+    "mcp_list": "mcp_list() -> dict: List all configured MCP servers and the tool names each exposes. Returns {ok: bool, servers?: {name: {status, error?, tools: [name]}}, error?: str}.",
+    "mcp_call": "mcp_call(server: str, tool: str, args: dict | None = None) -> dict: Call a tool exposed by an MCP server (configured in ~/.nexus/mcp_config.json). Returns the server's result as {ok: bool, result?: object, text?: str, error?: str}.",
 }
+
+
 
 
 def get_functions() -> dict[str, object]:

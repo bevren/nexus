@@ -143,6 +143,7 @@ const COMMANDS = [
   { name: "/review", description: "review my current changes and find issues" },
   { name: "/rename", description: "rename the current thread" },
   { name: "/new", description: "start a new chat with a new uid" },
+  { name: "/mcp", description: "show MCP server status and available tools (/mcp reload to restart servers)" },
 ];
 const FALLBACK_TOOL_DESCRIPTIONS = {
   insert_memory:
@@ -310,6 +311,14 @@ let toolDescriptions = { ...FALLBACK_TOOL_DESCRIPTIONS };
 let systemPromptText = "";
 let skillsCatalog = [];
 let systemPromptLoadPromise = null;
+let mcpBridgeServer = null;
+let mcpBridgePort = 0;
+let mcpServers = [];
+let mcpDescriptions = {};
+let mcpBridgeReadyResolve = null;
+let mcpBridgeReadyPromise = null;
+let mcpBridgeState = "";
+let mcpBridgeError = "";
 let answerRevealTimer = null;
 let answerRevealSettlePending = false;
 let forceChatRefreshFlag = false;
@@ -838,6 +847,17 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "",
     "Predefined Python helper functions available in the execution environment:",
     ...(lines.length > 0 ? lines : ["- (none)"]),
+    "",
+    "MCP TOOLS (Model Context Protocol servers, optional):",
+    "- MCP servers are separate processes exposing extra capabilities as tools.",
+    "- Call them from within an execute block using: mcp_call(server, tool, args) -> dict",
+    "- List available servers/tools with: mcp_list() -> dict",
+    ...(Object.keys(mcpDescriptions).length > 0
+      ? Object.entries(mcpDescriptions)
+          .sort((a, b) => a[0].localeCompare(b[0]))
+          .map(([toolKey, desc]) => `- ${toolKey}: ${desc}`)
+      : ["- (no MCP servers/tools available)"]),
+    "",
     "If no tool use is needed, reply in normal plain text.",
   ].join("\n");
 }
@@ -887,6 +907,503 @@ async function loadSkillsCatalog() {
   } catch {
     skillsCatalog = [];
   }
+}
+
+// ---------------------------------------------------------------------------
+// MCP (Model Context Protocol) client support
+//
+// Launches configured MCP stdio servers at startup, exposes their tools to
+// the LLM via the system prompt, and bridges tool calls from the Python
+// execution environment (tools.py) through a localhost HTTP endpoint.
+// ---------------------------------------------------------------------------
+
+const MCP_CONFIG_PATH = path.join(os.homedir(), ".nexus", "mcp_config.json");
+
+// mcpBridgeServer, mcpBridgePort, mcpServers, mcpDescriptions, mcpBridgeReady*
+// and mcpBridgeState/Error are declared at the top of the file.
+
+function getMcpConfigPath() {
+  return MCP_CONFIG_PATH;
+}
+
+function loadMcpConfig() {
+  try {
+    if (!fsSync.existsSync(MCP_CONFIG_PATH)) {
+      return { mcpServers: {} };
+    }
+    const raw = JSON.parse(fsSync.readFileSync(MCP_CONFIG_PATH, "utf8"));
+    const servers = raw?.mcpServers && typeof raw.mcpServers === "object" ? raw.mcpServers : {};
+    return { mcpServers: servers };
+  } catch (error) {
+    mcpBridgeError = `Failed to parse ${MCP_CONFIG_PATH}: ${error?.message || error}`;
+    return { mcpServers: {} };
+  }
+}
+
+function mcpMessageFrame(message) {
+  const body = JSON.stringify(message);
+  return `Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n\r\n${body}`;
+}
+
+function mcpParseFrame(buffer) {
+  const headerEnd = buffer.indexOf("\r\n\r\n");
+  if (headerEnd === -1) {
+    return null;
+  }
+  const header = buffer.slice(0, headerEnd).toString("utf8");
+  const match = /Content-Length:\s*(\d+)/i.exec(header);
+  if (!match) {
+    return null;
+  }
+  const length = Number(match[1]);
+  const bodyStart = headerEnd + 4;
+  if (buffer.length < bodyStart + length) {
+    return null;
+  }
+  const body = buffer.slice(bodyStart, bodyStart + length).toString("utf8");
+  let parsed = null;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    parsed = null;
+  }
+  return { message: parsed, consumed: bodyStart + length };
+}
+
+// Node's execFile buffers stdout; MCP needs streaming, so use spawn:
+const { spawn } = require("node:child_process");
+
+class McpStdioClientReal {
+  constructor(name, config) {
+    this.name = name;
+    this.config = config;
+    this.child = null;
+    this.buffer = Buffer.alloc(0);
+    this.requestId = 0;
+    this.pending = new Map();
+    this.initialized = false;
+    this.stderrTail = "";
+    this.toolsCache = null;
+    this.toolsCacheError = "";
+    this.closed = false;
+  }
+
+  async start() {
+    const command = typeof this.config?.command === "string" ? this.config.command : "";
+    if (!command.trim()) {
+      throw new Error(`MCP server ${this.name}: missing "command"`);
+    }
+    const args = Array.isArray(this.config?.args) ? this.config.args.map(String) : [];
+    const env = { ...process.env };
+    const configEnv = this.config?.env && typeof this.config.env === "object" ? this.config.env : {};
+    for (const [k, v] of Object.entries(configEnv)) {
+      if (typeof v === "string") {
+        env[k] = v;
+      }
+    }
+
+    this.child = spawn(command, args, {
+      env,
+      cwd: this.config?.cwd || process.cwd(),
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    this.child.stdout.on("data", (chunk) => this._onData(chunk));
+    this.child.stderr.on("data", (chunk) => {
+      this.stderrTail = (this.stderrTail + String(chunk)).slice(-4000);
+    });
+    this.child.on("error", (error) => {
+      if (!this.closed) {
+        this.stderrTail = (this.stderrTail + `\nspawn error: ${error?.message || error}`).slice(-4000);
+      }
+    });
+    this.child.on("exit", (code, signal) => {
+      if (!this.closed) {
+        this.stderrTail = (this.stderrTail + `\nexited code=${code} signal=${signal}`).slice(-4000);
+      }
+    });
+
+    await this._request("initialize", {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "nexus-tui", version: "1.0.0" },
+    });
+
+    this._send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    this.initialized = true;
+  }
+
+  _send(obj) {
+    if (!this.child || !this.child.stdin || this.child.stdin.destroyed) {
+      throw new Error(`MCP server ${this.name}: stdin closed`);
+    }
+    this.child.stdin.write(mcpMessageFrame(obj));
+  }
+
+  _onData(chunk) {
+    this.buffer = Buffer.concat([this.buffer, chunk]);
+    for (;;) {
+      const parsed = mcpParseFrame(this.buffer);
+      if (!parsed) {
+        break;
+      }
+      this.buffer = this.buffer.slice(parsed.consumed);
+      const msg = parsed.message;
+      if (!msg) {
+        continue;
+      }
+      if (msg.id !== undefined && msg.id !== null && this.pending.has(String(msg.id))) {
+        const { resolve, reject } = this.pending.get(String(msg.id));
+        this.pending.delete(String(msg.id));
+        if (msg.error) {
+          reject(new Error(msg.error.message || JSON.stringify(msg.error)));
+        } else {
+          resolve(msg.result);
+        }
+        continue;
+      }
+      if (msg.method === "notifications/message") {
+        const level = msg.params?.level || "info";
+        if (level === "error" || level === "warning") {
+          this.stderrTail = (this.stderrTail + `\n[server message] ${msg.params?.message || ""}`).slice(-4000);
+        }
+      }
+    }
+  }
+
+  _request(method, params = {}) {
+    if (this.child && !this.child.stdin?.destroyed && this.child.exitCode !== null) {
+      return Promise.reject(new Error(`MCP server ${this.name}: process exited`));
+    }
+    const id = ++this.requestId;
+    const payload = { jsonrpc: "2.0", id, method, params };
+    return new Promise((resolve, reject) => {
+      this.pending.set(String(id), { resolve, reject });
+      try {
+        this._send(payload);
+      } catch (error) {
+        this.pending.delete(String(id));
+        reject(error);
+      }
+      // Safety timeout: 30s for long-running tools.
+      setTimeout(() => {
+        if (this.pending.has(String(id))) {
+          this.pending.delete(String(id));
+          reject(new Error(`MCP server ${this.name}: request timed out (${method})`));
+        }
+      }, 30000);
+    });
+  }
+
+  async listTools() {
+    if (this.toolsCache) {
+      return this.toolsCache;
+    }
+    try {
+      const result = await this._request("tools/list", {});
+      const tools = Array.isArray(result?.tools) ? result.tools : [];
+      this.toolsCache = tools
+        .filter((t) => t && typeof t.name === "string" && t.name.trim().length > 0)
+        .map((t) => ({
+          name: t.name.trim(),
+          description: typeof t.description === "string" ? t.description : "",
+          inputSchema: t.inputSchema && typeof t.inputSchema === "object" ? t.inputSchema : {},
+        }));
+      this.toolsCacheError = "";
+      return this.toolsCache;
+    } catch (error) {
+      this.toolsCacheError = error?.message || String(error);
+      throw error;
+    }
+  }
+
+  async callTool(name, args = {}) {
+    return this._request("tools/call", {
+      name,
+      arguments: args && typeof args === "object" ? args : {},
+    });
+  }
+
+  async close() {
+    this.closed = true;
+    for (const { reject } of this.pending.values()) {
+      reject(new Error(`MCP server ${this.name}: closed`));
+    }
+    this.pending.clear();
+    if (this.child) {
+      try {
+        this.child.stdin.end();
+      } catch {
+        // ignore
+      }
+      const child = this.child;
+      this.child = null;
+      await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          try {
+            child.kill();
+          } catch {
+            // ignore
+          }
+          resolve();
+        }, 1500);
+        child.once("exit", () => {
+          clearTimeout(timer);
+          resolve();
+        });
+        if (child.exitCode !== null) {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+    }
+  }
+}
+
+async function startMcpServers() {
+  const config = loadMcpConfig();
+  const entries = Object.entries(config.mcpServers || {});
+  const running = [];
+
+  for (const [name, serverConfig] of entries) {
+    const client = new McpStdioClientReal(name, serverConfig);
+    try {
+      await client.start();
+      const tools = await client.listTools();
+      running.push({ name, client, tools });
+    } catch (error) {
+      running.push({
+        name,
+        client,
+        tools: [],
+        error: error?.message || String(error),
+      });
+    }
+  }
+  mcpServers = running.map((entry) => ({
+    name: entry.name,
+    client: entry.client,
+    tools: entry.tools || [],
+    error: entry.error || "",
+    command: String(config.mcpServers?.[entry.name]?.command || ""),
+  }));
+}
+
+async function startMcpBridgeServer() {
+  mcpBridgeState = "starting";
+  mcpBridgeError = "";
+  const http = require("node:http");
+  const server = http.createServer(async (req, res) => {
+    if (req.method !== "POST") {
+      res.writeHead(405).end();
+      return;
+    }
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 1024 * 1024) {
+        req.destroy();
+      }
+    });
+    req.on("end", async () => {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(body || "{}");
+      } catch {
+        parsed = null;
+      }
+      const reply = await handleMcpBridgeRequest(parsed);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(reply));
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      mcpBridgePort = typeof address === "object" && address ? address.port : 0;
+      resolve();
+    });
+  });
+  mcpBridgeServer = server;
+  mcpBridgeState = "running";
+
+  // Publish the bridge endpoint so the Python execution environment can find it.
+  try {
+    fsSync.writeFileSync(
+      path.join(os.homedir(), ".nexus", "mcp_bridge.json"),
+      JSON.stringify({ port: mcpBridgePort, pid: process.pid }),
+      "utf8"
+    );
+  } catch {
+    // non-fatal: python helpers will report the missing file clearly
+  }
+}
+
+async function handleMcpBridgeRequest(parsed) {
+  if (!parsed || typeof parsed !== "object") {
+    return { ok: false, error: "bad request" };
+  }
+
+  const serverName = typeof parsed.server === "string" ? parsed.server : "";
+  const toolName = typeof parsed.tool === "string" ? parsed.tool : "";
+  const argumentsObj = parsed.arguments && typeof parsed.arguments === "object" ? parsed.arguments : {};
+
+  if (parsed.method === "list") {
+    const result = {};
+    for (const entry of mcpServers) {
+      result[entry.name] = {
+        status: entry.error ? "error" : entry.client ? "running" : "stopped",
+        error: entry.error || "",
+        tools: entry.tools.map((t) => t.name),
+      };
+    }
+    return { ok: true, servers: result };
+  }
+
+  if (!serverName) {
+    return { ok: false, error: "missing server" };
+  }
+  const serverEntry = mcpServers.find((entry) => entry.name === serverName);
+  if (!serverEntry) {
+    return { ok: false, error: `unknown MCP server "${serverName}"` };
+  }
+  if (!serverEntry.client) {
+    return { ok: false, error: serverEntry.error || `MCP server "${serverName}" not running` };
+  }
+
+  try {
+    const result = await serverEntry.client.callTool(toolName, argumentsObj);
+    if (result?.isError) {
+      const text = extractMcpResultText(result);
+      return { ok: false, isError: true, result: result, text: text };
+    }
+    return { ok: true, result: result, text: extractMcpResultText(result) };
+  } catch (error) {
+    return { ok: false, error: error?.message || String(error) };
+  }
+}
+
+function extractMcpResultText(result) {
+  if (result && typeof result === "object" && Array.isArray(result.content)) {
+    const parts = [];
+    for (const item of result.content) {
+      if (item && typeof item.text === "string") {
+        parts.push(item.text);
+      }
+    }
+    return parts.join("\n");
+  }
+  try {
+    return JSON.stringify(result);
+  } catch {
+    return String(result);
+  }
+}
+
+function buildMcpDescriptionLine(toolName, tool, serverName) {
+  const schema = tool.inputSchema || {};
+  const props = schema.properties && typeof schema.properties === "object" ? Object.keys(schema.properties) : [];
+  const params = props.length > 0 ? props.join(", ") : "...";
+  const required = Array.isArray(schema.required) ? schema.required : [];
+  const requiredMark = required.length > 0 ? ` (required: ${required.join(", ")})` : "";
+  const schemaHint = JSON.stringify(schema).slice(0, 240);
+  return `mcp_call(server="${serverName}", tool="${tool.name}", args={${params}}) -> dict: MCP tool "${toolName}" from server "${serverName}".${tool.description ? ` ${tool.description}` : ""}${requiredMark} Accepts JSON args matching the inputSchema. Schema: ${schemaHint}`;
+}
+
+async function refreshMcpDescriptions() {
+  mcpDescriptions = {};
+  for (const entry of mcpServers) {
+    if (!entry.client || entry.error) {
+      continue;
+    }
+    for (const tool of entry.tools) {
+      mcpDescriptions[`mcp:[${entry.name}] ${tool.name}`] = buildMcpDescriptionLine(
+        `${entry.name}_${tool.name}`,
+        tool,
+        entry.name
+      );
+    }
+  }
+}
+
+async function stopMcpServers() {
+  for (const entry of mcpServers) {
+    if (entry.client) {
+      try {
+        await entry.client.close();
+      } catch {
+        // ignore
+      }
+    }
+  }
+  mcpServers = [];
+}
+
+async function initMcp() {
+  try {
+    await startMcpServers();
+  } catch (error) {
+    mcpBridgeError = error?.message || String(error);
+  }
+  try {
+    await refreshMcpDescriptions();
+  } catch (error) {
+    mcpBridgeError = (mcpBridgeError ? mcpBridgeError + "; " : "") + (error?.message || String(error));
+  }
+  try {
+    await startMcpBridgeServer();
+  } catch (error) {
+    mcpBridgeState = "error";
+    mcpBridgeError = (mcpBridgeError ? mcpBridgeError + "; " : "") + (error?.message || String(error));
+  }
+  // Refresh the system message so freshly-discovered MCP tools show up for
+  // the current chat (and any new one).
+  if (systemPromptText) {
+    try {
+      systemPromptText = buildSystemPromptFromDescriptions(toolDescriptions, {
+        modelId: selectedModel,
+        contextLeftPercent: getContextLeftPercent(selectedModel),
+      });
+      ensureSystemMessageAtTop();
+    } catch {
+      // non-fatal: keep the previous prompt if a rebuild fails
+    }
+  }
+
+  if (mcpBridgeReadyResolve) {
+    mcpBridgeReadyResolve();
+    mcpBridgeReadyResolve = null;
+  }
+}
+
+async function ensureMcpBridgeReady() {
+  if (mcpBridgeState === "running" || mcpBridgeState === "error") {
+    return;
+  }
+  if (!mcpBridgeReadyPromise) {
+    mcpBridgeReadyPromise = new Promise((resolve) => {
+      mcpBridgeReadyResolve = resolve;
+    });
+  }
+  await mcpBridgeReadyPromise;
+}
+
+// Snippet entry point for the system prompt: mcpCallFromBridge used by python helpers
+function getMcpBridgePort() {
+  return mcpBridgePort;
+}
+
+function getMcpStatusText() {
+  if (mcpServers.length === 0) {
+    return "no MCP servers configured";
+  }
+  const parts = [];
+  for (const entry of mcpServers) {
+    const status = entry.error ? `error (${entry.error})` : entry.client ? `running (${entry.tools.length} tools)` : "stopped";
+    parts.push(`${entry.name}: ${status}`);
+  }
+  return parts.join("; ");
 }
 
 async function ensureSystemPromptReady(forceReload = false) {
@@ -1035,6 +1552,14 @@ function cleanupTerminal(options = {}) {
   if (answerRevealTimer) {
     clearInterval(answerRevealTimer);
     answerRevealTimer = null;
+  }
+  if (mcpBridgeServer) {
+    try {
+      mcpBridgeServer.close();
+    } catch {
+      // ignore
+    }
+    mcpBridgeServer = null;
   }
   clearMouseSelectionTimer();
   mouseSelectionMode = false;
@@ -4023,6 +4548,59 @@ async function runSlashCommand(commandName, commandArgs = "") {
         persistHistory: false,
       });
     }
+    await rewriteSessionWithCurrentMessages();
+    refreshMainBufferAfterCommand();
+    return true;
+  }
+
+  if (commandName === "/mcp") {
+    const args = String(commandArgs ?? "").trim();
+    if (args.toLowerCase() === "reload") {
+      try {
+        await stopMcpServers();
+      } catch {
+        // ignore
+      }
+      mcpBridgeError = "";
+      try {
+        await startMcpServers();
+        await refreshMcpDescriptions();
+      } catch (error) {
+        mcpBridgeError = error?.message || String(error);
+      }
+      if (systemPromptText) {
+        systemPromptText = buildSystemPromptFromDescriptions(toolDescriptions, {
+          modelId: selectedModel,
+          contextLeftPercent: getContextLeftPercent(selectedModel),
+        });
+        ensureSystemMessageAtTop();
+      }
+      appendAssistantMessage(`MCP servers reloaded. ${getMcpStatusText()}`, {
+        excludeFromRequest: true,
+        persistHistory: false,
+      });
+      await rewriteSessionWithCurrentMessages();
+      refreshMainBufferAfterCommand();
+      return true;
+    }
+
+    let text = "";
+    if (mcpServers.length === 0) {
+      text = getMcpStatusText() || "No MCP servers configured. Add servers to ~/.nexus/mcp_config.json";
+    } else {
+      text = getMcpStatusText();
+    }
+    for (const entry of mcpServers) {
+      if (!entry.tools || entry.tools.length === 0) {
+        continue;
+      }
+      const toolNames = entry.tools.map((t) => t.name).join(", ");
+      text += `\n  ${entry.name} tools: ${toolNames}`;
+    }
+    appendAssistantMessage(text, {
+      excludeFromRequest: true,
+      persistHistory: false,
+    });
     await rewriteSessionWithCurrentMessages();
     refreshMainBufferAfterCommand();
     return true;
@@ -7439,6 +8017,204 @@ function runFormatSelfTest() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// MCP end-to-end self-test: launches a tiny in-process stdio MCP server,
+// starts the real bridge, calls it via the bridge handler, and verifies.
+// ---------------------------------------------------------------------------
+async function runMcpSelfTest() {
+  const out = (s) => process.stdout.write(s);
+  try {
+    const { spawn: spawnProc } = require("node:child_process");
+
+    // Script for a minimal stdio MCP server: responds to initialize,
+    // tools/list, and tools/call with a static "ping" tool.
+    const serverScript = [
+      "function frame(msg) {",
+      "  const body = JSON.stringify(msg);",
+      "  const crlf = String.fromCharCode(13, 10);",
+      "  process.stdout.write('Content-Length: ' + Buffer.byteLength(body, 'utf8') + crlf + crlf + body);",
+      "}",
+      "let buf = Buffer.alloc(0);",
+      "const CRLFCRLF = Buffer.from([13, 10, 13, 10]);",
+      "process.stdin.on('data', (chunk) => {",
+      "  buf = Buffer.concat([buf, chunk]);",
+      "  for (;;) {",
+      "    const idx = buf.indexOf(CRLFCRLF);",
+      "    if (idx === -1) return;",
+      "    const header = buf.slice(0, idx).toString('utf8');",
+      "    const m = /Content-Length: *(\\d+)/i.exec(header);",
+      "    if (!m) return;",
+      "    const len = Number(m[1]);",
+      "    if (buf.length < idx + 4 + len) return;",
+      "    const raw = buf.slice(idx + 4, idx + 4 + len).toString('utf8');",
+      "    buf = buf.slice(idx + 4 + len);",
+      "    const msg = JSON.parse(raw);",
+      "    if (msg.method === 'initialize') {",
+      "      frame({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'mock', version: '1.0.0' } } });",
+      "    } else if (msg.method === 'tools/list') {",
+      "      frame({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'ping', description: 'Ping test tool', inputSchema: { type: 'object', properties: { value: { type: 'string' } } } }] } });",
+      "    } else if (msg.method === 'tools/call') {",
+      "      const args = msg.params && msg.params.arguments || {};",
+      "      frame({ jsonrpc: '2.0', id: msg.id, result: { content: [{ type: 'text', text: 'pong:' + (args.value || '') }] } });",
+      "    } else if (msg.jsonrpc && msg.id !== undefined) {",
+      "      frame({ jsonrpc: '2.0', id: msg.id, result: {} });",
+      "    }",
+      "  }",
+      "});",
+    ].join(String.fromCharCode(10));
+
+    const scriptPath = path.join(os.tmpdir(), `nexus-mcp-mock-${process.pid}.js`);
+    fsSync.writeFileSync(scriptPath, serverScript, "utf8");
+
+    // When running as a SEA binary, process.execPath is sea.exe, which cannot
+    // execute a JS script as an MCP server. Resolve a real node executable.
+    // Never use a SEA binary (sea.exe) as the mock runner: it cannot execute
+    // a JS script. Only accept process.execPath when it is an actual node
+    // binary (running the source tree); otherwise prefer a sibling node.exe,
+    // the standard install path, or PATH lookup.
+    const execBasename = path.basename(process.execPath).toLowerCase();
+    const looksLikeNode = execBasename === "node.exe" || execBasename === "node";
+    const mockNodeCandidates = [
+      path.join(path.dirname(process.execPath), "node.exe"),
+      "C:/Program Files/nodejs/node.exe",
+      "node",
+      ...(looksLikeNode ? [process.execPath] : []),
+    ].filter(Boolean);
+    let mockNode = "";
+    for (const candidate of mockNodeCandidates) {
+      if (candidate === "node") {
+        mockNode = "node";
+        break;
+      }
+      try {
+        if (fsSync.existsSync(candidate)) {
+          mockNode = candidate;
+          break;
+        }
+      } catch {
+        // continue
+      }
+    }
+    if (!mockNode) {
+      out("MCP_FAIL: could not resolve a node executable for the mock server\n");
+      return 1;
+    }
+
+    // Temporarily set an mcp config pointing at the mock server
+    const configPath = getMcpConfigPath();
+    const origConfig = fsSync.existsSync(configPath)
+      ? fsSync.readFileSync(configPath, "utf8")
+      : null;
+    const mockConfig = {
+      mcpServers: {
+        mock: { command: mockNode, args: [scriptPath] },
+      },
+    };
+    fsSync.writeFileSync(configPath, JSON.stringify(mockConfig, null, 2), "utf8");
+
+    try {
+      await startMcpServers();
+      await refreshMcpDescriptions();
+      await startMcpBridgeServer();
+
+      const serverEntry = mcpServers.find((e) => e.name === "mock");
+      if (!serverEntry || !serverEntry.client || serverEntry.tools.length !== 1) {
+        const stderrTail = serverEntry?.client?.stderrTail || "";
+        const childInfo = serverEntry?.client?.child
+          ? `exitCode=${serverEntry.client.child.exitCode} signal=${serverEntry.client.child.signalCode} killed=${serverEntry.client.child.killed}`
+          : "no-child";
+        const pendingInfo = serverEntry?.client?.pending
+          ? [...serverEntry.client.pending.keys()].join(",")
+          : "";
+        out(`MCP_FAIL: mock server not discovered (tools=${serverEntry?.tools?.length ?? 0}, error="${serverEntry?.error || ""}", stderr="${stderrTail}", ${childInfo}, pending=[${pendingInfo}])\n`);
+        return 1;
+      }
+      if (serverEntry.tools[0].name !== "ping") {
+        out(`MCP_FAIL: expected tool "ping", got "${serverEntry.tools[0].name}"
+`);
+        return 1;
+      }
+
+      const bridgeResp = await handleMcpBridgeRequest({
+        method: "call",
+        server: "mock",
+        tool: "ping",
+        arguments: { value: "hello" },
+      });
+      if (!bridgeResp.ok || bridgeResp.text !== "pong:hello") {
+        out(`MCP_FAIL: bridge call returned ${JSON.stringify(bridgeResp)}
+`);
+        return 1;
+      }
+
+      const descKeys = Object.keys(mcpDescriptions);
+      if (descKeys.length !== 1 || !descKeys[0].includes("ping")) {
+        out(`MCP_FAIL: expected 1 description with "ping", got ${JSON.stringify(descKeys)}
+`);
+        return 1;
+      }
+
+      // Verify the python-side helper can reach the bridge too.
+      const pyScript = [
+        "import json, sys",
+        "sys.path.insert(0, " + JSON.stringify(process.cwd()) + ")",
+        "import tools",
+        "res = tools.mcp_call('mock', 'ping', {'value': 'py'})",
+        "print(json.dumps(res))",
+      ].join(String.fromCharCode(10));
+      let pythonOut = "";
+      try {
+        // Use the source tools.py (not the possibly-stale bundled tools.exe)
+        // so the bridge helpers are exercised on the current code.
+        const { stdout } = await execFileAsync("python", ["-c", pyScript], {
+          cwd: process.cwd(),
+          timeout: 30000,
+          maxBuffer: 512 * 1024,
+        });
+        pythonOut = String(stdout || "").trim();
+      } catch (error) {
+        pythonOut = "PYERR:" + String(error?.message || error);
+      }
+      try {
+        const parsed = JSON.parse(pythonOut);
+        if (!parsed?.ok || parsed?.text !== "pong:py") {
+          out(`MCP_FAIL: python bridge call failed: ${pythonOut}
+`);
+          return 1;
+        }
+      } catch {
+        out(`MCP_FAIL: python bridge call failed (unparseable): ${pythonOut}
+`);
+        return 1;
+      }
+
+      out("MCP_OK\n");
+      return 0;
+    } finally {
+      await stopMcpServers();
+      if (mcpBridgeServer) {
+        try {
+          mcpBridgeServer.close();
+        } catch {
+          // ignore
+        }
+        mcpBridgeServer = null;
+      }
+      mcpBridgeState = "";
+      mcpBridgePort = 0;
+      fsSync.rmSync(scriptPath, { force: true });
+      if (origConfig !== null) {
+        fsSync.writeFileSync(configPath, origConfig, "utf8");
+      } else {
+        fsSync.rmSync(configPath, { force: true });
+      }
+    }
+  } catch (error) {
+    out(`MCP_FAIL: ${String(error?.message || error)}\n`);
+    return 1;
+  }
+}
+
 if (process.argv.includes("--self-test-append")) {
   const code = runAppendSelfTest();
   process.exit(code);
@@ -7447,6 +8223,11 @@ if (process.argv.includes("--self-test-append")) {
 if (process.argv.includes("--self-test-format")) {
   const code = runFormatSelfTest();
   process.exit(code);
+}
+
+if (process.argv.includes("--self-test-mcp")) {
+  runMcpSelfTest().then((code) => process.exit(code));
+  return;
 }
 
 readline.emitKeypressEvents(process.stdin);
@@ -8174,6 +8955,11 @@ process.on("SIGINT", () => {
 process.on("exit", cleanupTerminal);
 
 async function initializeApp() {
+  // Launch MCP servers and the bridge in parallel with the rest of startup.
+  // The bridge becomes reachable whenever the HTTP listener binds; startup
+  // continues regardless so a broken server config never blocks the TUI.
+  initMcp().catch(() => {});
+
   await ensureSystemPromptReady();
   await ensureSessionFileReady();
   await loadSkillsCatalog();
