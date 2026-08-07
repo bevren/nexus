@@ -9,3 +9,5 @@ sea-prep.blob
 dist/
 tools.exe
 build/
+
+tools.exe.stale
