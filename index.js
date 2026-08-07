@@ -913,7 +913,7 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "```execute",
     "print(set_reminder(when='in 5 minutes', prompt='do this'))",
     "```",
-    "- when accepts human phrases: 'in 5 minutes', 'in 2 hours', 'at 3pm', 'tomorrow 9am'. Do not invent a timestamp; pass the user's phrase.",
+    "- when accepts human phrases: 'in 5 minutes', 'in 2 hours', 'at 3pm', 'tomorrow 9am', or a recurring cadence like 'every 5 seconds', 'every 10 minutes'. Do not invent a timestamp; pass the user's phrase.",
     "- After the tool returns, confirm briefly with the scheduled time.",
     "",
     "MCP TOOLS (Model Context Protocol servers, optional):",
@@ -1324,13 +1324,41 @@ async function handleMcpBridgeRequest(parsed) {
     if (loopTasks.length >= LOOP_MAX_TASKS) {
       return { ok: false, error: `this session already has ${LOOP_MAX_TASKS} scheduled loops` };
     }
+    // Recurring reminder: "every 5 seconds", "every 10 minutes", "every 2 hours".
+    // This schedules a repeating loop (not a one-shot). Sub-minute intervals are
+    // allowed here so quick polling reminders work ("every 5 seconds").
+    const everyPhrase = parseEveryPhrase(when);
+    if (everyPhrase) {
+      if (loopTasks.length >= LOOP_MAX_TASKS) {
+        return { ok: false, error: `this session already has ${LOOP_MAX_TASKS} scheduled loops` };
+      }
+      const task = scheduleLoopTask(null, prompt, {
+        oneshot: false,
+        dynamic: false,
+        intervalMs: everyPhrase.intervalMs,
+        subMinute: everyPhrase.intervalMs < LOOP_MIN_INTERVAL_MS,
+        displayLabel: `${prompt} (${everyPhrase.label})`,
+      });
+      startLoopScheduler();
+      if (process.stdout.isTTY) {
+        markDirty();
+        renderFrame(true);
+      }
+      await rewriteSessionWithCurrentMessages().catch(() => {});
+      return {
+        ok: true,
+        result: { id: task.id, whenDisplay: everyPhrase.label },
+        text: `Recurring reminder scheduled ${everyPhrase.label} (${task.id}). Fires and sends: "${prompt}"`,
+      };
+    }
+
     const extracted = extractWhenFromText(when);
     if (!extracted) {
       return {
         ok: false,
         error:
           `could not parse reminder time from "${when}". Use formats like ` +
-          '"in 5 minutes", "in 2 hours", "at 3pm", "tomorrow 9am".',
+          '"in 5 minutes", "in 2 hours", "at 3pm", "tomorrow 9am", "every 5 seconds".',
       };
     }
     const task = scheduleLoopTask(extracted.when, prompt, {
@@ -1634,6 +1662,7 @@ async function rewriteSessionWithCurrentMessages() {
       dynamic: task.dynamic === true,
       oneshot: task.oneshot === true,
       paused: task.paused === true,
+      subMinute: task.subMinute === true,
       createdAt: task.createdAt,
       nextFireAt: task.nextFireAt,
       lastDelayMs: task.lastDelayMs,
@@ -2261,9 +2290,11 @@ function normalizeLoopTask(entry) {
       ? entry.prompt.trim()
       : LOOP_MAINTENANCE_PROMPT;
   const intervalMs = Number(entry.intervalMs);
+  const subMinute = entry.subMinute === true;
+  const intervalFloor = subMinute ? 1000 : LOOP_MIN_INTERVAL_MS;
   const normalizedInterval =
-    Number.isFinite(intervalMs) && intervalMs >= LOOP_MIN_INTERVAL_MS
-      ? Math.max(LOOP_MIN_INTERVAL_MS, Math.floor(intervalMs))
+    Number.isFinite(intervalMs) && intervalMs >= intervalFloor
+      ? Math.max(intervalFloor, Math.floor(intervalMs))
       : LOOP_DEFAULT_INTERVAL_MS;
   const dynamic = entry.dynamic === true;
   const oneshot = entry.oneshot === true;
@@ -2353,10 +2384,12 @@ function parseLoopCommandArgs(args) {
 
 function scheduleLoopTask(intervalMinutes, prompt, options = {}) {
   const id = options.id || createSessionUid();
-  const intervalMs = Math.max(
-    LOOP_MIN_INTERVAL_MS,
-    Math.max(1, Number(intervalMinutes) || 1) * 60 * 1000
-  );
+  const intervalMs = Number.isFinite(Number(options.intervalMs)) && Number(options.intervalMs) > 0
+    ? Number(options.intervalMs)
+    : Math.max(
+        LOOP_MIN_INTERVAL_MS,
+        Math.max(1, Number(intervalMinutes) || 1) * 60 * 1000
+      );
   const nextFireAt = Number.isFinite(Number(options.fireAt))
     ? Number(options.fireAt)
     : Date.now() + intervalMs;
@@ -2367,6 +2400,7 @@ function scheduleLoopTask(intervalMinutes, prompt, options = {}) {
     dynamic: options.dynamic === true,
     oneshot: options.oneshot === true,
     paused: options.paused === true,
+    subMinute: options.subMinute === true,
     createdAt: Date.now(),
     nextFireAt,
     display: options.displayLabel || "",
@@ -2472,7 +2506,11 @@ async function checkDueLoops() {
 }
 
 function formatLoopIntervalLabel(intervalMs) {
-  const minutes = Math.round(intervalMs / 60000);
+  const seconds = Math.round(intervalMs / 1000);
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  const minutes = Math.round(seconds / 60);
   if (minutes < 60) {
     return `${minutes}m`;
   }
@@ -2697,6 +2735,42 @@ function extractWhenFromText(text) {
   }
 
   return null;
+}
+
+// Parses a recurring cadence phrase: "every 5 seconds", "every 10 minutes",
+// "every 2 hours", "every day". Returns the interval in ms and a display
+// label, or null when the text is not a "every N unit" phrase.
+function parseEveryPhrase(text) {
+  const match =
+    /\bevery\s+(\d+)\s*(s|sec|second|seconds|m|min|minute|minutes|h|hr|hour|hours|d|day|days)\b/i.exec(
+      String(text ?? "").trim()
+    );
+  if (!match) {
+    return null;
+  }
+  const count = parseInt(match[1], 10);
+  const unit = match[2].toLowerCase();
+  const ms = unit.startsWith("s")
+    ? count * 1000
+    : unit.startsWith("m")
+      ? count * 60 * 1000
+      : unit.startsWith("h")
+        ? count * 3600 * 1000
+        : count * 86400 * 1000;
+  if (!Number.isFinite(ms) || ms < 1000) {
+    return null;
+  }
+  const unitLabel = unit.startsWith("s")
+    ? "second"
+    : unit.startsWith("m")
+      ? "minute"
+      : unit.startsWith("h")
+        ? "hour"
+        : "day";
+  return {
+    intervalMs: ms,
+    label: `every ${count} ${unitLabel}${count === 1 ? "" : "s"}`,
+  };
 }
 
 async function runCompaction(customInstruction = "") {
@@ -9481,6 +9555,50 @@ async function runLoopSelfTest() {
     }
 
     // Time parsing (extractWhenFromText)
+    // Recurring cadence parsing (parseEveryPhrase): seconds stay seconds.
+    const everySec = parseEveryPhrase("every 5 seconds");
+    if (!everySec || everySec.intervalMs !== 5000 || everySec.label !== "every 5 seconds") {
+      out(`LOOP_FAIL: parseEveryPhrase(seconds) wrong: ${JSON.stringify(everySec)}\n`);
+      return 1;
+    }
+    const everyMin = parseEveryPhrase("every 10 minutes");
+    if (!everyMin || everyMin.intervalMs !== 600000 || everyMin.label !== "every 10 minutes") {
+      out(`LOOP_FAIL: parseEveryPhrase(minutes) wrong: ${JSON.stringify(everyMin)}\n`);
+      return 1;
+    }
+    if (parseEveryPhrase("not a cadence") !== null) {
+      out("LOOP_FAIL: parseEveryPhrase should return null for non-cadence\n");
+      return 1;
+    }
+
+    // Sub-minute schedule: normalizeLoopTask honors intervalMs < 1 min when
+    // subMinute is set; a persisted loop restores with its 5s interval.
+    const subTask = normalizeLoopTask({
+      id: "sub",
+      prompt: "x",
+      intervalMs: 5000,
+      subMinute: true,
+      oneshot: false,
+      createdAt: Date.now(),
+      nextFireAt: Date.now() + 5000,
+    });
+    if (!subTask || subTask.intervalMs !== 5000) {
+      out(`LOOP_FAIL: sub-minute interval should restore as-is (got ${subTask?.intervalMs})\n`);
+      return 1;
+    }
+    const subTaskNoFlag = normalizeLoopTask({
+      id: "sub2",
+      prompt: "x",
+      intervalMs: 5000,
+      oneshot: false,
+      createdAt: Date.now(),
+      nextFireAt: Date.now() + 5000,
+    });
+    if (!subTaskNoFlag || subTaskNoFlag.intervalMs !== LOOP_MIN_INTERVAL_MS) {
+      out("LOOP_FAIL: sub-minute interval without flag should clamp to minute floor\n");
+      return 1;
+    }
+
     // Seconds resolve to real seconds (no cron floor for one-shots).
     const secWhen = extractWhenFromText("in 3 seconds check it");
     if (
