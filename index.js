@@ -311,6 +311,7 @@ let systemPromptText = "";
 let skillsCatalog = [];
 let systemPromptLoadPromise = null;
 let answerRevealTimer = null;
+let answerRevealSettlePending = false;
 let forceChatRefreshFlag = false;
 let thinkingAnimationTimer = null;
 let thinkingFrameIndex = 0;
@@ -335,6 +336,7 @@ let altScreenActive = false;
 let forceTranscriptReplay = true;
 let appendReservedBottomRows = 0;
 let cachedChatLines = null;
+let lastEntryVisualStartIndex = -1;
 let cachedChatLinesCols = 0;
 let cachedChatLinesLen = -1;
 let cachedChatLinesLastRef = null;
@@ -1792,8 +1794,10 @@ function triggerAnswerReveal(entry) {
         clearInterval(answerRevealTimer);
         answerRevealTimer = null;
         // Reveal finished: drop the cache (it may hold a mid-fade frame) and
-        // force one final repaint so the message resolves to normal styling.
+        // run one final in-place repaint so the message resolves to normal
+        // styling without a full clear/redraw.
         cachedChatLines = null;
+        answerRevealSettlePending = true;
         forceChatRefreshFlag = true;
         markDirty();
         renderFrame(false);
@@ -2690,6 +2694,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
         if (generation !== chatGeneration) {
           return;
         }
+
       }
 
       if (stopRequested) {
@@ -5383,6 +5388,7 @@ function highlightPythonCodeLine(line, isFenceLine = false) {
 
 function buildChatVisualLines(cols, sourceEntries = messages) {
   const revealActive = sourceEntries === messages && hasActiveAnswerReveal();
+  let entryStartIndex = -1;
   if (sourceEntries === messages && !revealActive) {
     const lastRef = messages.length > 0 ? messages[messages.length - 1] : null;
     if (
@@ -5431,6 +5437,8 @@ function buildChatVisualLines(cols, sourceEntries = messages) {
       }
     }
 
+    entryStartIndex = visualLines.length;
+
     for (const styledLine of reasoningLines) {
       const plainLine = stripAnsiSgr(styledLine);
       visualLines.push({
@@ -5473,6 +5481,8 @@ function buildChatVisualLines(cols, sourceEntries = messages) {
 
     previousRole = role;
   }
+
+  lastEntryVisualStartIndex = entryStartIndex;
 
   if (sourceEntries === messages && !revealActive) {
     cachedChatLines = visualLines;
@@ -6566,14 +6576,46 @@ function renderFrame(forceChatRefresh = false) {
       chatAreaHeight !== lastChatAreaHeight ||
       menuLayoutChanged);
 
-  if (needsChatRefresh) {
+  const chatStartRow = Math.max(0, chatAreaHeight - chatVisualLines.length);
+  const revealActiveNow =
+    !APPEND_CHAT_TO_SCROLLBACK &&
+    chatScrollOffset === 0 &&
+    (hasActiveAnswerReveal() || answerRevealSettlePending) &&
+    lastEntryVisualStartIndex >= 0;
+
+  if (revealActiveNow) {
+    // Repaint every visible chat row in place (no clear step): static rows
+    // are rewritten with identical content (invisible), while the revealing
+    // message gets the current fade color. This also self-heals any
+    // full-screen clear that happened this frame (arrival or status-bar
+    // collapse) so the rest of the chat never disappears mid-fade.
+    for (let i = 0; i < chatVisualLines.length; i += 1) {
+      const row = chatStartRow + i;
+      const line = chatVisualLines[i];
+      if (line.styledText) {
+        writeStyledLine(row, line.text, line.styledText, cols);
+      } else if (line.color === GREEN_COLOR) {
+        writeColoredLine(row, line.text, cols, GREEN_COLOR);
+      } else if (line.color === RED_COLOR) {
+        writeColoredLine(row, line.text, cols, RED_COLOR);
+      } else if (line.color === PLACEHOLDER_COLOR) {
+        writeColoredLine(row, line.text, cols, PLACEHOLDER_COLOR);
+      } else {
+        writeLine(row, line.text, cols);
+        if (line.assistantBulletMuted) {
+          readline.cursorTo(process.stdout, CHAT_LEFT_PADDING.length, row);
+          process.stdout.write(`${PLACEHOLDER_COLOR}\u2022${RESET_COLOR}`);
+        }
+      }
+    }
+    answerRevealSettlePending = false;
+  } else if (needsChatRefresh) {
     const oldChatHeight = lastChatAreaHeight ?? 0;
     const chatClearHeight = Math.max(chatAreaHeight, oldChatHeight);
     for (let y = 0; y < chatClearHeight; y += 1) {
       writeLine(y, "", cols);
     }
 
-    const chatStartRow = Math.max(0, chatAreaHeight - chatVisualLines.length);
     for (let i = 0; i < chatVisualLines.length; i += 1) {
       if (chatVisualLines[i].styledText) {
         writeStyledLine(
