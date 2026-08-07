@@ -3375,6 +3375,10 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
         const retryMessages = stripReasoningDetailsFromMessages(messagesForRequest);
         const retryCompletion = await performRequest(retryMessages, false);
         setReasoningEnabledForModel(resolvedModel, false);
+        appendAssistantMessage(
+          "Auto-disabled thinking for this model (provider rejected the reasoning parameter). Run /set thinking on to re-enable.",
+          { excludeFromRequest: true, persistHistory: false }
+        );
         await rewriteSessionWithCurrentMessages().catch(() => {});
         markDirty();
         renderFrame(false);
@@ -3409,6 +3413,10 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
           updateContextBudgetFromCompletion(completion, resolvedModel);
           assistantPayload = retryPayload;
           setReasoningEnabledForModel(resolvedModel, false);
+          appendAssistantMessage(
+            "Auto-disabled thinking for this model (empty content with thinking on). Run /set thinking on to re-enable.",
+            { excludeFromRequest: true, persistHistory: false }
+          );
           await rewriteSessionWithCurrentMessages().catch(() => {});
           markDirty();
           renderFrame(false);
@@ -3555,6 +3563,10 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
             followUpContent = retryPayload.text;
             followUpReasoningDetails = null;
             setReasoningEnabledForModel(resolvedModel, false);
+            appendAssistantMessage(
+              "Auto-disabled thinking for this model (empty follow-up content with thinking on). Run /set thinking on to re-enable.",
+              { excludeFromRequest: true, persistHistory: false }
+            );
             await rewriteSessionWithCurrentMessages().catch(() => {});
             markDirty();
             renderFrame(false);
@@ -4161,7 +4173,8 @@ function getMainFooterText() {
   const modelLabel = selectedModel && selectedModel.trim().length > 0 ? selectedModel.trim() : "no model";
   const contextLeft = Math.round(getContextLeftPercent(selectedModel));
   const safeContextLeft = Math.max(0, Math.min(100, contextLeft));
-  let text = `Current model: ${modelLabel} | ${safeContextLeft}% context left | ${formatWorkspacePathForFooter(WORKSPACE_ROOT)}`;
+  const thinkingState = getReasoningEnabledForModel(selectedModel) ? "thinking on" : "thinking off";
+  let text = `Current model: ${modelLabel} | ${safeContextLeft}% context left | ${thinkingState} | ${formatWorkspacePathForFooter(WORKSPACE_ROOT)}`;
   const mouseManuallyOff = APP_MOUSE_TRACKING_ENABLED && !mouseTrackingEnabled && !mouseSelectionMode;
   if (mouseManuallyOff) {
     text += " | drag to select/copy · Alt+M mouse · PgUp/PgDn scroll";
@@ -4780,11 +4793,21 @@ async function runSlashCommand(commandName, commandArgs = "") {
     }
 
     if (settingKey === "thinking") {
-      const normalizedValue = settingValue.toLowerCase();
       if (!selectedModel || selectedModel.trim().length === 0) {
         appendTuiErrorMessage("/set", "failed because current model is not set");
         return true;
       }
+      if (settingValue.trim().length === 0) {
+        const stateText = getReasoningEnabledForModel(selectedModel) ? "on" : "off";
+        appendAssistantMessage(`Thinking is currently ${stateText} for ${selectedModel.trim()}`, {
+          excludeFromRequest: true,
+          persistHistory: false,
+        });
+        await rewriteSessionWithCurrentMessages();
+        refreshMainBufferAfterCommand();
+        return true;
+      }
+      const normalizedValue = settingValue.toLowerCase();
       if (normalizedValue !== "on" && normalizedValue !== "off") {
         appendTuiErrorMessage("/set", "invalid usage. Use '/set thinking <on|off>'");
         return true;
