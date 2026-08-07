@@ -1331,6 +1331,7 @@ async function handleMcpBridgeRequest(parsed) {
       oneshot: true,
       dynamic: false,
       fireAt: extracted.when,
+      displayLabel: extracted.display,
     });
     startLoopScheduler();
     if (process.stdout.isTTY) {
@@ -5563,6 +5564,7 @@ async function runSlashCommand(commandName, commandArgs = "") {
         oneshot: true,
         dynamic: false,
         fireAt: extracted.when,
+        displayLabel: extracted.display,
       });
       startLoopScheduler();
       appendAssistantMessage(
