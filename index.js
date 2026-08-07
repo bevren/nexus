@@ -1629,6 +1629,7 @@ async function rewriteSessionWithCurrentMessages() {
       createdAt: task.createdAt,
       nextFireAt: task.nextFireAt,
       lastDelayMs: task.lastDelayMs,
+      display: task.displayLabel || "",
     })),
   };
   const fullLines = loopTasks.length > 0
@@ -2273,6 +2274,7 @@ function normalizeLoopTask(entry) {
     nextFireAt,
     lastRunMessageCount: 0,
     lastDelayMs: normalizedInterval,
+    displayLabel: typeof entry.display === "string" && entry.display ? entry.display : "",
   };
 }
 
@@ -2357,6 +2359,7 @@ function scheduleLoopTask(intervalMinutes, prompt, options = {}) {
     oneshot: options.oneshot === true,
     createdAt: Date.now(),
     nextFireAt,
+    display: options.displayLabel || "",
   });
   loopTasks.push(task);
   return task;
@@ -2431,7 +2434,15 @@ async function checkDueLoops() {
           ? task.prompt.trim()
           : LOOP_MAINTENANCE_PROMPT;
       ensureSystemMessageAtTop();
-      messages.push({ role: "user", content });
+      // Fire as a tool output (not a user message) so the transcript shows a
+      // machine-originated event, and the model sees it as [tool result].
+      messages.push({
+        role: "tool",
+        content,
+        name: "set_reminder",
+        toolInput: task.displayLabel || "scheduled reminder",
+        toolOk: true,
+      });
       scrollChatToBottom();
       if (!APPEND_CHAT_TO_SCROLLBACK) {
         forceFullClearOnNextRender = true;
@@ -9323,12 +9334,28 @@ async function runLoopSelfTest() {
     loopTasks = savedBridgeTasks;
 
     // One-shot schedule via fireAt
-    const shot = scheduleLoopTask(null, "notify", { oneshot: true, dynamic: false, fireAt: Date.now() + 60 * 60 * 1000 });
-    if (shot.oneshot !== true || Math.abs(shot.nextFireAt - (Date.now() + 60 * 60 * 1000)) > 5000) {
-      out("LOOP_FAIL: one-shot schedule fireAt wrong\n");
+    const shot = scheduleLoopTask(null, "notify", {
+      oneshot: true,
+      dynamic: false,
+      fireAt: Date.now() + 60 * 60 * 1000,
+      displayLabel: "tomorrow at 9:00am",
+    });
+    if (
+      shot.oneshot !== true ||
+      Math.abs(shot.nextFireAt - (Date.now() + 60 * 60 * 1000)) > 5000 ||
+      shot.displayLabel !== "tomorrow at 9:00am"
+    ) {
+      out("LOOP_FAIL: one-shot schedule fireAt/display wrong\n");
       return 1;
     }
     removeLoopTask(shot.id);
+
+    // displayLabel round-trips through normalizeLoopTask (persistence).
+    const relabeled = normalizeLoopTask({ ...stored, display: "in 3 seconds" });
+    if (!relabeled || relabeled.displayLabel !== "in 3 seconds") {
+      out("LOOP_FAIL: displayLabel should round-trip through normalizeLoopTask\n");
+      return 1;
+    }
 
     // loop.md fallback: getLoopMaintenancePrompt falls back to the built-in
     // prompt when no file exists (no .claude dir in this workspace).
