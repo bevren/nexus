@@ -3510,20 +3510,50 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
       // Reset the thinking counter after code execution so the follow-up
       // thinking phase starts from 0s instead of carrying the old elapsed time.
       thinkingStartedAt = Date.now();
-      const followUpCompletion = await requestWithTimeout(followUpMessages);
+      let followUpCompletion = await requestWithTimeout(followUpMessages);
       if (generation !== chatGeneration) {
         return;
       }
       updateContextBudgetFromCompletion(followUpCompletion, resolvedModel);
 
-      const followUpPayload = extractAssistantPayloadFromCompletion(followUpCompletion, {
-        allowReasoningTextFallback: getReasoningEnabledForModel(resolvedModel),
+      const followUpReasoningEnabled = getReasoningEnabledForModel(resolvedModel);
+      let followUpPayload = extractAssistantPayloadFromCompletion(followUpCompletion, {
+        allowReasoningTextFallback: followUpReasoningEnabled,
       });
-      const followUpContent = followUpPayload.text;
-      const followUpReasoningDetails = getReasoningEnabledForModel(resolvedModel)
-        ? followUpPayload.reasoningDetails
-        : null;
+      let followUpContent = followUpPayload.text;
+      let followUpReasoningDetails = followUpReasoningEnabled ? followUpPayload.reasoningDetails : null;
+      if (followUpContent.trim().length === 0 && followUpReasoningEnabled) {
+        // Reasoning models sometimes return only reasoning_content with an
+        // empty final answer on follow-ups after tool runs. Retry without
+        // reasoning so the feedback loop keeps going instead of stalling
+        // silently after code execution.
+        try {
+          const retryMessages = stripReasoningDetailsFromMessages(followUpMessages);
+          const retryCompletion = await requestWithTimeout(retryMessages, { disableReasoning: true });
+          const retryPayload = extractAssistantPayloadFromCompletion(retryCompletion, {
+            allowReasoningTextFallback: false,
+          });
+          if (retryPayload.text.trim().length > 0) {
+            followUpCompletion = retryCompletion;
+            updateContextBudgetFromCompletion(followUpCompletion, resolvedModel);
+            followUpContent = retryPayload.text;
+            followUpReasoningDetails = null;
+            setReasoningEnabledForModel(resolvedModel, false);
+            await rewriteSessionWithCurrentMessages().catch(() => {});
+            markDirty();
+            renderFrame(false);
+          }
+        } catch {
+          // Keep the original empty result; the notice below will explain.
+        }
+      }
       if (followUpContent.trim().length === 0) {
+        appendAssistantMessage(
+          getReasoningEnabledForModel(resolvedModel)
+            ? "Provider returned no assistant content after the tool run. Try /set thinking off for this model."
+            : "Provider returned no assistant content after the tool run.",
+          { excludeFromRequest: true, persistHistory: false }
+        );
         break;
       }
 
