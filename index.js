@@ -608,10 +608,21 @@ function updateContextBudgetFromCompletion(completion, modelId = selectedModel) 
 }
 
 function normalizeReasoningDetails(value) {
+  if (typeof value === "string") {
+    const cleaned = value.trim();
+    return cleaned.length > 0 ? [{ type: "reasoning.text", text: cleaned, format: "unknown" }] : null;
+  }
   if (!Array.isArray(value)) {
     return null;
   }
-  const cleaned = value.filter((item) => item && typeof item === "object");
+  const cleaned = [];
+  for (const item of value) {
+    if (typeof item === "string") {
+      cleaned.push({ type: "reasoning.text", text: item, format: "unknown" });
+    } else if (item && typeof item === "object") {
+      cleaned.push(item);
+    }
+  }
   return cleaned.length > 0 ? cleaned : null;
 }
 
@@ -2432,7 +2443,12 @@ function extractAssistantPayloadFromCompletion(completion, options = {}) {
   let reasoningDetails =
     normalizeReasoningDetails(message?.reasoning_details) ||
     normalizeReasoningDetails(choice?.reasoning_details) ||
-    normalizeReasoningDetails(completion?.reasoning_details);
+    normalizeReasoningDetails(completion?.reasoning_details) ||
+    // OpenRouter returns thinking traces as message.reasoning: an array of
+    // objects, each { type: "reasoning.text", text }, or part-array variants.
+    normalizeReasoningDetails(message?.reasoning ? message.reasoning : null) ||
+    normalizeReasoningDetails(choice?.reasoning ? choice.reasoning : null) ||
+    normalizeReasoningDetails(completion?.reasoning ? completion.reasoning : null);
 
   const providerReasoningText =
     (typeof message?.reasoning_content === "string" && message.reasoning_content.trim()) ||
