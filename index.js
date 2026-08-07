@@ -159,6 +159,7 @@ const COMMANDS = [
   { name: "/compact", description: "manually compact context: /compact [optional instruction]" },
   { name: "/loop", description: "run a prompt on an interval: /loop [interval] [prompt]" },
   { name: "/loops", description: "list or cancel scheduled loops: /loops | /loops cancel <id>" },
+  { name: "/hooks", description: "show configured lifecycle hooks (read-only)" },
 ];
 const FALLBACK_TOOL_DESCRIPTIONS = {
   insert_memory:
@@ -1689,6 +1690,18 @@ function cleanupTerminal(options = {}) {
   }
 
   cleanedUp = true;
+
+  // SessionEnd hooks: synchronous, bounded to ~1.5s via spawnSync internals.
+  try {
+    runHooks({
+      eventName: "SessionEnd",
+      matcherValue: "other",
+      input: { reason: "other" },
+      sync: true,
+    });
+  } catch {
+    // never block exit on hook failures
+  }
   if (flushTimer) {
     clearTimeout(flushTimer);
     flushTimer = null;
@@ -2773,6 +2786,388 @@ function parseEveryPhrase(text) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Hooks (Claude Code-style lifecycle hooks)
+// - Configured in .claude/settings.json (project) and ~/.claude/settings.json (user)
+// - Hook types: command (shell), http (POST), prompt (LLM yes/no)
+// - Events fired by the TUI: SessionStart, UserPromptSubmit, PreToolUse,
+//   PostToolUse, PostToolUseFailure, Stop, Notification, PreCompact,
+//   PostCompact, SessionEnd
+// - Exit code 2 blocks the action; stderr becomes Claude feedback.
+//   stdout JSON may carry { hookSpecificOutput: { additionalContext, ... } }.
+// - Stop hooks are capped (stopHookBlockCount, stop_hook_active guard).
+// ---------------------------------------------------------------------------
+const HOOK_STOP_BLOCK_CAP = 8;
+
+let hooksProject = {};
+let hooksUser = {};
+let stopHookBlockCount = 0;
+let pendingHookContext = "";
+
+function loadHooksConfig() {
+  hooksProject = {};
+  hooksUser = {};
+  const targetPaths = [
+    [path.join(WORKSPACE_ROOT, ".claude", "settings.json"), (v) => { hooksProject = v; }],
+    [path.join(os.homedir(), ".claude", "settings.json"), (v) => { hooksUser = v; }],
+  ];
+  for (const [filePath, assign] of targetPaths) {
+    try {
+      if (fsSync.existsSync(filePath)) {
+        const parsed = JSON.parse(fsSync.readFileSync(filePath, "utf8"));
+        const hooks = parsed && typeof parsed.hooks === "object" ? parsed.hooks : {};
+        assign(hooks);
+      } else {
+        assign({});
+      }
+    } catch {
+      assign({});
+    }
+  }
+}
+
+function hookMatcherMatches(matcher, value) {
+  const pattern = String(matcher || "").trim();
+  if (!pattern) {
+    return true;
+  }
+  const valueStr = String(value ?? "");
+  const parts = pattern
+    .split(/[|,]/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  if (parts.length > 1) {
+    return parts.some((p) => {
+      if (/[*?\\^$+()[\]{}]/.test(p)) {
+        try {
+          return new RegExp(p).test(valueStr);
+        } catch {
+          return false;
+        }
+      }
+      return p === valueStr;
+    });
+  }
+  if (/[*?\\^$+()[\]{}]/.test(pattern)) {
+    try {
+      return new RegExp(pattern).test(valueStr);
+    } catch {
+      return false;
+    }
+  }
+  return pattern === valueStr;
+}
+
+function collectHookHandlersForEvent(eventName, matcherValue) {
+  const handlers = [];
+  for (const hooks of [hooksProject, hooksUser]) {
+    const groups = Array.isArray(hooks[eventName]) ? hooks[eventName] : [];
+    for (const group of groups) {
+      if (!hookMatcherMatches(group && group.matcher, matcherValue)) {
+        continue;
+      }
+      const hs = Array.isArray(group && group.hooks) ? group.hooks : [];
+      for (const handler of hs) {
+        handlers.push(handler);
+      }
+    }
+  }
+  return handlers;
+}
+
+function parseHookJson(text) {
+  const source = String(text || "");
+  const trimmed = source.trim();
+  if (!trimmed) {
+    return null;
+  }
+  try {
+    return JSON.parse(trimmed.replace(/^\uFEFF/, ""));
+  } catch {
+    // fall through to brace extraction
+  }
+  const match = source.match(/\{[\s\S]*\}/);
+  if (!match) {
+    return null;
+  }
+  try {
+    return JSON.parse(match[0]);
+  } catch {
+    return null;
+  }
+}
+
+function runCommandHook(command, inputJson, timeoutMs) {
+  const { spawn } = require("node:child_process");
+  return new Promise((resolve) => {
+    let child = null;
+    try {
+      child = spawn(String(command || ""), { shell: true, windowsHide: true });
+    } catch (error) {
+      resolve({ ok: false, error: String(error?.message || error) });
+      return;
+    }
+    if (!child) {
+      resolve({ ok: false, error: "failed to spawn hook" });
+      return;
+    }
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      try {
+        child.kill();
+      } catch {
+        // ignore
+      }
+      resolve({ ok: false, error: `hook timed out after ${Math.round((Number(timeoutMs) || 10000) / 1000)}s`, stdout, stderr });
+    }, Math.max(1000, Number(timeoutMs) || 10000));
+    if (child.stdout) {
+      child.stdout.on("data", (d) => {
+        stdout += String(d);
+      });
+    }
+    if (child.stderr) {
+      child.stderr.on("data", (d) => {
+        stderr += String(d);
+      });
+    }
+    child.on("error", (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve({ ok: false, error: String(error?.message || error), stdout, stderr });
+    });
+    child.on("close", (code) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve({ ok: true, code: code === null ? -1 : code, stdout, stderr });
+    });
+    try {
+      if (child.stdin) {
+        child.stdin.end(inputJson);
+      }
+    } catch {
+      // ignore
+    }
+  });
+}
+
+async function runHttpHook(handler, inputJson, timeoutMs) {
+  const url = typeof handler && typeof handler.url === "string" ? handler.url : "";
+  if (!url) {
+    return { ok: false, error: "http hook is missing a url" };
+  }
+  try {
+    const headers = { "Content-Type": "application/json" };
+    const extraHeaders =
+      handler && handler.headers && typeof handler.headers === "object" ? handler.headers : {};
+    for (const [key, value] of Object.entries(extraHeaders)) {
+      headers[key] = String(value).replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g, (whole, name) =>
+        typeof process.env[name] === "string" ? process.env[name] : ""
+      );
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.max(1000, Number(timeoutMs) || 10000));
+    try {
+      const resp = await fetch(url, {
+        method: "POST",
+        headers,
+        body: inputJson,
+        signal: controller.signal,
+      });
+      const text = await resp.text();
+      return { ok: true, code: resp.status, stdout: text, stderr: "" };
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (error) {
+    return { ok: false, error: String(error?.message || error) };
+  }
+}
+
+async function runPromptHook(handler, inputJson, timeoutMs) {
+  const client = getOpenRouterClient();
+  const modelId = selectedModel;
+  if (!client || !modelId) {
+    return { ok: false, error: "no LLM client available for prompt hook" };
+  }
+  const prompt =
+    handler && typeof handler.prompt === "string" && handler.prompt.trim()
+      ? handler.prompt.trim()
+      : "Decide whether to allow the action. Respond with JSON: {\"ok\": true|false, \"reason\": \"...\"}";
+  const systemText =
+    "You are a hook evaluator. Read the hook prompt and the HOOK INPUT JSON. " +
+    'Respond with only JSON: {"ok": true|false, "reason": "short reason"}.';
+  const operation = async () => {
+    const completion = await client.chat.completions.create({
+      model: modelId,
+      messages: [
+        { role: "system", content: systemText },
+        { role: "user", content: `${prompt}\n\nHOOK INPUT:\n${inputJson}` },
+      ],
+    });
+    const content = completion?.choices?.[0]?.message?.content || "";
+    const parsed = parseHookJson(content);
+    const ok = parsed && parsed.ok !== false;
+    const reason = parsed && typeof parsed.reason === "string" ? parsed.reason : "";
+    if (ok) {
+      return { ok: true, code: 0, stdout: "", stderr: "" };
+    }
+    return {
+      ok: true,
+      code: 0,
+      stdout: "",
+      stderr: reason || "blocked by prompt hook",
+      blocked: true,
+      reason,
+    };
+  };
+  const timer = new Promise((resolve) => {
+    setTimeout(() => resolve({ ok: false, error: "prompt hook timed out" }), Math.max(1000, Number(timeoutMs) || 10000));
+  });
+  return Promise.race([operation(), timer]);
+}
+
+function stderrContextText(stderr) {
+  const trimmed = String(stderr || "").trim();
+  if (!trimmed) {
+    return "";
+  }
+  return trimmed;
+}
+
+async function runHooks(options) {
+  const eventName = String(options?.eventName || "");
+  const matcherValue = options?.matcherValue ?? null;
+  const input = options?.input && typeof options.input === "object" ? options.input : {};
+  const timeoutMs = Number(options?.timeoutMs) || 15000;
+  const sync = options?.sync === true;
+  const result = {
+    eventName,
+    blocked: false,
+    blockReason: "",
+    additionalContext: "",
+    feedback: "",
+    decisions: [],
+    notices: [],
+    hookSpecificOutput: null,
+  };
+  const handlers = collectHookHandlersForEvent(eventName, matcherValue);
+  if (handlers.length === 0) {
+    return result;
+  }
+  const inputJson = JSON.stringify({
+    session_id: currentSessionUid,
+    cwd: WORKSPACE_ROOT,
+    hook_event_name: eventName,
+    ...input,
+  });
+
+  if (sync) {
+    // SessionEnd path: bounded 1.5s budget, synchronous.
+    const { spawnSync } = require("node:child_process");
+    for (const handler of handlers) {
+      if (handler && handler.type === "command") {
+        try {
+          const res = spawnSync(String(handler.command || ""), [], {
+            shell: true,
+            input: inputJson,
+            encoding: "utf8",
+            timeout: 1500,
+            windowsHide: true,
+            maxBuffer: 1024 * 1024,
+          });
+          const out = String(res.stdout || "");
+          const err = String(res.stderr || "");
+          if (res.status === 2) {
+            result.blocked = true;
+            result.blockReason = err.trim() || "blocked by hook";
+          }
+          if (res.status === 0 && out.trim()) {
+            result.additionalContext += (result.additionalContext ? "\n" : "") + out.trim();
+          }
+        } catch (error) {
+          result.notices.push(`${eventName} hook error: ${String(error?.message || error)}`);
+        }
+      }
+    }
+    return result;
+  }
+
+  const tasks = handlers.map(async (handler) => {
+    let run = null;
+    const type = handler && handler.type || "command";
+    if (type === "http") {
+      run = await runHttpHook(handler, inputJson, timeoutMs);
+    } else if (type === "prompt") {
+      run = await runPromptHook(handler, inputJson, timeoutMs);
+    } else {
+      run = await runCommandHook(handler && handler.command, inputJson, timeoutMs);
+    }
+    if (!run || run.ok === false) {
+      result.notices.push(`${eventName} hook error: ${String((run && run.error) || "unknown error")}`);
+      return;
+    }
+    if (run.code === 2 || run.blocked === true) {
+      result.blocked = true;
+      result.blockReason =
+        (run.blocked && run.reason) ||
+        String((run.stderr || "")).trim() ||
+        "blocked by hook";
+    }
+    const json = parseHookJson(run.stdout);
+    if (json && typeof json === "object") {
+      const hs =
+        json.hookSpecificOutput && typeof json.hookSpecificOutput === "object"
+          ? json.hookSpecificOutput
+          : json;
+      if (typeof hs.additionalContext === "string" && hs.additionalContext.trim()) {
+        result.additionalContext += (result.additionalContext ? "\n" : "") + hs.additionalContext.trim();
+      }
+      if (typeof hs.feedback === "string" && hs.feedback.trim()) {
+        result.feedback += (result.feedback ? "\n" : "") + hs.feedback.trim();
+      }
+      if (typeof hs.permissionDecision === "string") {
+        result.decisions.push(hs.permissionDecision);
+      }
+      if (hs.blocked === true) {
+        result.blocked = true;
+        result.blockReason = typeof hs.reason === "string" ? hs.reason : "blocked by hook";
+      }
+      result.hookSpecificOutput = hs;
+    } else if (eventName === "SessionStart" && run.code === 0 && String(run.stdout || "").trim()) {
+      result.additionalContext += (result.additionalContext ? "\n" : "") + String(run.stdout).trim();
+    }
+  });
+  await Promise.all(tasks);
+
+  // PreToolUse permission merging: most restrictive wins.
+  if (result.decisions.length > 0) {
+    const order = { deny: 0, defer: 1, ask: 2, allow: 3 };
+    let best = "allow";
+    for (const decision of result.decisions) {
+      if ((order[decision] ?? 4) < (order[best] ?? 4)) {
+        best = decision;
+      }
+    }
+    if (best !== "allow") {
+      result.blocked = true;
+      result.blockReason = result.blockReason || (best === "deny" ? "denied by hook" : `hook decision: ${best}`);
+    }
+  }
+  return result;
+}
+
 async function runCompaction(customInstruction = "") {
   // Codex local path: ask the model to summarize the conversation into a
   // single user-role "_summary" message, then keep only the most recent user
@@ -2842,6 +3237,22 @@ async function runCompaction(customInstruction = "") {
     return { ok: false, error: "Compaction failed: model returned an empty summary." };
   }
 
+  // PreCompact hook: deterministic pre-compaction hooks (e.g. capture context
+  // into a file before it is summarized away). Matcher: manual|auto.
+  try {
+    const compactHook = await runHooks({
+      eventName: "PreCompact",
+      matcherValue: customInstruction.trim() ? "manual" : "auto",
+      input: { trigger: customInstruction.trim() ? "manual" : "auto", summary_length: summaryText.length },
+      timeoutMs: 30000,
+    });
+    if (compactHook.additionalContext) {
+      pendingHookContext = compactHook.additionalContext;
+    }
+  } catch {
+    // non-fatal
+  }
+
   // Replace the conversation with: system + [freshest summary] + the most
   // recent tail of the conversation that fits the recent-token budget.
   // Everything older (assistant replies, tool results, read file contents)
@@ -2884,6 +3295,35 @@ async function runCompaction(customInstruction = "") {
   await rewriteSessionWithCurrentMessages().catch(() => {});
   markDirty();
   renderFrame(true);
+  // PostCompact hook: deterministic post-compaction hooks (e.g. re-inject
+  // critical context). stdout/custom additionalContext is appended as a
+  // system reminder-style user entry.
+  try {
+    const postCompactRun = await runHooks({
+      eventName: "PostCompact",
+      matcherValue: customInstruction.trim() ? "manual" : "auto",
+      input: { trigger: customInstruction.trim() ? "manual" : "auto", summary_length: summaryText.length },
+      timeoutMs: 30000,
+    });
+    const contextToInject =
+      (postCompactRun.additionalContext || "") || pendingHookContext || "";
+    if (contextToInject.trim()) {
+      ensureSystemMessageAtTop();
+      messages.push({ role: "user", content: contextToInject.trim(), excludeFromRequest: false });
+      scrollChatToBottom();
+      markDirty();
+      renderFrame(true);
+    }
+    if (postCompactRun.notices.length > 0) {
+      appendAssistantMessage(postCompactRun.notices.join("\n"), {
+        excludeFromRequest: true,
+        persistHistory: false,
+      });
+    }
+  } catch {
+    // non-fatal
+  }
+  pendingHookContext = "";
   return { ok: true, summary: summaryText, keptRecentUserMessages: keptTail.length };
 }
 
@@ -3953,6 +4393,18 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
     return;
   }
 
+  // additionalContext from hooks (UserPromptSubmit/PreToolUse) is injected as
+  // a system-reminder-style user entry before the LLM request.
+  if (String(pendingHookContext || "").trim()) {
+    ensureSystemMessageAtTop(resolvedModel);
+    messages.push({
+      role: "user",
+      content: String(pendingHookContext).trim(),
+      excludeFromRequest: false,
+    });
+    pendingHookContext = "";
+  }
+
   const requestWithTimeout = async (messagesForRequest, options = {}) => {
     const disableReasoning = options?.disableReasoning === true;
     const performRequest = async (msgs, includeReasoning) => {
@@ -4085,7 +4537,33 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
           done: false,
           ok: false,
         };
-        const execResult = await executeCodeWithPythonTool(pythonCode);
+        // PreToolUse hook: can block (exit 2) or inject context before a tool run.
+        const preToolRun = await runHooks({
+          eventName: "PreToolUse",
+          matcherValue: "code_execution",
+          input: {
+            tool_name: "code_execution",
+            tool_input: { code: pythonCode },
+          },
+          timeoutMs: 30000,
+        });
+        let execResult = null;
+        if (preToolRun.blocked) {
+          execResult = {
+            ok: false,
+            output: "",
+            error: `Tool blocked by hook${preToolRun.blockReason ? `: ${preToolRun.blockReason}` : "."}`,
+            traceback: "",
+            editEvents: [],
+            editSummaries: [],
+            historyActions: [],
+          };
+        } else {
+          if (preToolRun.additionalContext) {
+            pendingHookContext = preToolRun.additionalContext;
+          }
+          execResult = await executeCodeWithPythonTool(pythonCode);
+        }
         if (stopRequested) {
           // User pressed Esc while the process was running: per request,
           // let the running process finish, show its output, then stop.
@@ -4093,6 +4571,33 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
         } else if (activeToolRun) {
           activeToolRun.done = true;
           activeToolRun.ok = Boolean(execResult?.ok);
+        }
+        // PostToolUse / PostToolUseFailure: deterministic follow-up (format,
+        // notify, audit). Exit code 2 on PostToolUse blocks the tool result.
+        const postEventName = Boolean(execResult?.ok) ? "PostToolUse" : "PostToolUseFailure";
+        const postToolRun = await runHooks({
+          eventName: postEventName,
+          matcherValue: "code_execution",
+          input: {
+            tool_name: "code_execution",
+            tool_input: { code: pythonCode },
+            tool_output: execResult ? { done: true, ok: Boolean(execResult.ok), error: execResult.error || "" } : { done: false },
+          },
+          timeoutMs: 30000,
+        });
+        if (postToolRun.blocked) {
+          execResult = {
+            ok: false,
+            output: "",
+            error: `Tool result blocked by hook${postToolRun.blockReason ? `: ${postToolRun.blockReason}` : "."}`,
+            traceback: "",
+            editEvents: [],
+            editSummaries: [],
+            historyActions: [],
+          };
+        }
+        if (postToolRun.additionalContext) {
+          pendingHookContext = postToolRun.additionalContext;
         }
         const toolResultPayload = buildToolResultPayload(execResult);
         const historyActionResult = applyHistoryActionsFromTool(execResult?.historyActions, generation);
@@ -4251,6 +4756,44 @@ function queueAssistantReply(modelId) {
       if (hadPending && pendingAssistantRequests === 0) {
         markDirty();
         renderFrame(false);
+        // Turn completed: fire Notification then Stop hooks. Stop hooks run
+        // with a block cap (8) and receive stop_hook_active after a prior
+        // block so they don't loop forever.
+        runHooks({
+          eventName: "Notification",
+          matcherValue: "idle_prompt",
+          input: { notification_type: "idle_prompt" },
+          timeoutMs: 10000,
+        })
+          .catch(() => {})
+          .finally(async () => {
+            const hookInput = { stop_hook_active: stopHookBlockCount > 0 };
+            const stopRun = await runHooks({
+              eventName: "Stop",
+              input: hookInput,
+              timeoutMs: 30000,
+            });
+            if (stopRun.blocked) {
+              stopHookBlockCount += 1;
+              if (stopHookBlockCount >= HOOK_STOP_BLOCK_CAP) {
+                appendAssistantMessage(
+                  `Stop hook blocked the turn ${HOOK_STOP_BLOCK_CAP} times; allowing stop.`,
+                  { excludeFromRequest: true, persistHistory: false }
+                );
+                stopHookBlockCount = 0;
+              } else if (stopRun.blockReason) {
+                appendAssistantMessage(
+                  `Continuing: ${stopRun.blockReason}`,
+                  { excludeFromRequest: true, persistHistory: true }
+                );
+                if (selectedModel) {
+                  queueAssistantReply(selectedModel);
+                }
+              }
+            } else {
+              stopHookBlockCount = 0;
+            }
+          });
       }
     });
 }
@@ -5684,6 +6227,58 @@ async function runSlashCommand(commandName, commandArgs = "") {
       `Scheduled loop ${task.id} (${intervalLabel}). Prompt: ${task.prompt}`,
       { excludeFromRequest: true, persistHistory: false }
     );
+    await rewriteSessionWithCurrentMessages();
+    refreshMainBufferAfterCommand();
+    return true;
+  }
+
+  if (commandName === "/hooks") {
+    loadHooksConfig();
+    const eventNames = [
+      "SessionStart",
+      "UserPromptSubmit",
+      "PreToolUse",
+      "PostToolUse",
+      "PostToolUseFailure",
+      "Stop",
+      "Notification",
+      "PreCompact",
+      "PostCompact",
+      "SessionEnd",
+    ];
+    const lines = [];
+    let total = 0;
+    for (const eventName of eventNames) {
+      const projectHandlers = Array.isArray(hooksProject[eventName]) ? hooksProject[eventName] : [];
+      const userHandlers = Array.isArray(hooksUser[eventName]) ? hooksUser[eventName] : [];
+      const projectCount = projectHandlers.reduce((sum, g) => sum + (Array.isArray(g?.hooks) ? g.hooks.length : 0), 0);
+      const userCount = userHandlers.reduce((sum, g) => sum + (Array.isArray(g?.hooks) ? g.hooks.length : 0), 0);
+      if (projectCount + userCount > 0) {
+        total += projectCount + userCount;
+        const descs = [];
+        for (const [scope, groups] of [["project", projectHandlers], ["user", userHandlers]]) {
+          for (const group of groups) {
+            const matcher = group?.matcher || "";
+            for (const handler of Array.isArray(group?.hooks) ? group.hooks : []) {
+              const type = handler?.type || "command";
+              const target = handler?.command || handler?.url || handler?.prompt || "";
+              descs.push(`${type}${matcher ? ` [${matcher}]` : ""} (${scope}) ${String(target).slice(0, 60)}`);
+            }
+          }
+        }
+        lines.push(`- ${eventName} (${projectCount + userCount})`);
+        for (const desc of descs) {
+          lines.push(`    ${desc}`);
+        }
+      }
+    }
+    if (total === 0) {
+      lines.push("No hooks configured. Add a hooks block to .claude/settings.json or ~/.claude/settings.json.");
+    }
+    appendAssistantMessage(`Configured hooks (${total}):\n${lines.join("\n")}`, {
+      excludeFromRequest: true,
+      persistHistory: false,
+    });
     await rewriteSessionWithCurrentMessages();
     refreshMainBufferAfterCommand();
     return true;
@@ -9825,6 +10420,114 @@ if (process.argv.includes("--self-test-loop")) {
   runLoopSelfTest().then((code) => process.exit(code));
 }
 
+if (process.argv.includes("--self-test-hooks")) {
+  runHooksSelfTest().then((code) => process.exit(code));
+}
+
+// ---------------------------------------------------------------------------
+// Hooks self-test: exercises config loading, matcher matching, and the exit
+// code / JSON semantics of a command hook without a TTY.
+// ---------------------------------------------------------------------------
+async function runHooksSelfTest() {
+  const out = (s) => process.stdout.write(s);
+  try {
+    // Matcher matching: literal, regex, and pipe alternation.
+    if (!hookMatcherMatches("Edit|Write", "Edit")) {
+      out("HOOKS_FAIL: pipe matcher should match Edit\n");
+      return 1;
+    }
+    if (hookMatcherMatches("Edit|Write", "Bash")) {
+      out("HOOKS_FAIL: pipe matcher should not match Bash\n");
+      return 1;
+    }
+    if (!hookMatcherMatches("mcp__.*", "mcp__github__search")) {
+      out("HOOKS_FAIL: regex matcher should match MCP tool name\n");
+      return 1;
+    }
+    if (!hookMatcherMatches("", "anything")) {
+      out("HOOKS_FAIL: empty matcher should match everything\n");
+      return 1;
+    }
+
+    // JSON parsing for hook stdout decisions.
+    const parsed = parseHookJson('{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "use rg"}}');
+    if (!parsed || parsed.hookSpecificOutput.permissionDecision !== "deny") {
+      out("HOOKS_FAIL: parseHookJson should extract decision JSON\n");
+      return 1;
+    }
+    if (parseHookJson("not json") !== null) {
+      out("HOOKS_FAIL: parseHookJson should return null for non-JSON\n");
+      return 1;
+    }
+
+    // Command hook execution: exit 0 passthrough, exit 2 block with stderr.
+    const passthrough = await runCommandHook(
+      process.platform === "win32" ? "node -e 'process.exit(0)'" : "true",
+      "",
+      5000
+    );
+    if (!passthrough.ok || passthrough.code !== 0) {
+      out(`HOOKS_FAIL: exit-0 hook should pass through: ${JSON.stringify(passthrough)}\n`);
+      return 1;
+    }
+
+    const blocker = await runCommandHook(
+      process.platform === "win32"
+        ? "node -e \"console.error('Blocked: no drops'); process.exit(2)\""
+        : "sh -c \"echo 'Blocked: no drops' >&2; exit 2\"",
+      "",
+      5000
+    );
+    if (!blocker.ok || blocker.code !== 2 || !String(blocker.stderr).includes("Blocked")) {
+      out(`HOOKS_FAIL: exit-2 hook should block with stderr: ${JSON.stringify(blocker)}\n`);
+      return 1;
+    }
+
+    // runHooks merges decisions: a JSON deny from stdout should block.
+    const savedProject = hooksProject;
+    const savedUser = hooksUser;
+    const denyScriptPath = path.join(os.tmpdir(), `nexus-hook-deny-${process.pid}.js`);
+    fsSync.writeFileSync(
+      denyScriptPath,
+      "console.log(JSON.stringify({hookSpecificOutput:{permissionDecision:'deny',permissionDecisionReason:'nope'}}))",
+      "utf8"
+    );
+    hooksProject = {
+      PreToolUse: [
+        {
+          matcher: "code_execution",
+          hooks: [
+            {
+              type: "command",
+              command: `"${process.execPath}" "${denyScriptPath}"`,
+            },
+          ],
+        },
+      ],
+    };
+    hooksUser = {};
+    const merged = await runHooks({
+      eventName: "PreToolUse",
+      matcherValue: "code_execution",
+      input: { tool_name: "code_execution" },
+      timeoutMs: 10000,
+    });
+    if (!merged.blocked) {
+      out("HOOKS_FAIL: JSON deny decision should block the tool\n");
+      return 1;
+    }
+    hooksProject = savedProject;
+    hooksUser = savedUser;
+    fsSync.rmSync(denyScriptPath, { force: true });
+
+    out("HOOKS_OK\n");
+    return 0;
+  } catch (error) {
+    out(`HOOKS_FAIL: ${String(error?.message || error)}\n`);
+    return 1;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // MCP end-to-end self-test: launches a tiny in-process stdio MCP server,
 // starts the real bridge, calls it via the bridge handler, and verifies.
@@ -10790,6 +11493,26 @@ process.stdin.on("keypress", async (str, key) => {
 
     cancelIdleFlush();
     burstMode = false;
+    // UserPromptSubmit hook: deterministic pre-prompt hooks (e.g. inject
+    // context, block prompts). exit code 2 blocks the turn.
+    const promptHookRun = await runHooks({
+      eventName: "UserPromptSubmit",
+      input: { prompt: trimmedInput },
+      timeoutMs: 30000,
+    });
+    if (promptHookRun.blocked) {
+      appendAssistantMessage(
+        `Prompt blocked by hook${promptHookRun.blockReason ? `: ${promptHookRun.blockReason}` : "."}`,
+        { excludeFromRequest: true, persistHistory: false }
+      );
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+    if (promptHookRun.additionalContext) {
+      pendingHookContext = promptHookRun.additionalContext;
+    }
+
     // Reminders go through the model via the set_reminder tool, which the
     // agent calls when the user asks to be reminded ("remind me in 5 min").
     const modelAtSubmit = selectedModel;
@@ -10870,6 +11593,13 @@ async function initializeApp() {
   ensureSystemMessageAtTop();
   resetLlmClient();
   sessionPersistenceInitialized = false;
+  // Lifecycle hooks: load config at boot, then fire SessionStart.
+  loadHooksConfig();
+  runHooks({
+    eventName: "SessionStart",
+    matcherValue: "startup",
+    input: { source: "startup" },
+  }).catch(() => {});
   renderFrame(true);
 }
 
