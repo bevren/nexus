@@ -2209,6 +2209,67 @@ def set_reminder(when: str, prompt: str) -> dict:
         return {"ok": False, "error": f"set_reminder: bridge request failed: {exc}"}
 
 
+def _bridge_request(method: str, payload: dict) -> dict:
+    """POST a raw request to the TUI bridge and return the parsed JSON."""
+    import urllib.request
+
+    info = _read_mcp_bridge_info()
+    if not info:
+        return {
+            "ok": False,
+            "error": "bridge not available. Is the TUI running?",
+        }
+    url = f"http://127.0.0.1:{info['port']}/"
+    body = json.dumps({"method": method, **payload}).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        return {"ok": False, "error": f"bridge request failed: {exc}"}
+
+
+def kernel_exec(code: str) -> dict:
+    """Execute Python in the session's persistent kernel (state persists).
+
+    code: a Python program. Variables/functions defined here are available in
+    later kernel_exec calls in the same session, so multi-step computation can
+    build state incrementally instead of recomputing from scratch.
+
+    Returns: {ok, output, error, traceback} where output is everything printed
+    to stdout during the call. Use print() to surface results.
+    """
+    if not isinstance(code, str) or not code.strip():
+        return {"ok": False, "error": "kernel_exec: 'code' must be a non-empty string"}
+    resp = _bridge_request("kernel", {"action": "exec", "code": code})
+    if not resp.get("ok"):
+        error = resp.get("error") or "kernel_exec failed"
+        if isinstance(resp.get("result"), dict):
+            result = resp["result"]
+            return {
+                "ok": False,
+                "output": result.get("output", ""),
+                "error": result.get("error", error),
+                "traceback": result.get("traceback", ""),
+            }
+        return {"ok": False, "error": error}
+    result = resp.get("result") or {}
+    return {
+        "ok": True,
+        "output": result.get("output", ""),
+        "error": result.get("error", ""),
+        "traceback": result.get("traceback", ""),
+    }
+
+
+def kernel_reset() -> dict:
+    """Kill the persistent kernel so the next kernel_exec starts with a clean scope."""
+    resp = _bridge_request("kernel", {"action": "reset"})
+    return {"ok": bool(resp.get("ok")), "error": resp.get("error", "")}
+
+
 def _read_mcp_bridge_info() -> dict:
     bridge_file = NEXUS_DIR / "mcp_bridge.json"
     try:
@@ -2319,6 +2380,8 @@ FUNCTIONS = {
     "mcp_list": mcp_list,
     "mcp_call": mcp_call,
     "set_reminder": set_reminder,
+    "kernel_exec": kernel_exec,
+    "kernel_reset": kernel_reset,
 }
 
 FUNCTION_DESCRIPTIONS = {
@@ -2361,6 +2424,8 @@ FUNCTION_DESCRIPTIONS = {
     "mcp_list": "mcp_list() -> dict: List all configured MCP servers and the tool names each exposes. Returns {ok: bool, servers?: {name: {status, error?, tools: [name]}}, error?: str}.",
     "mcp_call": "mcp_call(server: str, tool: str, args: dict | None = None) -> dict: Call a tool exposed by an MCP server (configured in ~/.nexus/mcp_config.json). Returns the server's result as {ok: bool, result?: object, text?: str, error?: str}.",
     "set_reminder": "set_reminder(when: str, prompt: str) -> dict: Schedule a one-shot session reminder via the TUI bridge. when is a human phrase like 'in 5 minutes', 'in 2 hours', 'at 3pm', 'tomorrow 9am'. prompt is the exact action/message to run when it fires. Fires once as a normal user turn. Use whenever the user asks to be reminded or to remember something later.",
+    "kernel_exec": "kernel_exec(code: str) -> dict: Execute Python in the session's persistent kernel. State persists across calls (variables/functions defined here are usable in later kernel_exec calls). Returns {ok, output, error, traceback}; print() surfaces results. Use for iterative/stateful computation where recomputing from scratch would be wasteful.",
+    "kernel_reset": "kernel_reset() -> dict: Kill the persistent kernel so the next kernel_exec starts with a clean scope. Returns {ok, error}.",
 }
 
 

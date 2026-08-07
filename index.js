@@ -160,6 +160,7 @@ const COMMANDS = [
   { name: "/loop", description: "run a prompt on an interval: /loop [interval] [prompt]" },
   { name: "/loops", description: "list or cancel scheduled loops: /loops | /loops cancel <id>" },
   { name: "/hooks", description: "show configured lifecycle hooks (read-only)" },
+  { name: "/solve", description: "run an autonomous solve loop against the persistent kernel: /solve <task>" },
 ];
 const FALLBACK_TOOL_DESCRIPTIONS = {
   insert_memory:
@@ -218,6 +219,10 @@ const FALLBACK_TOOL_DESCRIPTIONS = {
   read_file_summary: "async read_file_summary(path: str) -> dict: Return summary/preview for large files.",
   set_reminder:
     "set_reminder(when: str, prompt: str) -> dict: Schedule a one-shot session reminder. when is a human phrase like 'in 5 minutes', 'in 2 hours', 'at 3pm', 'tomorrow 9am'. prompt is the exact action/message to run when it fires. Fires once as a normal user turn. Use whenever the user asks to be reminded or to remember something later.",
+  kernel_exec:
+    "kernel_exec(code: str) -> dict: Execute Python in the session's persistent kernel. State persists across calls (variables/functions defined here are usable in later kernel_exec calls). Returns {ok, output, error, traceback}; print() surfaces results. Use for iterative/stateful computation where recomputing from scratch would be wasteful.",
+  kernel_reset:
+    "kernel_reset() -> dict: Kill the persistent kernel so the next kernel_exec starts with a clean scope. Returns {ok, error}.",
 };
 
 let input = "";
@@ -917,6 +922,18 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "- when accepts human phrases: 'in 5 minutes', 'in 2 hours', 'at 3pm', 'tomorrow 9am', or a recurring cadence like 'every 5 seconds', 'every 10 minutes'. Do not invent a timestamp; pass the user's phrase.",
     "- After the tool returns, confirm briefly with the scheduled time.",
     "",
+    "KERNEL (persistent Python REPL):",
+    "- kernel_exec runs Python in a long-lived session kernel; variable and function definitions persist across kernel_exec calls, so multi-step computation can build state incrementally.",
+    "- Use print() to surface results; stdout is returned in {output}.",
+    "- Prefer kernel_exec over write_file/run_shell tricks when the task is iterative computation (define once, reuse many times).",
+    "- kernel_reset() clears the kernel scope when stale state causes confusion.",
+    "",
+    "SOLVE LOOP (/solve):",
+    "- /solve <task description> starts an autonomous loop: you write a Python program that attacks the task, the kernel runs it, and the result feeds back.",
+    "- The goal is a program whose stdout ends with the line SOLVE_OK when it has verified its own solution. Failures return stderr/stdout to inspect.",
+    "- Iterate until the program proves itself with SOLVE_OK or the iteration budget is exhausted, then summarize.",
+    "",
+    "",
     "MCP TOOLS (Model Context Protocol servers, optional):",
     "- MCP servers are separate processes exposing extra capabilities as tools.",
     "- Call them from within an execute block using: mcp_call(server, tool, args) -> dict",
@@ -1381,6 +1398,31 @@ async function handleMcpBridgeRequest(parsed) {
     };
   }
 
+  // Internal "kernel" method: persistent Python REPL bridge used by the
+  // kernel_exec/kernel_reset tools and the /solve loop.
+  if (parsed.method === "kernel") {
+    const action = typeof parsed.action === "string" ? parsed.action : "";
+    if (action === "exec") {
+      const code = typeof parsed.code === "string" ? parsed.code : "";
+      if (!code.trim()) {
+        return { ok: false, error: "kernel exec requires a 'code' string" };
+      }
+      const result = await kernelExec(code);
+      return {
+        ok: Boolean(result?.ok),
+        result,
+        text: result?.ok
+          ? String(result?.output || "")
+          : String(result?.error || "kernel exec failed"),
+      };
+    }
+    if (action === "reset") {
+      await kernelReset();
+      return { ok: true, result: {}, text: "kernel reset" };
+    }
+    return { ok: false, error: `unknown kernel action "${action}" (expected exec or reset)` };
+  }
+
   const serverName = typeof parsed.server === "string" ? parsed.server : "";
   const toolName = typeof parsed.tool === "string" ? parsed.tool : "";
   const argumentsObj = parsed.arguments && typeof parsed.arguments === "object" ? parsed.arguments : {};
@@ -1723,6 +1765,7 @@ function cleanupTerminal(options = {}) {
     answerRevealTimer = null;
   }
   stopLoopScheduler();
+  stopKernelProcess();
   if (mcpBridgeServer) {
     try {
       mcpBridgeServer.close();
@@ -2292,6 +2335,12 @@ const LOOP_MAINTENANCE_PROMPT =
 let loopTasks = [];
 let loopSchedulerTimer = null;
 let loopFiring = false;
+let solveActive = false;
+let solveAbortRequested = false;
+let solveIteration = 0;
+let solveLastStatus = "";
+const SOLVE_MAX_ITERATIONS = 8;
+const SOLVE_OK_SENTINEL = "SOLVE_OK";
 
 function normalizeLoopTask(entry) {
   if (!entry || typeof entry !== "object") {
@@ -3172,6 +3221,169 @@ async function runHooks(options) {
     }
   }
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// Persistent Python kernel (kernel.py) + /solve autonomous loop
+// - One long-lived Python process per session with a persistent scope:
+//   kernel_exec defines state, later calls use it (REPL continuity).
+// - Communicates over newline-delimited JSON on stdin/stdout.
+// - /solve runs an autonomous loop: model writes a program, the kernel runs
+//   it, failures feed back until the program prints SOLVE_OK or the budget
+//   is exhausted.
+// ---------------------------------------------------------------------------
+let kernelChild = null;
+let kernelPending = new Map();
+let kernelSeq = 0;
+let kernelBuffer = "";
+
+function getKernelScriptPath() {
+  const candidates = [
+    path.join(__dirname, "kernel.py"),
+    path.join(process.cwd(), "kernel.py"),
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (fsSync.existsSync(candidate)) {
+        return candidate;
+      }
+    } catch {
+      // continue
+    }
+  }
+  return path.join(process.cwd(), "kernel.py");
+}
+
+function getKernelPythonCommand() {
+  // Prefer python, then py -3 (Windows launcher). Matches runPythonCommand.
+  try {
+    const probe = spawnSync("python", ["--version"], { timeout: 5000, windowsHide: true });
+    if (probe && probe.status === 0 && String(probe.stdout || "").includes("Python")) {
+      return { command: "python", args: [] };
+    }
+  } catch {
+    // fall through
+  }
+  return { command: "py", args: ["-3"] };
+}
+
+function stopKernelProcess() {
+  if (kernelChild) {
+    try {
+      kernelChild.kill();
+    } catch {
+      // ignore
+    }
+    kernelChild = null;
+    kernelBuffer = "";
+  }
+  for (const [, resolver] of kernelPending) {
+    resolver({ ok: false, error: "kernel stopped" });
+  }
+  kernelPending.clear();
+}
+
+function startKernelProcess() {
+  if (kernelChild) {
+    return true;
+  }
+  const { spawn: kernelSpawn } = require("node:child_process");
+  const py = getKernelPythonCommand();
+  const scriptPath = getKernelScriptPath();
+  kernelBuffer = "";
+  try {
+    kernelChild = kernelSpawn(py.command, [...py.args, scriptPath], {
+      cwd: process.cwd(),
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+  } catch (error) {
+    kernelChild = null;
+    return false;
+  }
+  if (!kernelChild || !kernelChild.stdin || !kernelChild.stdout) {
+    kernelChild = null;
+    return false;
+  }
+  let stderrTail = "";
+  if (kernelChild.stderr) {
+    kernelChild.stderr.on("data", (d) => {
+      stderrTail = String(d).slice(-2000);
+    });
+  }
+  kernelChild.stdout.on("data", (chunk) => {
+    kernelBuffer += String(chunk);
+    let nl = kernelBuffer.indexOf("\n");
+    while (nl >= 0) {
+      const line = kernelBuffer.slice(0, nl).trim();
+      kernelBuffer = kernelBuffer.slice(nl + 1);
+      if (line) {
+        try {
+          const parsed = JSON.parse(line);
+          const rid = parsed && parsed.id;
+          const resolver = kernelPending.get(rid);
+          if (resolver) {
+            kernelPending.delete(rid);
+            resolver(parsed);
+          }
+        } catch {
+          // ignore malformed line
+        }
+      }
+      nl = kernelBuffer.indexOf("\n");
+    }
+  });
+  kernelChild.on("error", () => {
+    kernelChild = null;
+    for (const [, resolver] of kernelPending) {
+      resolver({ ok: false, error: "kernel process error" });
+    }
+    kernelPending.clear();
+  });
+  kernelChild.on("exit", (code) => {
+    const exited = kernelChild;
+    kernelChild = null;
+    if (exited) {
+      for (const [, resolver] of kernelPending) {
+        resolver({ ok: false, error: `kernel exited with code ${code}` });
+      }
+      kernelPending.clear();
+    }
+  });
+  return true;
+}
+
+function kernelExec(code, timeoutMs = 120000) {
+  const id = `k${++kernelSeq}`;
+  const source = String(code ?? "");
+  return new Promise((resolve) => {
+    if (!startKernelProcess()) {
+      resolve({ ok: false, id, output: "", error: "could not start kernel process", traceback: "" });
+      return;
+    }
+    const timer = setTimeout(() => {
+      if (kernelPending.has(id)) {
+        kernelPending.delete(id);
+        resolve({ ok: false, id, output: "", error: `kernel_exec timed out after ${Math.round((Number(timeoutMs) || 120000) / 1000)}s`, traceback: "" });
+      }
+    }, Math.max(1000, Number(timeoutMs) || 120000));
+    kernelPending.set(id, (result) => {
+      clearTimeout(timer);
+      resolve(result);
+    });
+    try {
+      kernelChild.stdin.write(JSON.stringify({ id, code: source }) + "\n");
+    } catch (error) {
+      clearTimeout(timer);
+      kernelPending.delete(id);
+      resolve({ ok: false, id, output: "", error: `kernel write failed: ${error?.message || error}`, traceback: "" });
+    }
+  });
+}
+
+async function kernelReset() {
+  stopKernelProcess();
+  return { ok: true };
 }
 
 async function runCompaction(customInstruction = "") {
@@ -4804,6 +5016,179 @@ function queueAssistantReply(modelId) {
     });
 }
 
+function getSolveStatusText() {
+  if (!solveActive) {
+    return "";
+  }
+  return `Solving (iteration ${solveIteration}/${SOLVE_MAX_ITERATIONS}): ${solveLastStatus || "working..."}`;
+}
+
+function extractRawCodeFromReply(text) {
+  const source = String(text ?? "");
+  const blocks = extractAllPythonCodeBlocks(source);
+  if (blocks.length > 0) {
+    return blocks.join("\n\n");
+  }
+  return source.trim();
+}
+
+async function runSolveLoop(taskText) {
+  const resolvedModel = selectedModel;
+  if (!resolvedModel) {
+    return false;
+  }
+  const client = getOpenRouterClient();
+  if (!client) {
+    appendAssistantMessage("Solve loop failed: LLM provider is not configured.", {
+      excludeFromRequest: true,
+      persistHistory: false,
+    });
+    return false;
+  }
+
+  const solveSystem = [
+    "You are solving a task by writing a Python program.",
+    `TASK: ${taskText}`,
+    "",
+    "RULES:",
+    "- Write a complete Python program as one code block. It will be executed in a persistent kernel (state carries between iterations).",
+    "- The program must verify its own solution where possible.",
+    `- When the program has validated the solution, print exactly the line: ${SOLVE_OK_SENTINEL}`,
+    "- Keep programs focused; use the kernel’s persistent state to avoid recomputing.",
+    "- After each iteration you will receive the program's stdout/stderr. Fix failures and iterate.",
+  ].join("\n");
+
+  solveIteration = 0;
+  solveLastStatus = "asking for program";
+  const requestWithTimeout = async (messagesForRequest, options = {}) => {
+    const payload = { model: resolvedModel, messages: messagesForRequest };
+    if (getReasoningEnabledForModel(resolvedModel)) {
+      payload.reasoning = { enabled: true };
+    }
+    const requestPromise = client.chat.completions.create(payload);
+    let timeoutId = null;
+    const timeoutSeconds = Number(options?.timeoutSeconds) || 120;
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutId = setTimeout(
+        () => reject(new Error(`Request timed out after ${timeoutSeconds}s`)),
+        timeoutSeconds * 1000
+      );
+    });
+    try {
+      return await Promise.race([requestPromise, timeoutPromise]);
+    } finally {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+    }
+  };
+
+  const firstRequest = await requestWithTimeout(
+    [
+      { role: "system", content: solveSystem },
+      { role: "user", content: "Write the first version of the program now. Only output the code block." },
+    ],
+    {}
+  );
+  let lastReply = extractAssistantText(firstRequest?.choices?.[0]?.message?.content);
+  if (!lastReply.trim()) {
+    const payload = extractAssistantPayloadFromCompletion(firstRequest, {
+      allowReasoningTextFallback: true,
+    });
+    lastReply = payload.text;
+  }
+
+  for (let iter = 1; iter <= SOLVE_MAX_ITERATIONS; iter += 1) {
+    if (solveAbortRequested || stopRequested) {
+      return false;
+    }
+    solveIteration = iter;
+    solveLastStatus = `running program (iter ${iter})`;
+    markDirty();
+    renderFrame(true);
+
+    const code = extractRawCodeFromReply(lastReply);
+    if (!code.trim()) {
+      solveLastStatus = "no code in reply";
+      const repair = await requestWithTimeout(
+        [
+          { role: "system", content: solveSystem },
+          { role: "user", content: "Your previous reply contained no Python code. Output only the program code block." },
+        ],
+        {}
+      );
+      lastReply = extractAssistantText(repair?.choices?.[0]?.message?.content) || "";
+      iter -= 1;
+      continue;
+    }
+
+    appendAssistantMessage(`Solve iteration ${iter}: ${code.slice(0, 400)}${code.length > 400 ? "…" : ""}`, {
+      excludeFromRequest: true,
+      persistHistory: false,
+    });
+    markDirty();
+    renderFrame(true);
+
+    const kernelResult = await kernelExec(code);
+    const stdoutText = String(kernelResult?.output || "");
+    const stderrText = String(kernelResult?.error || "");
+    const gotSolvedMarker = stdoutText.includes(SOLVE_OK_SENTINEL);
+
+    appendAssistantMessage(
+      `Kernel output (iteration ${iter}):
+${(stdoutText || "(no stdout)").slice(0, 4000)}${stderrText ? `
+[error] ${stderrText.slice(0, 2000)}` : ""}`,
+      { excludeFromRequest: true, persistHistory: false }
+    );
+    markDirty();
+    renderFrame(true);
+
+    if (gotSolvedMarker) {
+      solveLastStatus = `SOLVE_OK on iteration ${iter}`;
+      return true;
+    }
+    if (kernelResult?.ok === false && String(kernelResult?.error || "").includes("timed out")) {
+      solveLastStatus = "kernel timeout";
+    } else {
+      solveLastStatus = stderrText ? "program error" : "program ran (no SOLVE_OK)";
+    }
+
+    if (iter >= SOLVE_MAX_ITERATIONS) {
+      break;
+    }
+
+    const feedback = [
+      "The program did not print SOLVE_OK.",
+      "",
+      stdoutText ? `STDOUT:
+${stdoutText.slice(0, 4000)}` : "STDOUT: (empty)",
+      stderrText ? `STDERR:
+${stderrText.slice(0, 3000)}` : "STDERR: (none)",
+      "",
+      "Write the next version of the program. Fix the failures. Only output the code block.",
+    ].join("\n");
+    solveLastStatus = `waiting for revision (iter ${iter})`;
+    markDirty();
+    renderFrame(true);
+    const iterationRequest = await requestWithTimeout(
+      [
+        { role: "system", content: solveSystem },
+        { role: "user", content: feedback },
+      ],
+      {}
+    );
+    let nextReply = extractAssistantText(iterationRequest?.choices?.[0]?.message?.content);
+    if (!nextReply.trim()) {
+      const payload = extractAssistantPayloadFromCompletion(iterationRequest, {
+        allowReasoningTextFallback: true,
+      });
+      nextReply = payload.text;
+    }
+    lastReply = nextReply || "";
+  }
+  return Boolean(solveLastStatus && solveLastStatus.includes("SOLVE_OK"));
+}
+
 function shouldBlockPastedInput(text) {
   if (typeof text !== "string" || text.length === 0) {
     return false;
@@ -5697,6 +6082,7 @@ async function startNewChat() {
   sessionPersistenceInitialized = false;
   loopTasks = [];
   stopLoopScheduler();
+  stopKernelProcess();
   resetMessagesToSystemPrompt();
   resetComposerState();
   await rewriteSessionWithCurrentMessages();
@@ -5710,6 +6096,7 @@ async function clearCurrentChat() {
   sessionPersistenceInitialized = false;
   loopTasks = [];
   stopLoopScheduler();
+  stopKernelProcess();
   resetMessagesToSystemPrompt();
   resetComposerState();
   await fs.unlink(sessionFilePath).catch(() => {});
@@ -6234,6 +6621,52 @@ async function runSlashCommand(commandName, commandArgs = "") {
       { excludeFromRequest: true, persistHistory: false }
     );
     await rewriteSessionWithCurrentMessages();
+    refreshMainBufferAfterCommand();
+    return true;
+  }
+
+  if (commandName === "/solve") {
+    const taskText = String(commandArgs ?? "").trim();
+    if (!taskText) {
+      appendTuiErrorMessage("/solve", "invalid usage. Use '/solve <task description>'");
+      return true;
+    }
+    if (solveActive) {
+      appendTuiErrorMessage("/solve", "failed because another /solve loop is already running");
+      return true;
+    }
+    solveActive = true;
+    solveAbortRequested = false;
+    solveIteration = 0;
+    solveLastStatus = "starting";
+    appendAssistantMessage(`Solve loop started. Task: ${taskText}`, {
+      excludeFromRequest: true,
+      persistHistory: false,
+    });
+    markDirty();
+    renderFrame(true);
+
+    const solved = await runSolveLoop(taskText);
+
+    solveActive = false;
+    solveLastStatus = "";
+    if (solved) {
+      appendAssistantMessage("SOLVE_OK reached — the program verified its own solution.", {
+        excludeFromRequest: true,
+        persistHistory: false,
+      });
+    } else if (solveAbortRequested) {
+      appendAssistantMessage("Solve loop aborted (Esc).", {
+        excludeFromRequest: true,
+        persistHistory: false,
+      });
+    } else {
+      appendAssistantMessage(
+        `Solve loop exhausted its ${SOLVE_MAX_ITERATIONS}-iteration budget without SOLVE_OK. Last status: ${solveLastStatus || "none"}`,
+        { excludeFromRequest: true, persistHistory: false }
+      );
+    }
+    await rewriteSessionWithCurrentMessages().catch(() => {});
     refreshMainBufferAfterCommand();
     return true;
   }
@@ -7544,6 +7977,15 @@ function getStatusBarText() {
     const frame = SPINNER_FRAMES[spinnerFrameIndex % SPINNER_FRAMES.length];
     const text = "Starting MCP Servers...";
     return `${frame} ${applyShineEffect(text, shineFrameIndex, 8)}`;
+  }
+
+  // Solve loop status takes priority when a /solve is running, even between
+  // LLM calls (so the user can see iteration progress + know Esc aborts).
+  if (solveActive) {
+    const solveText = getSolveStatusText();
+    if (solveText) {
+      return `${SPINNER_FRAMES[spinnerFrameIndex % SPINNER_FRAMES.length]} ${solveText}`;
+    }
   }
 
   if (!isAssistantThinking()) {
@@ -10430,6 +10872,10 @@ if (process.argv.includes("--self-test-hooks")) {
   runHooksSelfTest().then((code) => process.exit(code));
 }
 
+if (process.argv.includes("--self-test-kernel")) {
+  runKernelSelfTest().then((code) => process.exit(code));
+}
+
 // ---------------------------------------------------------------------------
 // Hooks self-test: exercises config loading, matcher matching, and the exit
 // code / JSON semantics of a command hook without a TTY.
@@ -10531,6 +10977,66 @@ async function runHooksSelfTest() {
   } catch (error) {
     out(`HOOKS_FAIL: ${String(error?.message || error)}\n`);
     return 1;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel self-test: drives the persistent Python kernel headlessly to verify
+// REPL continuity (state persists), error capture, and SOLVE_OK detection.
+// ---------------------------------------------------------------------------
+async function runKernelSelfTest() {
+  const out = (s) => process.stdout.write(s);
+  try {
+    await kernelReset();
+
+    // Persistent state: define in one call, use in a later call.
+    const first = await kernelExec("x = 40\ny = 2");
+    if (!first.ok) {
+      out(`KERNEL_FAIL: first exec failed: ${JSON.stringify(first)}\n`);
+      return 1;
+    }
+    const second = await kernelExec("print(x * y)");
+    if (!second.ok || !String(second.output).includes("80")) {
+      out(`KERNEL_FAIL: state did not persist (expected 80): ${JSON.stringify(second)}\n`);
+      return 1;
+    }
+
+    // Error capture: exceptions are reported without killing the process.
+    const err = await kernelExec("raise ValueError('boom')");
+    if (err.ok || !String(err.error).includes("boom")) {
+      out(`KERNEL_FAIL: error capture broken: ${JSON.stringify(err)}\n`);
+      return 1;
+    }
+
+    // Process survived the exception; state still intact.
+    const afterErr = await kernelExec("print(x)");
+    if (!afterErr.ok || !String(afterErr.output).includes("40")) {
+      out(`KERNEL_FAIL: kernel died after exception: ${JSON.stringify(afterErr)}\n`);
+      return 1;
+    }
+
+    // SOLVE_OK sentinel detection works through output.
+    const solved = await kernelExec("print('done'); print('SOLVE_OK')");
+    if (solved.ok !== true || !String(solved.output).includes("SOLVE_OK")) {
+      out(`KERNEL_FAIL: SOLVE_OK passthrough broken: ${JSON.stringify(solved)}\n`);
+      return 1;
+    }
+
+    // Reset clears the scope.
+    await kernelReset();
+    const afterReset = await kernelExec("y"); // should now fail (undefined)
+    if (afterReset.ok) {
+      out(`KERNEL_FAIL: reset did not clear scope: ${JSON.stringify(afterReset)}\n`);
+      return 1;
+    }
+
+    out("KERNEL_OK\n");
+    return 0;
+  } catch (error) {
+    out(`KERNEL_FAIL: ${String(error?.message || error)}\n`);
+    return 1;
+  } finally {
+    await kernelReset();
   }
 }
 
