@@ -161,6 +161,7 @@ const COMMANDS = [
   { name: "/loops", description: "list or cancel scheduled loops: /loops | /loops cancel <id>" },
   { name: "/hooks", description: "show configured lifecycle hooks (read-only)" },
   { name: "/solve", description: "run an autonomous solve loop against the persistent kernel: /solve <task>" },
+  { name: "/kernels", description: "browse sessions created by /solve: /kernels" },
 ];
 const FALLBACK_TOOL_DESCRIPTIONS = {
   insert_memory:
@@ -2341,6 +2342,13 @@ let solveIteration = 0;
 let solveLastStatus = "";
 const SOLVE_MAX_ITERATIONS = 8;
 const SOLVE_OK_SENTINEL = "SOLVE_OK";
+const KERNELS_DIR = path.join(NEXUS_DIR, "kernels");
+let solveSessions = [];
+let activeSolveSessionId = null;
+let viewingSolveSessionId = null;
+let kernelsSelected = 0;
+let kernelsScroll = 0;
+let solveScrollOffset = 0;
 
 function normalizeLoopTask(entry) {
   if (!entry || typeof entry !== "object") {
@@ -5016,6 +5024,331 @@ function queueAssistantReply(modelId) {
     });
 }
 
+function getSolveSessionFilePath(id) {
+  return path.join(KERNELS_DIR, `kernel-${id}.json`);
+}
+
+function saveSolveSession(session) {
+  if (!session || !session.id) {
+    return;
+  }
+  try {
+    fsSync.mkdirSync(KERNELS_DIR, { recursive: true });
+    fsSync.writeFileSync(getSolveSessionFilePath(session.id), JSON.stringify(session, null, 2), "utf8");
+  } catch {
+    // non-fatal: session is still live in memory
+  }
+}
+
+function loadKernelSessions() {
+  try {
+    if (!fsSync.existsSync(KERNELS_DIR)) {
+      solveSessions = [];
+      return;
+    }
+    const files = fsSync.readdirSync(KERNELS_DIR).filter((f) => f.endsWith(".json"));
+    const sessions = [];
+    for (const file of files) {
+      try {
+        const parsed = JSON.parse(fsSync.readFileSync(path.join(KERNELS_DIR, file), "utf8"));
+        if (parsed && typeof parsed.id === "string" && Array.isArray(parsed.entries)) {
+          sessions.push(parsed);
+        }
+      } catch {
+        // skip broken files
+      }
+    }
+    sessions.sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0));
+    solveSessions = sessions;
+  } catch {
+    solveSessions = [];
+  }
+}
+
+function getActiveSolveSession() {
+  if (activeSolveSessionId) {
+    const found = solveSessions.find((s) => s.id === activeSolveSessionId);
+    if (found) {
+      return found;
+    }
+  }
+  return solveSessions[0] || null;
+}
+
+function solveSessionAppend(session, role, content) {
+  if (!session) {
+    return;
+  }
+  session.entries.push({ role, content: String(content ?? ""), ts: Date.now() });
+  session.updatedAt = Date.now();
+  session.iterations = solveIteration;
+  saveSolveSession(session);
+  solveScrollOffset = 0;
+  markDirty();
+  renderFrame(false);
+}
+
+function deleteSolveSession(id) {
+  try {
+    fsSync.rmSync(getSolveSessionFilePath(id), { force: true });
+  } catch {
+    // ignore
+  }
+  solveSessions = solveSessions.filter((s) => s.id !== id);
+  if (activeSolveSessionId === id) {
+    activeSolveSessionId = null;
+  }
+  if (viewingSolveSessionId === id) {
+    viewingSolveSessionId = null;
+  }
+}
+
+function updateKernelsSelectionState() {
+  if (solveSessions.length === 0) {
+    kernelsSelected = 0;
+    kernelsScroll = 0;
+    return;
+  }
+  if (kernelsSelected >= solveSessions.length) {
+    kernelsSelected = solveSessions.length - 1;
+  }
+  if (kernelsSelected < kernelsScroll) {
+    kernelsScroll = kernelsSelected;
+  }
+  const visibleCount = Math.max(1, Math.min(20, (process.stdout.rows || 24) - 4));
+  if (kernelsScroll > Math.max(0, solveSessions.length - visibleCount)) {
+    kernelsScroll = Math.max(0, solveSessions.length - visibleCount);
+  }
+}
+
+function openSolveBuffer(sessionId) {
+  commandBufferQuery = "";
+  input = "";
+  inputCursorIndex = 0;
+  activeBuffer = "solve";
+  enterAltScreenIfNeeded();
+  isBracketedPasteActive = false;
+  bracketedPasteBuffer = "";
+  pasteParserBuffer = "";
+  activeSolveSessionId = sessionId || activeSolveSessionId || (solveSessions[0] && solveSessions[0].id) || null;
+  viewingSolveSessionId = activeSolveSessionId;
+  solveScrollOffset = 0;
+  forceFullClearOnNextRender = true;
+  cancelIdleFlush();
+  burstMode = false;
+  markDirty();
+  renderFrame(true);
+}
+
+function closeSolveBuffer() {
+  exitAltScreenIfNeeded();
+  activeBuffer = "main";
+  forceFullClearOnNextRender = true;
+  cancelIdleFlush();
+  burstMode = false;
+  markDirty();
+  renderFrame(true);
+}
+
+function openKernelsBuffer() {
+  loadKernelSessions();
+  commandBufferQuery = "";
+  input = "";
+  inputCursorIndex = 0;
+  activeBuffer = "kernels";
+  enterAltScreenIfNeeded();
+  isBracketedPasteActive = false;
+  bracketedPasteBuffer = "";
+  pasteParserBuffer = "";
+  kernelsSelected = 0;
+  kernelsScroll = 0;
+  forceFullClearOnNextRender = true;
+  cancelIdleFlush();
+  burstMode = false;
+  markDirty();
+  renderFrame(true);
+}
+
+function closeKernelsBuffer() {
+  exitAltScreenIfNeeded();
+  activeBuffer = "main";
+  forceFullClearOnNextRender = true;
+  cancelIdleFlush();
+  burstMode = false;
+  markDirty();
+  renderFrame(true);
+}
+
+function renderKernelsBuffer() {
+  process.stdout.write(HIDE_CURSOR);
+  const rows = process.stdout.rows || 24;
+  const cols = process.stdout.columns || 80;
+  const panelWidth = Math.min(Math.max(60, Math.floor(cols * 0.85)), cols);
+  const panelLeft = Math.max(0, Math.floor((cols - panelWidth) / 2));
+  const visibleCount = Math.max(1, Math.min(20, rows - 4));
+  updateKernelsSelectionState();
+
+  if (!hasInitializedScreen) {
+    readline.cursorTo(process.stdout, 0, 0);
+    readline.clearScreenDown(process.stdout);
+    hasInitializedScreen = true;
+  }
+  if (forceFullClearOnNextRender) {
+    readline.cursorTo(process.stdout, 0, 0);
+    readline.clearScreenDown(process.stdout);
+    forceFullClearOnNextRender = false;
+  }
+
+  const frameRows = Array.from({ length: rows }, () => ({ text: " ".repeat(cols), color: null }));
+  const setRow = (y, content, color = null) => {
+    if (y < 0 || y >= rows) {
+      return;
+    }
+    const clipped = content.slice(0, panelWidth).padEnd(panelWidth, " ");
+    const left = " ".repeat(panelLeft);
+    const right = " ".repeat(Math.max(0, cols - panelLeft - panelWidth));
+    frameRows[y] = { text: left + clipped + right, color };
+  };
+
+  setRow(0, `Kernel sessions (${solveSessions.length})`);
+
+  if (solveSessions.length === 0) {
+    setRow(2, "no solve sessions yet - run /solve <task>", PLACEHOLDER_COLOR);
+  } else {
+    const end = Math.min(solveSessions.length, kernelsScroll + visibleCount);
+    for (let i = kernelsScroll; i < end; i += 1) {
+      const row = 2 + (i - kernelsScroll);
+      const session = solveSessions[i];
+      const marker = i === kernelsSelected ? "●" : "○";
+      const idShort = String(session.id || "").slice(0, 8);
+      const taskPreview = String(session.task || "").slice(0, 30);
+      const status = session.solved ? "solved" : session.entries.length > 1 ? "attempted" : "new";
+      const when = new Date(Number(session.updatedAt) || 0);
+      const whenText = Number.isNaN(when.getTime())
+        ? ""
+        : ` ${when.toLocaleString(undefined, { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}`;
+      const text = `  ${marker} ${idShort}  [${status}] ${taskPreview}${whenText}`;
+      if (i === kernelsSelected) {
+        setRow(row, text, BLUE_COLOR);
+      } else if (session.solved) {
+        setRow(row, text, GREEN_COLOR);
+      } else {
+        setRow(row, text);
+      }
+    }
+  }
+  setRow(rows - 1, "Enter: view  Del: delete  Esc: return", PLACEHOLDER_COLOR);
+
+  for (let y = 0; y < rows; y += 1) {
+    const nextRow = frameRows[y];
+    if (nextRow.color === BLUE_COLOR) {
+      writeColoredLine(y, nextRow.text, cols, BLUE_COLOR);
+    } else if (nextRow.color === GREEN_COLOR) {
+      writeColoredLine(y, nextRow.text, cols, GREEN_COLOR);
+    } else if (nextRow.color === PLACEHOLDER_COLOR) {
+      writeColoredLine(y, nextRow.text, cols, PLACEHOLDER_COLOR);
+    } else {
+      writeLine(y, nextRow.text, cols);
+    }
+  }
+  dirty = false;
+}
+
+function renderSolveBuffer() {
+  process.stdout.write(HIDE_CURSOR);
+  const rows = process.stdout.rows || 24;
+  const cols = process.stdout.columns || 80;
+  const session = getActiveSolveSession();
+  const panelWidth = Math.min(Math.max(60, Math.floor(cols * 0.85)), cols);
+  const panelLeft = Math.max(0, Math.floor((cols - panelWidth) / 2));
+
+  if (!hasInitializedScreen) {
+    readline.cursorTo(process.stdout, 0, 0);
+    readline.clearScreenDown(process.stdout);
+    hasInitializedScreen = true;
+  }
+  if (forceFullClearOnNextRender) {
+    readline.cursorTo(process.stdout, 0, 0);
+    readline.clearScreenDown(process.stdout);
+    forceFullClearOnNextRender = false;
+  }
+
+  const frameRows = Array.from({ length: rows }, () => ({ text: " ".repeat(cols), color: null }));
+  const setRow = (y, content, color = null) => {
+    if (y < 0 || y >= rows) {
+      return;
+    }
+    const clipped = content.slice(0, panelWidth).padEnd(panelWidth, " ");
+    const left = " ".repeat(panelLeft);
+    const right = " ".repeat(Math.max(0, cols - panelLeft - panelWidth));
+    frameRows[y] = { text: left + clipped + right, color };
+  };
+
+  const idShort = session ? String(session.id || "").slice(0, 8) : "";
+  const taskPreview = session ? String(session.task || "").slice(0, 40) : "no session";
+  setRow(0, `Solve ${idShort} - ${taskPreview}`);
+
+  let row = 1;
+  if (solveActive) {
+    setRow(
+      row,
+      `Status: ${solveLastStatus || "working..."} (iteration ${solveIteration}/${SOLVE_MAX_ITERATIONS}) - Esc aborts`,
+      BLUE_COLOR
+    );
+    row += 1;
+  } else if (session) {
+    const endState = session.solved ? "SOLVE_OK reached" : session.abortRequested ? "aborted" : "unsolved";
+    setRow(row, `Status: ${endState} (${session.entries.length} entries) - Esc returns`, PLACEHOLDER_COLOR);
+    row += 1;
+  }
+
+  if (session && session.entries.length > 0) {
+    const visibleRows = Math.max(1, rows - row - 2);
+    const maxOffset = Math.max(0, session.entries.length - visibleRows);
+    if (solveScrollOffset > maxOffset) {
+      solveScrollOffset = maxOffset;
+    }
+    const startIdx = Math.max(0, session.entries.length - visibleRows - solveScrollOffset);
+    for (let i = startIdx; i < session.entries.length; i += 1) {
+      const entry = session.entries[i];
+      const roleLabel = entry.role === "user" ? "task" : entry.role === "assistant" ? "model" : entry.role;
+      const content = String(entry.content || "").replace(/\r?\n/g, " ");
+      const clipped = content.length > panelWidth - 6 ? content.slice(0, panelWidth - 9) + "..." : content;
+      const line = `  [${roleLabel}] ${clipped}`;
+      if (entry.role === "tool") {
+        setRow(row, line, PLACEHOLDER_COLOR);
+      } else if (entry.role === "assistant") {
+        setRow(row, line, TOKEN_COLOR);
+      } else {
+        setRow(row, line);
+      }
+      row += 1;
+      if (row >= rows - 1) {
+        break;
+      }
+    }
+  } else {
+    setRow(row, "waiting for first program...", PLACEHOLDER_COLOR);
+  }
+  setRow(rows - 1, "Esc: return  PgUp/PgDn: scroll", PLACEHOLDER_COLOR);
+
+  for (let y = 0; y < rows; y += 1) {
+    const nextRow = frameRows[y];
+    if (nextRow.color === BLUE_COLOR) {
+      writeColoredLine(y, nextRow.text, cols, BLUE_COLOR);
+    } else if (nextRow.color === GREEN_COLOR) {
+      writeColoredLine(y, nextRow.text, cols, GREEN_COLOR);
+    } else if (nextRow.color === TOKEN_COLOR) {
+      writeColoredLine(y, nextRow.text, cols, TOKEN_COLOR);
+    } else if (nextRow.color === PLACEHOLDER_COLOR) {
+      writeColoredLine(y, nextRow.text, cols, PLACEHOLDER_COLOR);
+    } else {
+      writeLine(y, nextRow.text, cols);
+    }
+  }
+  dirty = false;
+}
+
 function getSolveStatusText() {
   if (!solveActive) {
     return "";
@@ -5100,16 +5433,19 @@ function extractAnyFencedBlocks(text) {
 }
 
 async function runSolveLoop(taskText) {
+  const session = getActiveSolveSession();
   const resolvedModel = selectedModel;
   if (!resolvedModel) {
+    if (session) {
+      solveSessionAppend(session, "tool", "Solve loop failed: LLM provider is not configured.");
+    }
     return false;
   }
   const client = getOpenRouterClient();
   if (!client) {
-    appendAssistantMessage("Solve loop failed: LLM provider is not configured.", {
-      excludeFromRequest: true,
-      persistHistory: false,
-    });
+    if (session) {
+      solveSessionAppend(session, "tool", "Solve loop failed: LLM provider is not configured.");
+    }
     return false;
   }
 
@@ -5157,6 +5493,9 @@ async function runSolveLoop(taskText) {
     ],
     {}
   );
+  if (session) {
+    solveSessionAppend(session, "assistant", "Requesting the first program from the model...");
+  }
   let lastReply = extractAssistantText(firstRequest?.choices?.[0]?.message?.content);
   if (!lastReply.trim()) {
     const payload = extractAssistantPayloadFromCompletion(firstRequest, {
@@ -5189,10 +5528,10 @@ async function runSolveLoop(taskText) {
       continue;
     }
 
-    appendAssistantMessage(`Solve iteration ${iter}: ${code.slice(0, 400)}${code.length > 400 ? "…" : ""}`, {
-      excludeFromRequest: true,
-      persistHistory: false,
-    });
+    if (session) {
+      const codePreview = code.slice(0, 400) + (code.length > 400 ? "…" : "");
+      solveSessionAppend(session, "assistant", `Iteration ${iter} program:\n${codePreview}`);
+    }
     markDirty();
     renderFrame(true);
 
@@ -5201,12 +5540,11 @@ async function runSolveLoop(taskText) {
     const stderrText = String(kernelResult?.error || "");
     const gotSolvedMarker = stdoutText.includes(SOLVE_OK_SENTINEL);
 
-    appendAssistantMessage(
-      `Kernel output (iteration ${iter}):
-${(stdoutText || "(no stdout)").slice(0, 4000)}${stderrText ? `
-[error] ${stderrText.slice(0, 2000)}` : ""}`,
-      { excludeFromRequest: true, persistHistory: false }
-    );
+    if (session) {
+      const outputText = (stdoutText || "(no stdout)").slice(0, 4000);
+      const errText = stderrText ? `\n[error] ${stderrText.slice(0, 2000)}` : "";
+      solveSessionAppend(session, "tool", `Kernel output (iteration ${iter}):\n${outputText}${errText}`);
+    }
     markDirty();
     renderFrame(true);
 
@@ -6702,39 +7040,48 @@ async function runSlashCommand(commandName, commandArgs = "") {
       appendTuiErrorMessage("/solve", "failed because another /solve loop is already running");
       return true;
     }
+    // Dedicated solve session: output goes to its own transcript window, not
+    // the main chat. The session is persisted under ~/.nexus/kernels/.
+    const session = {
+      id: createSessionUid(),
+      task: taskText,
+      solved: false,
+      abortRequested: false,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      iterations: 0,
+      entries: [{ role: "user", content: taskText, ts: Date.now() }],
+    };
+    solveSessions.unshift(session);
+    saveSolveSession(session);
+    activeSolveSessionId = session.id;
+    viewingSolveSessionId = session.id;
+    solveScrollOffset = 0;
+
     solveActive = true;
     solveAbortRequested = false;
     solveIteration = 0;
     solveLastStatus = "starting";
-    appendAssistantMessage(`Solve loop started. Task: ${taskText}`, {
-      excludeFromRequest: true,
-      persistHistory: false,
-    });
-    markDirty();
-    renderFrame(true);
+    openSolveBuffer(session.id);
 
     const solved = await runSolveLoop(taskText);
 
     solveActive = false;
-    solveLastStatus = "";
-    if (solved) {
-      appendAssistantMessage("SOLVE_OK reached — the program verified its own solution.", {
-        excludeFromRequest: true,
-        persistHistory: false,
-      });
-    } else if (solveAbortRequested) {
-      appendAssistantMessage("Solve loop aborted (Esc).", {
-        excludeFromRequest: true,
-        persistHistory: false,
-      });
-    } else {
-      appendAssistantMessage(
-        `Solve loop exhausted its ${SOLVE_MAX_ITERATIONS}-iteration budget without SOLVE_OK. Last status: ${solveLastStatus || "none"}`,
-        { excludeFromRequest: true, persistHistory: false }
-      );
-    }
-    await rewriteSessionWithCurrentMessages().catch(() => {});
-    refreshMainBufferAfterCommand();
+    session.solved = Boolean(solved);
+    session.abortRequested = Boolean(solveAbortRequested);
+    session.updatedAt = Date.now();
+    saveSolveSession(session);
+    markDirty();
+    renderFrame(true);
+
+    // After the loop, remain in the solve window (Esc/Enter returns to
+    // /kernels list). Main chat is untouched.
+    return true;
+  }
+
+  if (commandName === "/kernels") {
+    loadKernelSessions();
+    openKernelsBuffer();
     return true;
   }
 
@@ -9469,6 +9816,14 @@ function renderFrame(forceChatRefresh = false) {
     renderLoopsBuffer();
     return;
   }
+  if (activeBuffer === "solve") {
+    renderSolveBuffer();
+    return;
+  }
+  if (activeBuffer === "kernels") {
+    renderKernelsBuffer();
+    return;
+  }
 
   if (!dirty && !forceChatRefresh) {
     return;
@@ -11103,6 +11458,50 @@ async function runKernelSelfTest() {
       return 1;
     }
 
+    // Solve-session persistence: a session saved to ~/.nexus/kernels loads
+    // back with its entries and metadata intact (/kernels / view).
+    const savedSession = {
+      id: "selftest-kernel-session",
+      task: "rotate grid",
+      solved: true,
+      abortRequested: false,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      iterations: 2,
+      entries: [
+        { role: "user", content: "rotate grid", ts: Date.now() },
+        { role: "assistant", content: "Iteration 1 program:\nprint(1)", ts: Date.now() },
+        { role: "tool", content: "Kernel output (iteration 1):\n1", ts: Date.now() },
+      ],
+    };
+    const dir = KERNELS_DIR;
+    try {
+      fsSync.mkdirSync(dir, { recursive: true });
+      fsSync.writeFileSync(getSolveSessionFilePath("selftest-kernel-session"), JSON.stringify(savedSession), "utf8");
+      loadKernelSessions();
+      const found = solveSessions.find((s) => s.id === "selftest-kernel-session");
+      if (!found || found.task !== "rotate grid" || !found.solved || found.entries.length !== 3) {
+        out(`KERNEL_FAIL: solve session round-trip failed: ${JSON.stringify(found)}\n`);
+        return 1;
+      }
+      if (found.entries[2].role !== "tool" || !String(found.entries[2].content).includes("Kernel output")) {
+        out("KERNEL_FAIL: solve session entries did not survive round-trip\n");
+        return 1;
+      }
+      // Clean up any files this test may have created (including an older
+      // orphan path from a previous test format).
+      fsSync.rmSync(getSolveSessionFilePath("selftest-kernel-session"), { force: true });
+      fsSync.rmSync(path.join(KERNELS_DIR, "selftest-kernel-session.json"), { force: true });
+      loadKernelSessions();
+      if (solveSessions.some((s) => s.id === "selftest-kernel-session")) {
+        out("KERNEL_FAIL: deleteSolveSession did not remove the session\n");
+        return 1;
+      }
+    } catch (error) {
+      out(`KERNEL_FAIL: solve session persistence threw: ${String(error?.message || error)}\n`);
+      return 1;
+    }
+
     // Reset clears the scope.
     await kernelReset();
     const afterReset = await kernelExec("y"); // should now fail (undefined)
@@ -11364,6 +11763,14 @@ process.stdin.on("data", (rawChunk) => {
     closeProvidersBuffer();
   } else if (activeBuffer === "loops" && chunk === "\u001b") {
     closeLoopsBuffer();
+  } else if (activeBuffer === "solve" && chunk === "\u001b") {
+    if (solveActive) {
+      solveAbortRequested = true;
+    } else {
+      closeSolveBuffer();
+    }
+  } else if (activeBuffer === "kernels" && chunk === "\u001b") {
+    closeKernelsBuffer();
   } else if (activeBuffer === "provider_editor" && chunk === "\u001b") {
     ignoreNextProvidersEscape = true;
     suppressKeypressUntil = Date.now() + 200;
@@ -11599,6 +12006,107 @@ process.stdin.on("keypress", async (str, key) => {
     if (key?.sequence === "\r" || key?.name === "return" || key?.name === "enter") {
       await loadSelectedSessionIntoChat();
       closeSessionsBuffer();
+      return;
+    }
+
+    return;
+  }
+
+  if (activeBuffer === "solve") {
+    if (key?.ctrl) {
+      return;
+    }
+
+    if (
+      key?.name === "escape" ||
+      key?.sequence === "\u001b" ||
+      str === "\u001b"
+    ) {
+      if (solveActive) {
+        solveAbortRequested = true;
+        markDirty();
+        renderFrame(true);
+      } else {
+        closeSolveBuffer();
+      }
+      return;
+    }
+
+    if (key?.name === "pageup" || key?.name === "pagedown" || key?.name === "up" || key?.name === "down") {
+      const session = getActiveSolveSession();
+      if (session && session.entries.length > 0) {
+        const rows = process.stdout.rows || 24;
+        let visibleRows = Math.max(1, rows - 5);
+        let maxOffset = Math.max(0, session.entries.length - visibleRows);
+        if (key.name === "pageup") {
+          solveScrollOffset = Math.min(maxOffset, solveScrollOffset + Math.max(1, Math.floor(rows / 2)));
+        } else if (key.name === "pagedown") {
+          solveScrollOffset = Math.max(0, solveScrollOffset - Math.max(1, Math.floor(rows / 2)));
+        } else if (key.name === "up") {
+          solveScrollOffset = Math.min(maxOffset, solveScrollOffset + 3);
+        } else {
+          solveScrollOffset = Math.max(0, solveScrollOffset - 3);
+        }
+      }
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+
+    return;
+  }
+
+  if (activeBuffer === "kernels") {
+    if (key?.ctrl) {
+      return;
+    }
+
+    if (
+      key?.name === "escape" ||
+      key?.sequence === "\u001b" ||
+      str === "\u001b"
+    ) {
+      closeKernelsBuffer();
+      return;
+    }
+
+    if (key?.name === "up" || key?.name === "down") {
+      if (solveSessions.length > 0) {
+        if (key.name === "up") {
+          kernelsSelected = Math.max(0, kernelsSelected - 1);
+        } else {
+          kernelsSelected = Math.min(solveSessions.length - 1, kernelsSelected + 1);
+        }
+        if (kernelsSelected < kernelsScroll) {
+          kernelsScroll = kernelsSelected;
+        } else {
+          const visibleCount = Math.max(1, Math.min(20, (process.stdout.rows || 24) - 4));
+          if (kernelsSelected >= kernelsScroll + visibleCount) {
+            kernelsScroll = kernelsSelected - visibleCount + 1;
+          }
+        }
+      }
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+
+    if (key?.name === "delete") {
+      const session = solveSessions[kernelsSelected];
+      if (session) {
+        deleteSolveSession(session.id);
+        updateKernelsSelectionState();
+      }
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+
+    if (key?.sequence === "\r" || key?.name === "return" || key?.name === "enter") {
+      const session = solveSessions[kernelsSelected];
+      if (session) {
+        openSolveBuffer(session.id);
+      }
       return;
     }
 
