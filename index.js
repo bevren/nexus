@@ -7109,20 +7109,49 @@ async function runSlashCommand(commandName, commandArgs = "") {
   }
 
   if (commandName === "/solve") {
-    const taskText = String(commandArgs ?? "").trim();
+    let taskText = String(commandArgs ?? "").trim();
     if (!taskText) {
-      appendTuiErrorMessage("/solve", "invalid usage. Use '/solve <task description>'");
+      appendTuiErrorMessage("/solve", "invalid usage. Use '/solve <task description>' or '/solve <task.md>'");
       return true;
     }
     if (solveActive) {
       appendTuiErrorMessage("/solve", "failed because another /solve loop is already running");
       return true;
     }
+    // Support "/solve task.md": a bare path (no spaces) that points at an
+    // existing file (or has a document extension) is read and used as the
+    // task; anything else is treated as an inline description.
+    let taskLabel = taskText;
+    if (!/\s/.test(taskText)) {
+      const candidate = path.isAbsolute(taskText) ? taskText : path.join(WORKSPACE_ROOT, taskText);
+      const looksLikeDoc = /\.(md|markdown|txt|rst|py|json)$/i.test(taskText);
+      let isFile = false;
+      try {
+        isFile = fsSync.existsSync(candidate) && fsSync.statSync(candidate).isFile();
+      } catch {
+        isFile = false;
+      }
+      if (isFile || looksLikeDoc) {
+        try {
+          const fileContent = await fs.readFile(candidate, "utf8");
+          if (!String(fileContent || "").trim()) {
+            appendTuiErrorMessage("/solve", `failed because the task file is empty: ${taskText}`);
+            return true;
+          }
+          taskLabel = taskText;
+          taskText = String(fileContent).trim();
+        } catch (error) {
+          appendTuiErrorMessage("/solve", `failed to read task file: ${taskText} (${error?.message || error})`);
+          return true;
+        }
+      }
+    }
     // Dedicated solve session: output goes to its own transcript window, not
     // the main chat. The session is persisted under ~/.nexus/kernels/.
     const session = {
       id: createSessionUid(),
-      task: taskText,
+      task: taskLabel,
+      taskFull: taskText,
       solved: false,
       abortRequested: false,
       createdAt: Date.now(),
