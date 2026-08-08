@@ -3283,6 +3283,8 @@ let kernelChild = null;
 let kernelPending = new Map();
 let kernelSeq = 0;
 let kernelBuffer = "";
+let kernelWorkspaceDir = "";
+let kernelVenvPython = "";
 
 function getKernelScriptPath() {
   const candidates = [
@@ -3302,7 +3304,11 @@ function getKernelScriptPath() {
 }
 
 function getKernelPythonCommand() {
-  // Prefer python, then py -3 (Windows launcher). Matches runPythonCommand.
+  // Prefer the solve-session venv python when a workspace has been prepared;
+  // then the global python, then py -3 (Windows launcher).
+  if (kernelVenvPython && fsSync.existsSync(kernelVenvPython)) {
+    return { command: kernelVenvPython, args: [] };
+  }
   try {
     const probe = spawnSync("python", ["--version"], { timeout: 5000, windowsHide: true });
     if (probe && probe.status === 0 && String(probe.stdout || "").includes("Python")) {
@@ -3337,10 +3343,13 @@ function startKernelProcess() {
   const { spawn: kernelSpawn } = require("node:child_process");
   const py = getKernelPythonCommand();
   const scriptPath = getKernelScriptPath();
+  const kernelCwd = kernelWorkspaceDir && fsSync.existsSync(kernelWorkspaceDir)
+    ? kernelWorkspaceDir
+    : process.cwd();
   kernelBuffer = "";
   try {
     kernelChild = kernelSpawn(py.command, [...py.args, scriptPath], {
-      cwd: process.cwd(),
+      cwd: kernelCwd,
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -3430,7 +3439,168 @@ function kernelExec(code, timeoutMs = 120000) {
 
 async function kernelReset() {
   stopKernelProcess();
+  kernelWorkspaceDir = "";
+  kernelVenvPython = "";
   return { ok: true };
+}
+
+// Creates a fresh per-solve .venv in dirPath and points the kernel at it.
+// Returns { ok, dir, venvPython } or { ok:false, error }.
+async function prepareKernelWorkspace(dirPath) {
+  const dir = path.resolve(String(dirPath ?? ""));
+  let dirOk = false;
+  try {
+    dirOk = fsSync.existsSync(dir) && fsSync.statSync(dir).isDirectory();
+  } catch {
+    dirOk = false;
+  }
+  if (!dirOk) {
+    return { ok: false, error: `workspace directory does not exist: ${dirPath}` };
+  }
+
+  // Detach from any previous solve's kernel + venv before creating the new one.
+  stopKernelProcess();
+  kernelWorkspaceDir = "";
+  kernelVenvPython = "";
+
+  const venvDir = path.join(dir, ".venv");
+  const isWin = process.platform === "win32";
+  const venvPython = isWin
+    ? path.join(venvDir, "Scripts", "python.exe")
+    : path.join(venvDir, "bin", "python");
+
+  try {
+    fsSync.rmSync(venvDir, { recursive: true, force: true });
+    await fs.mkdir(venvDir, { recursive: true });
+    const { spawnSync: venvSpawn } = require("node:child_process");
+    const basePy = getKernelPythonCommand();
+    const created = venvSpawn(basePy.command, [...basePy.args, "-m", "venv", venvDir], {
+      cwd: dir,
+      windowsHide: true,
+      timeout: 120000,
+    });
+    if (!created || created.status !== 0) {
+      return { ok: false, error: `venv creation failed: ${String(created && created.stderr || "").slice(0, 500)}` };
+    }
+    if (!fsSync.existsSync(venvPython)) {
+      return { ok: false, error: `venv python not found after creation: ${venvPython}` };
+    }
+  } catch (error) {
+    return { ok: false, error: `venv creation error: ${error?.message || error}` };
+  }
+
+  kernelWorkspaceDir = dir;
+  kernelVenvPython = venvPython;
+  return { ok: true, dir, venvPython };
+}
+
+// Resolves a /solve argument into a task source.
+//   "/solve <dir>"      -> <dir>/task.md (or README.md) is the task; requirements.txt -> venv
+//   "/solve <file>.md"  -> the file's content is the task
+//   "/solve <inline>"   -> the text is the task
+// Returns { ok, taskLabel, taskText, workspaceDir, requirementsPath, error }.
+async function loadSolveTaskSource(specText) {
+  const raw = String(specText ?? "").trim();
+  if (!raw) {
+    return { ok: false, error: "no task specified" };
+  }
+  const candidate = path.isAbsolute(raw) ? raw : path.join(WORKSPACE_ROOT, raw);
+  let isDir = false;
+  let isFile = false;
+  try {
+    isDir = fsSync.existsSync(candidate) && fsSync.statSync(candidate).isDirectory();
+  } catch {
+    isDir = false;
+  }
+  try {
+    isFile = fsSync.existsSync(candidate) && fsSync.statSync(candidate).isFile();
+  } catch {
+    isFile = false;
+  }
+
+  if (isDir) {
+    const taskMd = path.join(candidate, "task.md");
+    const readme = path.join(candidate, "README.md");
+    let taskFile = "";
+    try {
+      if (fsSync.existsSync(taskMd) && fsSync.statSync(taskMd).isFile()) {
+        taskFile = taskMd;
+      } else if (fsSync.existsSync(readme) && fsSync.statSync(readme).isFile()) {
+        taskFile = readme;
+      }
+    } catch {
+      taskFile = "";
+    }
+    if (!taskFile) {
+      return { ok: false, error: `no task.md (or README.md) found in directory: ${raw}` };
+    }
+    let taskText = "";
+    try {
+      taskText = String(await fs.readFile(taskFile, "utf8")).trim();
+    } catch (error) {
+      return { ok: false, error: `failed to read ${taskFile}: ${error?.message || error}` };
+    }
+    if (!taskText) {
+      return { ok: false, error: `task file is empty: ${taskFile}` };
+    }
+    const requirementsPath = path.join(candidate, "requirements.txt");
+    let hasReqs = false;
+    try {
+      hasReqs = fsSync.existsSync(requirementsPath) && fsSync.statSync(requirementsPath).isFile();
+    } catch {
+      hasReqs = false;
+    }
+    return {
+      ok: true,
+      taskLabel: raw,
+      taskText,
+      workspaceDir: candidate,
+      requirementsPath: hasReqs ? requirementsPath : "",
+    };
+  }
+
+  if (isFile) {
+    let taskText = "";
+    try {
+      taskText = String(await fs.readFile(candidate, "utf8")).trim();
+    } catch (error) {
+      return { ok: false, error: `failed to read ${raw}: ${error?.message || error}` };
+    }
+    if (!taskText) {
+      return { ok: false, error: `task file is empty: ${raw}` };
+    }
+    return { ok: true, taskLabel: raw, taskText, workspaceDir: "", requirementsPath: "" };
+  }
+
+  // Inline description.
+  return { ok: true, taskLabel: raw.slice(0, 60), taskText: raw, workspaceDir: "", requirementsPath: "" };
+}
+
+// Installs requirements.txt into the current kernel venv (if any).
+async function installKernelRequirements(requirementsPath) {
+  if (!kernelVenvPython || !fsSync.existsSync(kernelVenvPython)) {
+    return { ok: false, error: "no venv python available" };
+  }
+  const reqFile = path.resolve(String(requirementsPath || ""));
+  let okFile = false;
+  try {
+    okFile = fsSync.existsSync(reqFile) && fsSync.statSync(reqFile).isFile();
+  } catch {
+    okFile = false;
+  }
+  if (!okFile) {
+    return { ok: true, installed: false, error: "" };
+  }
+  const { spawnSync: pipSpawn } = require("node:child_process");
+  const pip = pipSpawn(kernelVenvPython, ["-m", "pip", "install", "-r", reqFile], {
+    cwd: kernelWorkspaceDir || process.cwd(),
+    windowsHide: true,
+    timeout: 600000,
+  });
+  if (!pip || pip.status !== 0) {
+    return { ok: false, installed: false, error: String(pip && pip.stderr || "").slice(0, 800) };
+  }
+  return { ok: true, installed: true, error: "" };
 }
 
 async function runCompaction(customInstruction = "") {
@@ -7144,49 +7314,55 @@ async function runSlashCommand(commandName, commandArgs = "") {
   }
 
   if (commandName === "/solve") {
-    let taskText = String(commandArgs ?? "").trim();
-    if (!taskText) {
-      appendTuiErrorMessage("/solve", "invalid usage. Use '/solve <task description>' or '/solve <task.md>'");
+    const specText = String(commandArgs ?? "").trim();
+    if (!specText) {
+      appendTuiErrorMessage("/solve", "invalid usage. Use '/solve <task description>', '/solve <task.md>', or '/solve <dir>'");
       return true;
     }
     if (solveActive) {
       appendTuiErrorMessage("/solve", "failed because another /solve loop is already running");
       return true;
     }
-    // Support "/solve task.md": a bare path (no spaces) that points at an
-    // existing file (or has a document extension) is read and used as the
-    // task; anything else is treated as an inline description.
-    let taskLabel = taskText;
-    if (!/\s/.test(taskText)) {
-      const candidate = path.isAbsolute(taskText) ? taskText : path.join(WORKSPACE_ROOT, taskText);
-      const looksLikeDoc = /\.(md|markdown|txt|rst|py|json)$/i.test(taskText);
-      let isFile = false;
-      try {
-        isFile = fsSync.existsSync(candidate) && fsSync.statSync(candidate).isFile();
-      } catch {
-        isFile = false;
-      }
-      if (isFile || looksLikeDoc) {
-        try {
-          const fileContent = await fs.readFile(candidate, "utf8");
-          if (!String(fileContent || "").trim()) {
-            appendTuiErrorMessage("/solve", `failed because the task file is empty: ${taskText}`);
-            return true;
+    // Resolve the task source: inline text, a .md file, or a directory
+    // workspace containing task.md (+ optional requirements.txt).
+    const source = await loadSolveTaskSource(specText);
+    if (!source.ok) {
+      appendTuiErrorMessage("/solve", `failed: ${source.error || "could not load task source"}`);
+      return true;
+    }
+    const taskText = source.taskText;
+    const taskLabel = source.taskLabel;
+
+    // Prepare a per-solve venv when the task came from a directory.
+    let workspaceDir = source.workspaceDir || "";
+    let requirementsPath = source.requirementsPath || "";
+    let venvReady = false;
+    let venvError = "";
+    if (workspaceDir) {
+      const prep = await prepareKernelWorkspace(workspaceDir);
+      if (!prep.ok) {
+        venvError = String(prep.error || "venv preparation failed");
+      } else {
+        venvReady = true;
+        if (requirementsPath) {
+          const inst = await installKernelRequirements(requirementsPath);
+          if (!inst.ok) {
+            venvError = String(inst.error || "requirements install failed");
           }
-          taskLabel = taskText;
-          taskText = String(fileContent).trim();
-        } catch (error) {
-          appendTuiErrorMessage("/solve", `failed to read task file: ${taskText} (${error?.message || error})`);
-          return true;
         }
       }
     }
+
     // Dedicated solve session: output goes to its own transcript window, not
     // the main chat. The session is persisted under ~/.nexus/kernels/.
     const session = {
       id: createSessionUid(),
       task: taskLabel,
       taskFull: taskText,
+      workspaceDir,
+      requirementsPath,
+      venvReady,
+      venvError,
       solved: false,
       abortRequested: false,
       createdAt: Date.now(),
@@ -7194,6 +7370,21 @@ async function runSlashCommand(commandName, commandArgs = "") {
       iterations: 0,
       entries: [{ role: "user", content: taskText, ts: Date.now() }],
     };
+    if (venvReady) {
+      session.entries.push({
+        role: "tool",
+        content: `Kernel workspace: ${workspaceDir} (venv ${
+          requirementsPath ? "with requirements installed" : "without requirements"
+        })`,
+        ts: Date.now(),
+      });
+    } else if (venvError) {
+      session.entries.push({
+        role: "tool",
+        content: `Kernel workspace venv error: ${venvError}`,
+        ts: Date.now(),
+      });
+    }
     solveSessions.unshift(session);
     saveSolveSession(session);
     activeSolveSessionId = session.id;
@@ -7204,6 +7395,8 @@ async function runSlashCommand(commandName, commandArgs = "") {
     solveAbortRequested = false;
     solveIteration = 0;
     solveLastStatus = "starting";
+    // Ensure the kernel spawns fresh against the new workspace + venv.
+    stopKernelProcess();
     openSolveBuffer(session.id);
 
     const solved = await runSolveLoop(taskText);
