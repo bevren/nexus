@@ -4725,6 +4725,39 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
     }
   };
 
+  // Retries an LLM request when the assistant message text comes back empty
+  // (DeepSeek reasoning responses occasionally return only reasoning_content
+  // with an empty content field). Bounded attempts keep the agent loop alive
+  // instead of silently stopping on a transient empty response.
+  const retryAssistantPayloadForEmpty = async (messagesForRequest, modelId, options = {}) => {
+    const maxAttempts = Math.max(1, Number(options?.maxAttempts) || 3);
+    const baseDelayMs = Math.max(0, Number(options?.baseDelayMs) || 800);
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const attemptMessages = stripReasoningDetailsFromMessages(messagesForRequest);
+      const attemptCompletion = await requestWithTimeout(attemptMessages, {
+        disableReasoning: true,
+      });
+      if (generation !== chatGeneration) {
+        return null;
+      }
+      updateContextBudgetFromCompletion(attemptCompletion, modelId);
+      const attemptPayload = extractAssistantPayloadFromCompletion(attemptCompletion, {
+        allowReasoningTextFallback: false,
+      });
+      if (attemptPayload.text.trim().length > 0) {
+        return {
+          completion: attemptCompletion,
+          payload: attemptPayload,
+          disabledReasoning: true,
+        };
+      }
+      if (attempt < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, baseDelayMs * attempt));
+      }
+    }
+    return null;
+  };
+
   let pendingResolved = false;
   try {
     let completion = await requestWithTimeout(requestMessages);
@@ -4737,25 +4770,28 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
     let assistantPayload = extractAssistantPayloadFromCompletion(completion, {
       allowReasoningTextFallback: reasoningEnabledNow,
     });
-    if (assistantPayload.text.trim().length === 0 && getReasoningEnabledForModel(resolvedModel)) {
+    // Empty assistant message (reasoning-only or transient provider response):
+    // re-run with reasoning off, a few times, so the turn does not silently stall.
+    if (assistantPayload.text.trim().length === 0) {
       try {
-        const retryMessages = stripReasoningDetailsFromMessages(requestMessages);
-        const retryCompletion = await requestWithTimeout(retryMessages, { disableReasoning: true });
-        const retryPayload = extractAssistantPayloadFromCompletion(retryCompletion, {
-          allowReasoningTextFallback: false,
+        const retried = await retryAssistantPayloadForEmpty(requestMessages, resolvedModel, {
+          maxAttempts: 3,
+          baseDelayMs: 800,
         });
-        if (retryPayload.text.trim().length > 0) {
-          completion = retryCompletion;
+        if (retried && retried.payload && retried.payload.text.trim().length > 0) {
+          completion = retried.completion;
           updateContextBudgetFromCompletion(completion, resolvedModel);
-          assistantPayload = retryPayload;
-          setReasoningEnabledForModel(resolvedModel, false);
-          appendAssistantMessage(
-            "Auto-disabled thinking for this model (empty content with thinking on). Run /set thinking on to re-enable.",
-            { excludeFromRequest: true, persistHistory: false }
-          );
-          await rewriteSessionWithCurrentMessages().catch(() => {});
-          markDirty();
-          renderFrame(false);
+          assistantPayload = retried.payload;
+          if (retried.disabledReasoning && getReasoningEnabledForModel(resolvedModel)) {
+            setReasoningEnabledForModel(resolvedModel, false);
+            appendAssistantMessage(
+              "Auto-disabled thinking for this model (empty content after retries). Run /set thinking on to re-enable.",
+              { excludeFromRequest: true, persistHistory: false }
+            );
+            await rewriteSessionWithCurrentMessages().catch(() => {});
+            markDirty();
+            renderFrame(false);
+          }
         }
       } catch {
         // Keep original payload and fall through to user-facing error text.
@@ -4935,30 +4971,29 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
       });
       let followUpContent = followUpPayload.text;
       let followUpReasoningDetails = followUpReasoningEnabled ? followUpPayload.reasoningDetails : null;
-      if (followUpContent.trim().length === 0 && followUpReasoningEnabled) {
-        // Reasoning models sometimes return only reasoning_content with an
-        // empty final answer on follow-ups after tool runs. Retry without
-        // reasoning so the feedback loop keeps going instead of stalling
-        // silently after code execution.
+      if (followUpContent.trim().length === 0) {
+        // Empty follow-up after a tool run: retry (reasoning off, bounded) so
+        // a transient empty response does not silently stop the agent loop.
         try {
-          const retryMessages = stripReasoningDetailsFromMessages(followUpMessages);
-          const retryCompletion = await requestWithTimeout(retryMessages, { disableReasoning: true });
-          const retryPayload = extractAssistantPayloadFromCompletion(retryCompletion, {
-            allowReasoningTextFallback: false,
+          const retried = await retryAssistantPayloadForEmpty(followUpMessages, resolvedModel, {
+            maxAttempts: 3,
+            baseDelayMs: 800,
           });
-          if (retryPayload.text.trim().length > 0) {
-            followUpCompletion = retryCompletion;
+          if (retried && retried.payload && retried.payload.text.trim().length > 0) {
+            followUpCompletion = retried.completion;
             updateContextBudgetFromCompletion(followUpCompletion, resolvedModel);
-            followUpContent = retryPayload.text;
+            followUpContent = retried.payload.text;
             followUpReasoningDetails = null;
-            setReasoningEnabledForModel(resolvedModel, false);
-            appendAssistantMessage(
-              "Auto-disabled thinking for this model (empty follow-up content with thinking on). Run /set thinking on to re-enable.",
-              { excludeFromRequest: true, persistHistory: false }
-            );
-            await rewriteSessionWithCurrentMessages().catch(() => {});
-            markDirty();
-            renderFrame(false);
+            if (retried.disabledReasoning && getReasoningEnabledForModel(resolvedModel)) {
+              setReasoningEnabledForModel(resolvedModel, false);
+              appendAssistantMessage(
+                "Auto-disabled thinking for this model (empty follow-up content after retries). Run /set thinking on to re-enable.",
+                { excludeFromRequest: true, persistHistory: false }
+              );
+              await rewriteSessionWithCurrentMessages().catch(() => {});
+              markDirty();
+              renderFrame(false);
+            }
           }
         } catch {
           // Keep the original empty result; the notice below will explain.
@@ -4967,8 +5002,8 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
       if (followUpContent.trim().length === 0) {
         appendAssistantMessage(
           getReasoningEnabledForModel(resolvedModel)
-            ? "Provider returned no assistant content after the tool run. Try /set thinking off for this model."
-            : "Provider returned no assistant content after the tool run.",
+            ? "Provider returned no assistant content after the tool run (even after retries). Try /set thinking off for this model."
+            : "Provider returned no assistant content after the tool run (even after retries).",
           { excludeFromRequest: true, persistHistory: false }
         );
         break;
