@@ -5552,6 +5552,10 @@ async function runSolveLoop(taskText) {
     renderFrame(true);
 
     const kernelResult = await kernelExec(code);
+    // Esc/kill may have cancelled this kernel run; exit the loop promptly.
+    if (solveAbortRequested || stopRequested) {
+      return false;
+    }
     const stdoutText = String(kernelResult?.output || "");
     const stderrText = String(kernelResult?.error || "");
     const gotSolvedMarker = stdoutText.includes(SOLVE_OK_SENTINEL);
@@ -11798,6 +11802,7 @@ process.stdin.on("data", (rawChunk) => {
   } else if (activeBuffer === "solve" && chunk === "\u001b") {
     if (solveActive) {
       solveAbortRequested = true;
+      stopKernelProcess();
     } else {
       closeSolveBuffer();
     }
@@ -12056,6 +12061,9 @@ process.stdin.on("keypress", async (str, key) => {
     ) {
       if (solveActive) {
         solveAbortRequested = true;
+        // Kill the running kernel so a mid-flight kernelExec unblocks
+        // immediately instead of waiting for the program to finish or time out.
+        stopKernelProcess();
         markDirty();
         renderFrame(true);
       } else {
