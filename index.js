@@ -413,6 +413,45 @@ function getSessionReasoningConfig() {
   return normalizeReasoningConfigMap(reasoningEnabledByModel);
 }
 
+// Auto-disables persist as `false` in the session file (set via
+// setReasoningEnabledForModel(false) on provider/empty-content retries).
+// On resume we must not let those stale flags win over the user's explicit
+// preference. Walk the loaded transcript newest-first for the last
+// reasoning-state signal: an explicit "/set thinking on" or an auto-disable
+// notice both mean thinking should come back ON; only an explicit
+// "/set thinking off" preserves the off state.
+function pruneAutoDisabledReasoningFlags(persistedMap, transcript) {
+  const result = { ...persistedMap };
+  let lastSignal = null; // "explicit-on" | "explicit-off" | "auto"
+  for (let i = transcript.length - 1; i >= 0; i -= 1) {
+    const entry = transcript[i];
+    if (!entry || entry.role !== "assistant" || entry.excludeFromRequest !== true) {
+      continue;
+    }
+    const content = typeof entry.content === "string" ? entry.content.trim() : "";
+    if (content === "Set thinking on") {
+      lastSignal = "explicit-on";
+      break;
+    }
+    if (content === "Set thinking off") {
+      lastSignal = "explicit-off";
+      break;
+    }
+    if (content.startsWith("Auto-disabled thinking for this model")) {
+      lastSignal = "auto";
+      break;
+    }
+  }
+  if (lastSignal === "explicit-on" || lastSignal === "auto") {
+    for (const key of Object.keys(result)) {
+      if (result[key] === false) {
+        delete result[key];
+      }
+    }
+  }
+  return result;
+}
+
 function isAssistantNoContentFallbackMessage(content) {
   if (typeof content !== "string") {
     return false;
@@ -6464,7 +6503,10 @@ async function loadSessionFileIntoChat(filePath, options = {}) {
   const loadedSessionReasoningByModel = normalizeReasoningConfigMap(
     parsedSession?.sessionReasoningByModel
   );
-  reasoningEnabledByModel = loadedSessionReasoningByModel;
+  reasoningEnabledByModel = pruneAutoDisabledReasoningFlags(
+    loadedSessionReasoningByModel,
+    loadedMessages
+  );
   messages.length = 0;
   printedMessageCount = 0;
   forceTranscriptReplay = true;
@@ -11543,6 +11585,28 @@ async function runKernelSelfTest() {
     const afterReset = await kernelExec("y"); // should now fail (undefined)
     if (afterReset.ok) {
       out(`KERNEL_FAIL: reset did not clear scope: ${JSON.stringify(afterReset)}\n`);
+      return 1;
+    }
+
+    // Reasoning-state restore: an auto-disable notice or explicit "Set
+    // thinking on" in the transcript clears stale `false` flags so the app
+    // does not come back with thinking off; an explicit "off" is respected.
+    const stale = { "deepseek-chat": false };
+    const autoTranscript = [
+      { role: "assistant", content: "Set thinking on", excludeFromRequest: true },
+      { role: "assistant", content: "Auto-disabled thinking for this model (empty content with thinking on). Run /set thinking on to re-enable.", excludeFromRequest: true },
+    ];
+    const prunedAuto = pruneAutoDisabledReasoningFlags(stale, autoTranscript);
+    if (Object.prototype.hasOwnProperty.call(prunedAuto, "deepseek-chat")) {
+      out(`KERNEL_FAIL: auto-disable flag should be pruned on resume: ${JSON.stringify(prunedAuto)}\n`);
+      return 1;
+    }
+    const offTranscript = [
+      { role: "assistant", content: "Set thinking off", excludeFromRequest: true },
+    ];
+    const prunedOff = pruneAutoDisabledReasoningFlags(stale, offTranscript);
+    if (prunedOff["deepseek-chat"] !== false) {
+      out(`KERNEL_FAIL: explicit /set thinking off must survive resume: ${JSON.stringify(prunedOff)}\n`);
       return 1;
     }
 
