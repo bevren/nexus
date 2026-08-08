@@ -6,7 +6,7 @@ const fs = require("fs/promises");
 const fsSync = require("fs");
 const path = require("path");
 const os = require("os");
-const { execFile } = require("child_process");
+const { execFile, spawnSync } = require("child_process");
 const { randomUUID } = require("crypto");
 
 let OpenAI = null;
@@ -101,6 +101,8 @@ const IMAGE_INLINE_TOKEN_RE = /\[Image #\d+\]/gi;
 const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|svg|ico|tiff?|avif|heic|heif)(\?.*)?$/i;
 const HIDE_CURSOR = "\u001b[?25l";
 const SHOW_CURSOR = "\u001b[?25h";
+const SAVE_CURSOR = "\u001b7";
+const RESTORE_CURSOR = "\u001b8";
 const BRACKETED_PASTE_START = "\u001b[200~";
 const BRACKETED_PASTE_END = "\u001b[201~";
 const ENABLE_BRACKETED_PASTE = "\u001b[?2004h";
@@ -160,8 +162,8 @@ const COMMANDS = [
   { name: "/loop", description: "run a prompt on an interval: /loop [interval] [prompt]" },
   { name: "/loops", description: "list or cancel scheduled loops: /loops | /loops cancel <id>" },
   { name: "/hooks", description: "show configured lifecycle hooks (read-only)" },
-  { name: "/solve", description: "run an autonomous solve loop against the persistent kernel: /solve <task>" },
-  { name: "/kernels", description: "browse sessions created by /solve: /kernels" },
+  { name: "/solve", description: "run an autonomous solve loop in an isolated workspace: /solve <directory>" },
+  { name: "/kernels", description: "view, resume, restart, or delete sessions created by /solve" },
 ];
 const FALLBACK_TOOL_DESCRIPTIONS = {
   insert_memory:
@@ -321,6 +323,7 @@ let activeBlockedPastePayloadIndex = -1;
 let isBracketedPasteActive = false;
 let bracketedPasteBuffer = "";
 let suppressKeypressUntil = 0;
+let suppressSolveEscapeKeypressUntil = 0;
 let suppressMouseNoiseUntil = 0;
 let ignoreNextProvidersEscape = false;
 let bracketedPasteModeEnabled = false;
@@ -353,6 +356,7 @@ let mcpStartupActive = false;
 let mcpStartupHasConfig = false;
 let answerRevealTimer = null;
 let answerRevealSettlePending = false;
+const pendingAnswerRevealEntries = new Set();
 let forceChatRefreshFlag = false;
 let thinkingAnimationTimer = null;
 let thinkingFrameIndex = 0;
@@ -382,6 +386,7 @@ let cachedChatLinesCols = 0;
 let cachedChatLinesLen = -1;
 let cachedChatLinesLastRef = null;
 let cachedChatLinesSpacing = -1;
+const cachedTranscriptLinesByEntries = new WeakMap();
 
 function createSessionUid() {
   if (typeof randomUUID === "function") {
@@ -834,6 +839,7 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "- Do not output tool_call payloads, XML, YAML, or pseudo function-call objects.",
     "- Call helper functions directly in Python code.",
     "- For tool-use replies, include no prose before or after the execute block.",
+    "- Keep execute blocks compact. If an execute block is reported as truncated, retry with a smaller complete block.",
     "",
     "FILE EDIT STRATEGY (MANDATORY):",
     "- For existing files, prefer incremental edits with replace_in_file instead of rewriting the full file.",
@@ -969,7 +975,7 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "- kernel_reset() clears the kernel scope when stale state causes confusion.",
     "",
     "SOLVE LOOP (/solve):",
-    "- /solve <task description> starts an autonomous loop: you write a Python program that attacks the task, the kernel runs it, and the result feeds back.",
+    "- /solve <directory> starts an autonomous loop using that directory's task.md (or README.md), workspace, and private .venv.",
     "- The goal is a program whose stdout ends with the line SOLVE_OK when it has verified its own solution. Failures return stderr/stdout to inspect.",
     "- Iterate until the program proves itself with SOLVE_OK or the iteration budget is exhausted, then summarize.",
     "",
@@ -1924,15 +1930,23 @@ function enterAltScreenIfNeeded() {
   forceFullClearOnNextRender = true;
 }
 
-function exitAltScreenIfNeeded() {
+function exitAltScreenIfNeeded(options = {}) {
   if (!altScreenActive) {
     return;
   }
 
   process.stdout.write(EXIT_ALT_SCREEN);
   altScreenActive = false;
-  hasInitializedScreen = false;
-  forceFullClearOnNextRender = true;
+  if (options.preserveRestoredScreen === true) {
+    // DECSET 1049 restores the main screen exactly as it was before the
+    // alternate buffer opened. Keep the main renderer's cached layout so it
+    // can update in place instead of blanking and repainting that screen.
+    hasInitializedScreen = true;
+    forceFullClearOnNextRender = false;
+  } else {
+    hasInitializedScreen = false;
+    forceFullClearOnNextRender = true;
+  }
 }
 
 function normalizeLlmRequestTimeoutMs(value) {
@@ -2376,18 +2390,59 @@ let loopTasks = [];
 let loopSchedulerTimer = null;
 let loopFiring = false;
 let solveActive = false;
+let solveStartupActive = false;
+let solveStartupStatus = "";
+let solveStartupAbortRequested = false;
+let solveStartupChild = null;
 let solveAbortRequested = false;
+let solveRequestAbortController = null;
 let solveIteration = 0;
 let solveLastStatus = "";
-const SOLVE_MAX_ITERATIONS = 8;
+const SOLVE_MAX_ITERATIONS = 0; // 0 means continue until SOLVE_OK or explicit abort.
+const SOLVE_REQUEST_MIN_TIMEOUT_MS = 300000;
 const SOLVE_OK_SENTINEL = "SOLVE_OK";
 const KERNELS_DIR = path.join(NEXUS_DIR, "kernels");
 let solveSessions = [];
 let activeSolveSessionId = null;
+let runningSolveSessionId = null;
 let viewingSolveSessionId = null;
+let solveReturnBuffer = "main";
 let kernelsSelected = 0;
 let kernelsScroll = 0;
 let solveScrollOffset = 0;
+
+function getSolveIterationLabel() {
+  return SOLVE_MAX_ITERATIONS > 0
+    ? `${solveIteration}/${SOLVE_MAX_ITERATIONS}`
+    : String(solveIteration);
+}
+
+function setSolveStartupStatus(status) {
+  solveStartupStatus = String(status || "");
+  if (!solveStartupActive) {
+    return;
+  }
+  markDirty();
+  updateThinkingAnimationState();
+  renderFrame(false);
+}
+
+function cancelSolveStartup() {
+  if (!solveStartupActive) {
+    return;
+  }
+  solveStartupAbortRequested = true;
+  solveStartupStatus = "Cancelling kernel startup...";
+  if (solveStartupChild) {
+    try {
+      solveStartupChild.kill();
+    } catch {
+      // Process may already have exited.
+    }
+  }
+  markDirty();
+  renderFrame(false);
+}
 
 function normalizeLoopTask(entry) {
   if (!entry || typeof entry !== "object") {
@@ -3336,6 +3391,31 @@ function stopKernelProcess() {
   kernelPending.clear();
 }
 
+async function stopKernelProcessAndWait(timeoutMs = 5000) {
+  const child = kernelChild;
+  if (!child) {
+    return;
+  }
+  const exited = new Promise((resolve) => {
+    child.once("exit", resolve);
+    child.once("error", resolve);
+  });
+  stopKernelProcess();
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+  let timeoutId = null;
+  await Promise.race([
+    exited,
+    new Promise((resolve) => {
+      timeoutId = setTimeout(resolve, Math.max(100, Number(timeoutMs) || 5000));
+    }),
+  ]);
+  if (timeoutId) {
+    clearTimeout(timeoutId);
+  }
+}
+
 function startKernelProcess() {
   if (kernelChild) {
     return true;
@@ -3347,12 +3427,14 @@ function startKernelProcess() {
     ? kernelWorkspaceDir
     : process.cwd();
   kernelBuffer = "";
+  let child = null;
   try {
-    kernelChild = kernelSpawn(py.command, [...py.args, scriptPath], {
+    child = kernelSpawn(py.command, [...py.args, scriptPath], {
       cwd: kernelCwd,
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    kernelChild = child;
   } catch (error) {
     kernelChild = null;
     return false;
@@ -3367,7 +3449,10 @@ function startKernelProcess() {
       stderrTail = String(d).slice(-2000);
     });
   }
-  kernelChild.stdout.on("data", (chunk) => {
+  child.stdout.on("data", (chunk) => {
+    if (kernelChild !== child) {
+      return;
+    }
     kernelBuffer += String(chunk);
     let nl = kernelBuffer.indexOf("\n");
     while (nl >= 0) {
@@ -3389,22 +3474,25 @@ function startKernelProcess() {
       nl = kernelBuffer.indexOf("\n");
     }
   });
-  kernelChild.on("error", () => {
+  child.on("error", () => {
+    if (kernelChild !== child) {
+      return;
+    }
     kernelChild = null;
     for (const [, resolver] of kernelPending) {
       resolver({ ok: false, error: "kernel process error" });
     }
     kernelPending.clear();
   });
-  kernelChild.on("exit", (code) => {
-    const exited = kernelChild;
-    kernelChild = null;
-    if (exited) {
-      for (const [, resolver] of kernelPending) {
-        resolver({ ok: false, error: `kernel exited with code ${code}` });
-      }
-      kernelPending.clear();
+  child.on("exit", (code) => {
+    if (kernelChild !== child) {
+      return;
     }
+    kernelChild = null;
+    for (const [, resolver] of kernelPending) {
+      resolver({ ok: false, error: `kernel exited with code ${code}` });
+    }
+    kernelPending.clear();
   });
   return true;
 }
@@ -3438,13 +3526,77 @@ function kernelExec(code, timeoutMs = 120000) {
 }
 
 async function kernelReset() {
-  stopKernelProcess();
+  await stopKernelProcessAndWait();
   kernelWorkspaceDir = "";
   kernelVenvPython = "";
   return { ok: true };
 }
 
-// Creates a fresh per-solve .venv in dirPath and points the kernel at it.
+function runSolveStartupProcess(command, args, options = {}) {
+  return new Promise((resolve) => {
+    let child = null;
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timeoutId = null;
+    const finish = (result) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+      if (solveStartupChild === child) {
+        solveStartupChild = null;
+      }
+      resolve({
+        stdout: stdout.slice(-4000),
+        stderr: stderr.slice(-4000),
+        ...result,
+      });
+    };
+    try {
+      child = spawn(command, args, {
+        cwd: options.cwd || process.cwd(),
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      solveStartupChild = child;
+    } catch (error) {
+      finish({ ok: false, error: String(error?.message || error), cancelled: false });
+      return;
+    }
+    child.stdout?.on("data", (chunk) => {
+      stdout = (stdout + String(chunk)).slice(-8000);
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr = (stderr + String(chunk)).slice(-8000);
+    });
+    child.once("error", (error) => {
+      finish({ ok: false, error: String(error?.message || error), cancelled: solveStartupAbortRequested });
+    });
+    child.once("exit", (code, signal) => {
+      finish({
+        ok: code === 0 && !solveStartupAbortRequested,
+        code,
+        signal,
+        error: "",
+        cancelled: solveStartupAbortRequested,
+      });
+    });
+    timeoutId = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        // ignore
+      }
+      finish({ ok: false, error: `process timed out after ${Math.round((Number(options.timeoutMs) || 120000) / 1000)}s`, cancelled: false });
+    }, Math.max(1000, Number(options.timeoutMs) || 120000));
+  });
+}
+
+// Creates (or reuses) a workspace-owned .venv and points the kernel at it.
 // Returns { ok, dir, venvPython } or { ok:false, error }.
 async function prepareKernelWorkspace(dirPath) {
   const dir = path.resolve(String(dirPath ?? ""));
@@ -3459,7 +3611,7 @@ async function prepareKernelWorkspace(dirPath) {
   }
 
   // Detach from any previous solve's kernel + venv before creating the new one.
-  stopKernelProcess();
+  await stopKernelProcessAndWait();
   kernelWorkspaceDir = "";
   kernelVenvPython = "";
 
@@ -3470,17 +3622,30 @@ async function prepareKernelWorkspace(dirPath) {
     : path.join(venvDir, "bin", "python");
 
   try {
-    fsSync.rmSync(venvDir, { recursive: true, force: true });
-    await fs.mkdir(venvDir, { recursive: true });
-    const { spawnSync: venvSpawn } = require("node:child_process");
-    const basePy = getKernelPythonCommand();
-    const created = venvSpawn(basePy.command, [...basePy.args, "-m", "venv", venvDir], {
-      cwd: dir,
-      windowsHide: true,
-      timeout: 120000,
-    });
-    if (!created || created.status !== 0) {
-      return { ok: false, error: `venv creation failed: ${String(created && created.stderr || "").slice(0, 500)}` };
+    setSolveStartupStatus("Preparing kernel workspace...");
+    if (!fsSync.existsSync(venvPython)) {
+      await fs.rm(venvDir, { recursive: true, force: true });
+      if (solveStartupAbortRequested) {
+        return { ok: false, cancelled: true, error: "kernel startup cancelled" };
+      }
+      await fs.mkdir(venvDir, { recursive: true });
+      const basePy = getKernelPythonCommand();
+      setSolveStartupStatus("Launching Kernel: creating workspace .venv...");
+      const created = await runSolveStartupProcess(basePy.command, [...basePy.args, "-m", "venv", venvDir], {
+        cwd: dir,
+        timeoutMs: 120000,
+      });
+      if (!created.ok) {
+        return {
+          ok: false,
+          cancelled: Boolean(created.cancelled),
+          error: created.cancelled
+            ? "kernel startup cancelled"
+            : `venv creation failed: ${String(created.stderr || created.error || "unknown error").slice(0, 500)}`,
+        };
+      }
+    } else {
+      setSolveStartupStatus("Launching Kernel: reusing workspace .venv...");
     }
     if (!fsSync.existsSync(venvPython)) {
       return { ok: false, error: `venv python not found after creation: ${venvPython}` };
@@ -3495,9 +3660,9 @@ async function prepareKernelWorkspace(dirPath) {
 }
 
 // Resolves a /solve argument into a task source.
-//   "/solve <dir>"      -> <dir>/task.md (or README.md) is the task; requirements.txt -> venv
-//   "/solve <file>.md"  -> the file's content is the task
-//   "/solve <inline>"   -> the text is the task
+//   "/solve <dir>" -> <dir>/task.md (or README.md) is the task; requirements.txt -> venv
+// Files and inline task descriptions are deliberately rejected so every solve
+// has an explicit workspace and isolated interpreter.
 // Returns { ok, taskLabel, taskText, workspaceDir, requirementsPath, error }.
 async function loadSolveTaskSource(specText) {
   const raw = String(specText ?? "").trim();
@@ -3506,19 +3671,16 @@ async function loadSolveTaskSource(specText) {
   }
   const candidate = path.isAbsolute(raw) ? raw : path.join(WORKSPACE_ROOT, raw);
   let isDir = false;
-  let isFile = false;
   try {
     isDir = fsSync.existsSync(candidate) && fsSync.statSync(candidate).isDirectory();
   } catch {
     isDir = false;
   }
-  try {
-    isFile = fsSync.existsSync(candidate) && fsSync.statSync(candidate).isFile();
-  } catch {
-    isFile = false;
+  if (!isDir) {
+    return { ok: false, error: `path is not a directory: ${raw}` };
   }
 
-  if (isDir) {
+  {
     const taskMd = path.join(candidate, "task.md");
     const readme = path.join(candidate, "README.md");
     let taskFile = "";
@@ -3559,21 +3721,6 @@ async function loadSolveTaskSource(specText) {
     };
   }
 
-  if (isFile) {
-    let taskText = "";
-    try {
-      taskText = String(await fs.readFile(candidate, "utf8")).trim();
-    } catch (error) {
-      return { ok: false, error: `failed to read ${raw}: ${error?.message || error}` };
-    }
-    if (!taskText) {
-      return { ok: false, error: `task file is empty: ${raw}` };
-    }
-    return { ok: true, taskLabel: raw, taskText, workspaceDir: "", requirementsPath: "" };
-  }
-
-  // Inline description.
-  return { ok: true, taskLabel: raw.slice(0, 60), taskText: raw, workspaceDir: "", requirementsPath: "" };
 }
 
 // Installs requirements.txt into the current kernel venv (if any).
@@ -3591,14 +3738,20 @@ async function installKernelRequirements(requirementsPath) {
   if (!okFile) {
     return { ok: true, installed: false, error: "" };
   }
-  const { spawnSync: pipSpawn } = require("node:child_process");
-  const pip = pipSpawn(kernelVenvPython, ["-m", "pip", "install", "-r", reqFile], {
+  setSolveStartupStatus("Installing requirements.txt...");
+  const pip = await runSolveStartupProcess(kernelVenvPython, ["-m", "pip", "install", "-r", reqFile], {
     cwd: kernelWorkspaceDir || process.cwd(),
-    windowsHide: true,
-    timeout: 600000,
+    timeoutMs: 600000,
   });
-  if (!pip || pip.status !== 0) {
-    return { ok: false, installed: false, error: String(pip && pip.stderr || "").slice(0, 800) };
+  if (!pip.ok) {
+    return {
+      ok: false,
+      installed: false,
+      cancelled: Boolean(pip.cancelled),
+      error: pip.cancelled
+        ? "kernel startup cancelled"
+        : String(pip.stderr || pip.error || "requirements install failed").slice(0, 800),
+    };
   }
   return { ok: true, installed: true, error: "" };
 }
@@ -4045,11 +4198,7 @@ function hasActiveAnswerReveal() {
   return false;
 }
 
-function triggerAnswerReveal(entry) {
-  if (!entry || entry.ephemeral === true || APPEND_CHAT_TO_SCROLLBACK) {
-    return;
-  }
-  entry.revealUntil = Date.now() + ANSWER_REVEAL_MS;
+function ensureAnswerRevealTimer() {
   if (!answerRevealTimer) {
     answerRevealTimer = setInterval(() => {
       if (!hasActiveAnswerReveal()) {
@@ -4074,13 +4223,42 @@ function triggerAnswerReveal(entry) {
   }
 }
 
-const ANSWER_REVEAL_FADE_FROM = 231; // bright white
-const ANSWER_REVEAL_FADE_TO = 243;   // dim gray
-const ANSWER_REVEAL_BULLET_FG = "\u001b[96m";
+function triggerAnswerReveal(entry) {
+  if (!entry || entry.ephemeral === true || APPEND_CHAT_TO_SCROLLBACK) {
+    return;
+  }
+  const isExecuteBlock =
+    entry.role === "assistant" && /```execute(?:\s|$)/i.test(String(entry.content || ""));
+  if (isAssistantThinking() && !isExecuteBlock) {
+    // Hold the initial black reveal frame until the Thinking status actually
+    // collapses. Starting the clock here can consume the whole fade while a
+    // large final response is still being laid out.
+    entry.revealUntil = Number.POSITIVE_INFINITY;
+    pendingAnswerRevealEntries.add(entry);
+    return;
+  }
+  entry.revealUntil = Date.now() + ANSWER_REVEAL_MS;
+  ensureAnswerRevealTimer();
+}
+
+function startPendingAnswerReveals() {
+  if (pendingAnswerRevealEntries.size === 0) {
+    return;
+  }
+  const revealUntil = Date.now() + ANSWER_REVEAL_MS;
+  for (const entry of pendingAnswerRevealEntries) {
+    entry.revealUntil = revealUntil;
+  }
+  pendingAnswerRevealEntries.clear();
+  ensureAnswerRevealTimer();
+}
+
+const ANSWER_REVEAL_FADE_FROM = 232; // near-black xterm grayscale
+const ANSWER_REVEAL_FADE_TO = 252;   // normal light foreground
 
 function applyAnswerRevealStyle(lineText, elapsed) {
-  // Fade progress 0..1: bright white -> dim gray. Returns null once the fade
-  // completes so callers fall back to the normal markdown/code styling.
+  // Fade progress 0..1: black -> normal foreground. Returns null once the
+  // fade completes so callers fall back to normal markdown/code styling.
   const plain = stripAnsiSgr(String(lineText ?? ""));
   if (elapsed >= 1) {
     return null;
@@ -4090,11 +4268,9 @@ function applyAnswerRevealStyle(lineText, elapsed) {
     ANSWER_REVEAL_FADE_FROM + (ANSWER_REVEAL_FADE_TO - ANSWER_REVEAL_FADE_FROM) * progress
   );
   const color = `\u001b[38;5;${colorIndex}m`;
-  let out = `${color}${plain}${RESET_COLOR}`;
-  if (plain.startsWith("\u2022 ")) {
-    out = `${ANSWER_REVEAL_BULLET_FG}\u2022${RESET_COLOR} ${color}${plain.slice(2)}${RESET_COLOR}`;
-  }
-  return out;
+  // Keep the assistant bullet in the same fade instead of revealing it in
+  // cyan immediately; normal per-token styling returns at completion.
+  return `${color}${plain}${RESET_COLOR}`;
 }
 
 function createPendingAssistantMessage(generation) {
@@ -4110,9 +4286,8 @@ function createPendingAssistantMessage(generation) {
   messages.push({ role: "assistant", content: "thinking...", ephemeral: true });
   pendingAssistantMessageIndex = index;
   scrollChatToBottom();
-  forceFullClearOnNextRender = true;
   markDirty();
-  renderFrame(true);
+  renderFrame(false);
   return index;
 }
 
@@ -4247,6 +4422,10 @@ function parseToolArguments(rawArgs) {
 }
 
 function extractAllPythonCodeBlocks(text) {
+  return extractAllPythonCodeBlockEntries(text).map((entry) => entry.code);
+}
+
+function extractAllPythonCodeBlockEntries(text) {
   if (typeof text !== "string" || text.length === 0) {
     return [];
   }
@@ -4259,12 +4438,12 @@ function extractAllPythonCodeBlocks(text) {
     if (!body) {
       continue;
     }
-    blocks.push(body);
+    blocks.push({ code: body, complete: true });
   }
 
   const truncatedTail = extractUnterminatedExecuteTail(text);
   if (truncatedTail) {
-    blocks.push(truncatedTail);
+    blocks.push({ code: truncatedTail, complete: false });
   }
   return blocks;
 }
@@ -4349,9 +4528,8 @@ function buildExecutableCodeForToolCall(toolName, toolArgs) {
 }
 
 async function executeCodeWithPythonTool(code) {
-  const encodedCode = Buffer.from(String(code ?? ""), "utf8").toString("base64");
+  let tempDir = "";
   const runner = `
-import base64
 import asyncio
 import io
 import json
@@ -4359,6 +4537,7 @@ import textwrap
 import traceback
 import ast
 from contextlib import redirect_stdout
+from pathlib import Path
 import sys
 import tools
 
@@ -4377,7 +4556,7 @@ def tracer(frame, event, arg):
             raise RuntimeError("Execution stopped: step limit exceeded")
     return tracer
 
-code = base64.b64decode(sys.argv[1]).decode("utf-8")
+code = Path(sys.argv[1]).read_text(encoding="utf-8")
 scope = {}
 if hasattr(tools, "FUNCTIONS") and isinstance(tools.FUNCTIONS, dict):
     scope.update(tools.FUNCTIONS)
@@ -4450,7 +4629,13 @@ print(json.dumps(result))
 `.trim();
 
   try {
-    const { stdout } = await runPythonCommand(["-c", runner, encodedCode], {
+    // Passing base64 source as argv exceeds Windows' command-line limit for
+    // larger execute blocks. A short-lived UTF-8 file keeps transport size
+    // independent of the generated code length.
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-exec-"));
+    const codePath = path.join(tempDir, "execute.py.txt");
+    await fs.writeFile(codePath, String(code ?? ""), "utf8");
+    const { stdout } = await runPythonCommand(["-c", runner, codePath], {
       timeout: TOOL_EXEC_TIMEOUT_MS,
       maxBuffer: 2 * 1024 * 1024,
     });
@@ -4492,6 +4677,10 @@ print(json.dumps(result))
       editSummaries: [],
       historyActions: [],
     };
+  } finally {
+    if (tempDir) {
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
   }
 }
 
@@ -5031,12 +5220,13 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
         emitStopNotice();
         break;
       }
-      const pythonBlocks = extractAllPythonCodeBlocks(latestAssistantContent);
+      const pythonBlocks = extractAllPythonCodeBlockEntries(latestAssistantContent);
       if (pythonBlocks.length === 0) {
         break;
       }
 
-      for (const pythonCode of pythonBlocks) {
+      for (const pythonBlock of pythonBlocks) {
+        const pythonCode = pythonBlock.code;
         if (stopRequested) {
           break;
         }
@@ -5047,31 +5237,43 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
           ok: false,
         };
         // PreToolUse hook: can block (exit 2) or inject context before a tool run.
-        const preToolRun = await runHooks({
-          eventName: "PreToolUse",
-          matcherValue: "code_execution",
-          input: {
-            tool_name: "code_execution",
-            tool_input: { code: pythonCode },
-          },
-          timeoutMs: 30000,
-        });
         let execResult = null;
-        if (preToolRun.blocked) {
+        if (!pythonBlock.complete) {
           execResult = {
             ok: false,
             output: "",
-            error: `Tool blocked by hook${preToolRun.blockReason ? `: ${preToolRun.blockReason}` : "."}`,
+            error: "Execute block was truncated before its closing fence and was not run. Retry using a smaller, complete execute block.",
             traceback: "",
             editEvents: [],
             editSummaries: [],
             historyActions: [],
           };
         } else {
-          if (preToolRun.additionalContext) {
-            pendingHookContext = preToolRun.additionalContext;
+          const preToolRun = await runHooks({
+            eventName: "PreToolUse",
+            matcherValue: "code_execution",
+            input: {
+              tool_name: "code_execution",
+              tool_input: { code: pythonCode },
+            },
+            timeoutMs: 30000,
+          });
+          if (preToolRun.blocked) {
+            execResult = {
+              ok: false,
+              output: "",
+              error: `Tool blocked by hook${preToolRun.blockReason ? `: ${preToolRun.blockReason}` : "."}`,
+              traceback: "",
+              editEvents: [],
+              editSummaries: [],
+              historyActions: [],
+            };
+          } else {
+            if (preToolRun.additionalContext) {
+              pendingHookContext = preToolRun.additionalContext;
+            }
+            execResult = await executeCodeWithPythonTool(pythonCode);
           }
-          execResult = await executeCodeWithPythonTool(pythonCode);
         }
         if (stopRequested) {
           // User pressed Esc while the process was running: per request,
@@ -5259,6 +5461,7 @@ function queueAssistantReply(modelId) {
       pendingAssistantRequests = Math.max(0, pendingAssistantRequests - 1);
       if (hadPending && pendingAssistantRequests === 0) {
         thinkingStartedAt = 0;
+        startPendingAnswerReveals();
       }
       updateThinkingAnimationState();
       if (hadPending && pendingAssistantRequests === 0) {
@@ -5323,6 +5526,9 @@ function saveSolveSession(session) {
 }
 
 function loadKernelSessions() {
+  const liveRunningSession = runningSolveSessionId
+    ? solveSessions.find((session) => session.id === runningSolveSessionId) || null
+    : null;
   try {
     if (!fsSync.existsSync(KERNELS_DIR)) {
       solveSessions = [];
@@ -5334,7 +5540,7 @@ function loadKernelSessions() {
       try {
         const parsed = JSON.parse(fsSync.readFileSync(path.join(KERNELS_DIR, file), "utf8"));
         if (parsed && typeof parsed.id === "string" && Array.isArray(parsed.entries)) {
-          sessions.push(parsed);
+          sessions.push(liveRunningSession && parsed.id === liveRunningSession.id ? liveRunningSession : parsed);
         }
       } catch {
         // skip broken files
@@ -5416,7 +5622,8 @@ function updateKernelsSelectionState() {
   }
 }
 
-function openSolveBuffer(sessionId) {
+function openSolveBuffer(sessionId, options = {}) {
+  const returnBuffer = options.returnBuffer || (activeBuffer === "kernels" ? "kernels" : "main");
   commandBufferQuery = "";
   input = "";
   inputCursorIndex = 0;
@@ -5425,8 +5632,8 @@ function openSolveBuffer(sessionId) {
   isBracketedPasteActive = false;
   bracketedPasteBuffer = "";
   pasteParserBuffer = "";
-  activeSolveSessionId = sessionId || activeSolveSessionId || (solveSessions[0] && solveSessions[0].id) || null;
-  viewingSolveSessionId = activeSolveSessionId;
+  viewingSolveSessionId = sessionId || viewingSolveSessionId || activeSolveSessionId || (solveSessions[0] && solveSessions[0].id) || null;
+  solveReturnBuffer = returnBuffer === "kernels" ? "kernels" : "main";
   solveScrollOffset = 0;
   forceFullClearOnNextRender = true;
   cancelIdleFlush();
@@ -5436,16 +5643,24 @@ function openSolveBuffer(sessionId) {
 }
 
 function closeSolveBuffer() {
-  exitAltScreenIfNeeded();
-  activeBuffer = "main";
-  forceFullClearOnNextRender = true;
+  if (solveReturnBuffer === "kernels") {
+    activeBuffer = "kernels";
+    // solveSessions is updated live. Re-reading every saved transcript here
+    // makes Escape progressively slower as kernel histories grow.
+    updateKernelsSelectionState();
+  } else {
+    exitAltScreenIfNeeded({ preserveRestoredScreen: true });
+    activeBuffer = "main";
+  }
+  forceFullClearOnNextRender = false;
   cancelIdleFlush();
   burstMode = false;
   markDirty();
-  renderFrame(true);
+  renderFrame(false);
 }
 
 function openKernelsBuffer() {
+  const reuseAltScreen = altScreenActive;
   loadKernelSessions();
   commandBufferQuery = "";
   input = "";
@@ -5457,7 +5672,9 @@ function openKernelsBuffer() {
   pasteParserBuffer = "";
   kernelsSelected = 0;
   kernelsScroll = 0;
-  forceFullClearOnNextRender = true;
+  // Kernel rows cover the full screen, so a direct command-buffer transition
+  // can overwrite in place without flashing a blank alternate screen.
+  forceFullClearOnNextRender = !reuseAltScreen;
   cancelIdleFlush();
   burstMode = false;
   markDirty();
@@ -5465,11 +5682,54 @@ function openKernelsBuffer() {
 }
 
 function closeKernelsBuffer() {
-  exitAltScreenIfNeeded();
+  exitAltScreenIfNeeded({ preserveRestoredScreen: true });
   activeBuffer = "main";
-  forceFullClearOnNextRender = true;
   cancelIdleFlush();
   burstMode = false;
+  markDirty();
+  renderFrame(false);
+}
+
+function getViewedSolveSession() {
+  if (viewingSolveSessionId) {
+    const found = solveSessions.find((s) => s.id === viewingSolveSessionId);
+    if (found) {
+      return found;
+    }
+  }
+  return getActiveSolveSession();
+}
+
+function stopRunningSolve() {
+  if (!solveActive) {
+    return;
+  }
+  solveAbortRequested = true;
+  solveLastStatus = "Stopping...";
+  solveRequestAbortController?.abort();
+  stopKernelProcess();
+  markDirty();
+  renderFrame(true);
+}
+
+async function runSelectedKernelSession(mode) {
+  const session = solveSessions[kernelsSelected];
+  if (!session) {
+    return;
+  }
+  const restart = mode === "restart";
+  const result = await runSolveSessionLifecycle(session, {
+    restart,
+    resume: !restart,
+  });
+  if (!result.ok && !result.cancelled) {
+    solveSessionAppend(
+      session,
+      "tool",
+      `${restart ? "Restart" : "Resume"} failed: ${result.error || "unknown error"}`,
+      { name: restart ? "kernel_restart" : "kernel_resume", toolOk: false }
+    );
+  }
   markDirty();
   renderFrame(true);
 }
@@ -5508,7 +5768,7 @@ function renderKernelsBuffer() {
   setRow(0, `Kernel sessions (${solveSessions.length})`);
 
   if (solveSessions.length === 0) {
-    setRow(2, "no solve sessions yet - run /solve <task>", PLACEHOLDER_COLOR);
+    setRow(2, "no solve sessions yet - run /solve <directory>", PLACEHOLDER_COLOR);
   } else {
     const end = Math.min(solveSessions.length, kernelsScroll + visibleCount);
     for (let i = kernelsScroll; i < end; i += 1) {
@@ -5517,7 +5777,16 @@ function renderKernelsBuffer() {
       const marker = i === kernelsSelected ? "●" : "○";
       const idShort = String(session.id || "").slice(0, 8);
       const taskPreview = String(session.task || "").slice(0, 30);
-      const status = session.solved ? "solved" : session.entries.length > 1 ? "attempted" : "new";
+      const isCurrentSession = session.id === (runningSolveSessionId || (solveStartupActive ? activeSolveSessionId : null));
+      const status = isCurrentSession && solveStartupActive
+        ? "starting"
+        : isCurrentSession && solveActive
+          ? "running"
+          : session.solved
+            ? "solved"
+            : session.entries.length > 1
+              ? "attempted"
+              : "new";
       const when = new Date(Number(session.updatedAt) || 0);
       const whenText = Number.isNaN(when.getTime())
         ? ""
@@ -5532,7 +5801,12 @@ function renderKernelsBuffer() {
       }
     }
   }
-  setRow(rows - 1, "Enter: view  Del: delete  Esc: return", PLACEHOLDER_COLOR);
+  if (solveStartupActive) {
+    const frame = SPINNER_FRAMES[spinnerFrameIndex % SPINNER_FRAMES.length];
+    setRow(rows - 1, `${frame} ${solveStartupStatus || "Launching Kernel..."}  Esc: cancel`, BLUE_COLOR);
+  } else {
+    setRow(rows - 1, "Enter: view  R: resume  F5: restart  S: stop running  Del: delete  Esc: return", PLACEHOLDER_COLOR);
+  }
 
   for (let y = 0; y < rows; y += 1) {
     const nextRow = frameRows[y];
@@ -5553,7 +5827,8 @@ function renderSolveBuffer() {
   process.stdout.write(HIDE_CURSOR);
   const rows = process.stdout.rows || 24;
   const cols = process.stdout.columns || 80;
-  const session = getActiveSolveSession();
+  const session = getViewedSolveSession();
+  const viewingRunningSession = Boolean(session && solveActive && session.id === runningSolveSessionId);
 
   if (!hasInitializedScreen) {
     readline.cursorTo(process.stdout, 0, 0);
@@ -5571,14 +5846,14 @@ function renderSolveBuffer() {
   const header1 = `Solve ${idShort} - ${taskPreview}`;
   writeColoredLine(0, header1, cols, TOKEN_COLOR);
   let statusText = "";
-  if (solveActive) {
-    statusText = `Status: ${solveLastStatus || "working..."} (iteration ${solveIteration}/${SOLVE_MAX_ITERATIONS}) - Esc aborts`;
+  if (viewingRunningSession) {
+    statusText = `Status: ${solveLastStatus || "working..."} (iteration ${getSolveIterationLabel()}) - Esc backgrounds, S stops`;
   } else if (session) {
     const endState = session.solved ? "SOLVE_OK reached" : session.abortRequested ? "aborted" : "unsolved";
     statusText = `Status: ${endState} - Esc returns`;
   }
   if (statusText) {
-    writeColoredLine(1, statusText, cols, solveActive ? BLUE_COLOR : PLACEHOLDER_COLOR);
+    writeColoredLine(1, statusText, cols, viewingRunningSession ? BLUE_COLOR : PLACEHOLDER_COLOR);
   }
 
   // Body: reuse the exact chat transcript renderer so reasoning traces,
@@ -5619,19 +5894,20 @@ function renderSolveBuffer() {
         }
       }
     }
-  } else if (!solveActive) {
+  } else if (!viewingRunningSession) {
     writeColoredLine(bodyTop, "waiting for first program...", cols, PLACEHOLDER_COLOR);
   }
 
   const scrollHint = total > bodyHeight ? "  PgUp/PgDn scroll" : "";
-  writeColoredLine(rows - 1, "Esc: return" + scrollHint, cols, PLACEHOLDER_COLOR);
+  const solveHint = viewingRunningSession ? "Esc: background  S: stop" : "Esc: return";
+  writeColoredLine(rows - 1, solveHint + scrollHint, cols, PLACEHOLDER_COLOR);
   dirty = false;
 }
 function getSolveStatusText() {
   if (!solveActive) {
     return "";
   }
-  return `Solving (iteration ${solveIteration}/${SOLVE_MAX_ITERATIONS}): ${solveLastStatus || "working..."}`;
+  return `Solving (iteration ${getSolveIterationLabel()}): ${solveLastStatus || "working..."}`;
 }
 
 function extractRawCodeFromReply(text) {
@@ -5738,48 +6014,108 @@ async function runSolveLoop(taskText) {
   }
 
   const solveSystem = [
-    "You are solving a task by writing a Python program.",
+    "You are solving a task by sending Python snippets to one persistent Python kernel.",
     `TASK: ${taskText}`,
     "",
-    "RULES:",
-    "- Write a complete Python program as one code block. It will be executed in a persistent kernel (state carries between iterations).",
-    "- The program must verify its own solution where possible.",
+    "PERSISTENT KERNEL RULES:",
+    "- The same Python process and global scope are reused for every iteration in this solve session.",
+    "- Imports, variables, functions, classes, clients, environments, and other objects created by successful earlier snippets remain available.",
+    "- Never repeat setup code that has already run successfully. Do not recreate clients, environments, imports, or helper definitions merely because a new iteration began.",
+    "- On the first iteration, send the minimal setup snippet. On later iterations, send only the incremental code needed for the next observation, action, check, or repair.",
+    "- If a previous snippet failed, statements before the exception may already have changed persistent state; inspect or repair that state instead of blindly rerunning everything.",
+    "- You will see your earlier snippets and outputs in this conversation. Refer to existing variables and functions directly.",
+    "- Output exactly one Python code block and no prose.",
+    "- Each snippet must verify its result where possible.",
     `- When the program has validated the solution, print exactly the line: ${SOLVE_OK_SENTINEL}`,
     "- Keep programs focused; use the kernel’s persistent state to avoid recomputing.",
-    "- After each iteration you will receive the program's stdout/stderr. Fix failures and iterate.",
+    "- After each iteration you will receive stdout/stderr. Reuse persistent state, fix failures incrementally, and continue.",
   ].join("\n");
 
   solveIteration = 0;
-  solveLastStatus = "asking for program";
+  solveLastStatus = "Thinking...";
   const requestWithTimeout = async (messagesForRequest, options = {}) => {
     const payload = { model: resolvedModel, messages: messagesForRequest };
     if (getReasoningEnabledForModel(resolvedModel)) {
       payload.reasoning = { enabled: true };
     }
-    const requestPromise = client.chat.completions.create(payload);
+    const controller = new AbortController();
+    solveRequestAbortController = controller;
+    const requestPromise = client.chat.completions.create(payload, { signal: controller.signal });
     let timeoutId = null;
-    const timeoutSeconds = Number(options?.timeoutSeconds) || 120;
+    const configuredTimeoutMs = Math.max(getLlmRequestTimeoutMs(), SOLVE_REQUEST_MIN_TIMEOUT_MS);
+    const timeoutMs = Math.max(10000, Number(options?.timeoutMs) || configuredTimeoutMs);
     const timeoutPromise = new Promise((_, reject) => {
       timeoutId = setTimeout(
-        () => reject(new Error(`Request timed out after ${timeoutSeconds}s`)),
-        timeoutSeconds * 1000
+        () => {
+          controller.abort();
+          reject(new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s`));
+        },
+        timeoutMs
       );
     });
     try {
       return await Promise.race([requestPromise, timeoutPromise]);
     } finally {
+      if (solveRequestAbortController === controller) {
+        solveRequestAbortController = null;
+      }
       if (timeoutId) {
         clearTimeout(timeoutId);
       }
     }
   };
 
-  const firstRequest = await requestWithTimeout(
-    [
-      { role: "system", content: solveSystem },
-      { role: "user", content: "Write the first version of the program now. Only output the code block." },
-    ],
-    {}
+  const requestWithRetry = async (messagesForRequest, phaseLabel) => {
+    let attempt = 0;
+    for (;;) {
+      if (solveAbortRequested || stopRequested) {
+        throw new Error("solve aborted by user");
+      }
+      attempt += 1;
+      solveLastStatus = attempt > 1
+        ? `Thinking... retry ${attempt} (${phaseLabel})`
+        : `Thinking... ${phaseLabel}`;
+      markDirty();
+      renderFrame(true);
+      try {
+        return await requestWithTimeout(messagesForRequest);
+      } catch (error) {
+        if (solveAbortRequested || stopRequested) {
+          throw new Error("solve aborted by user");
+        }
+        const message = String(error?.message || error);
+        const retryable =
+          /timed?\s*out|timeout|abort|429|rate.?limit|\b5\d\d\b|econn|network|fetch failed|socket/i.test(message);
+        if (!retryable) {
+          throw error;
+        }
+        solveLastStatus = `Request failed (${message.slice(0, 80)}); retrying...`;
+        if (session) {
+          solveSessionAppend(session, "tool", `Model request failed during ${phaseLabel}; retrying (attempt ${attempt + 1}): ${message}`, {
+            name: "kernel_model_retry",
+            toolOk: false,
+          });
+        }
+        markDirty();
+        renderFrame(true);
+        const retryDelayMs = Math.min(10000, 1000 * attempt);
+        for (let waited = 0; waited < retryDelayMs; waited += 250) {
+          if (solveAbortRequested || stopRequested) {
+            throw new Error("solve aborted by user");
+          }
+          await new Promise((resolve) => setTimeout(resolve, Math.min(250, retryDelayMs - waited)));
+        }
+      }
+    }
+  };
+
+  const solveConversation = [
+    { role: "system", content: solveSystem },
+    { role: "user", content: "Initialize only what is not already present in the persistent kernel, then take the first useful step. Output only one Python code block." },
+  ];
+  const firstRequest = await requestWithRetry(
+    solveConversation,
+    "initial program"
   );
   let lastReply = extractAssistantText(firstRequest?.choices?.[0]?.message?.content);
   let lastReasoning = normalizeReasoningDetails(
@@ -5794,6 +6130,9 @@ async function runSolveLoop(taskText) {
     });
     lastReply = payload.text;
   }
+  if (lastReply.trim()) {
+    solveConversation.push({ role: "assistant", content: lastReply });
+  }
   if (session) {
     // The first model reply's reasoning trace rides on the assistant entry
     // (exactly like chat), so buildChatVisualLines renders the ◦ block above
@@ -5802,26 +6141,30 @@ async function runSolveLoop(taskText) {
     void lastReasoning;
   }
 
-  for (let iter = 1; iter <= SOLVE_MAX_ITERATIONS; iter += 1) {
+  for (let iter = 1; SOLVE_MAX_ITERATIONS <= 0 || iter <= SOLVE_MAX_ITERATIONS; iter += 1) {
     if (solveAbortRequested || stopRequested) {
       return false;
     }
     solveIteration = iter;
-    solveLastStatus = `running program (iter ${iter})`;
+    solveLastStatus = `Running Kernel... (iter ${iter})`;
     markDirty();
     renderFrame(true);
 
     const code = extractRawCodeFromReply(lastReply);
     if (!code.trim()) {
       solveLastStatus = "no code in reply";
-      const repair = await requestWithTimeout(
-        [
-          { role: "system", content: solveSystem },
-          { role: "user", content: "Your previous reply contained no Python code. Output only the program code block." },
-        ],
-        {}
+      solveConversation.push({
+        role: "user",
+        content: "Your previous reply contained no Python code. Reuse the persistent kernel state and output only the next incremental Python code block.",
+      });
+      const repair = await requestWithRetry(
+        solveConversation,
+        "code repair"
       );
       lastReply = extractAssistantText(repair?.choices?.[0]?.message?.content) || "";
+      if (lastReply.trim()) {
+        solveConversation.push({ role: "assistant", content: lastReply });
+      }
       iter -= 1;
       continue;
     }
@@ -5848,8 +6191,8 @@ async function runSolveLoop(taskText) {
     if (solveAbortRequested || stopRequested) {
       return false;
     }
-    const stdoutText = String(kernelResult?.output || "");
-    const stderrText = String(kernelResult?.error || "");
+    const stdoutText = sanitizeTerminalOutput(kernelResult?.output || "");
+    const stderrText = sanitizeTerminalOutput(kernelResult?.error || "");
     const gotSolvedMarker = stdoutText.includes(SOLVE_OK_SENTINEL);
 
     if (session) {
@@ -5874,7 +6217,7 @@ async function runSolveLoop(taskText) {
       solveLastStatus = stderrText ? "program error" : "program ran (no SOLVE_OK)";
     }
 
-    if (iter >= SOLVE_MAX_ITERATIONS) {
+    if (SOLVE_MAX_ITERATIONS > 0 && iter >= SOLVE_MAX_ITERATIONS) {
       break;
     }
 
@@ -5886,17 +6229,17 @@ ${stdoutText.slice(0, 4000)}` : "STDOUT: (empty)",
       stderrText ? `STDERR:
 ${stderrText.slice(0, 3000)}` : "STDERR: (none)",
       "",
-      "Write the next version of the program. Fix the failures. Only output the code block.",
+      "The previous snippet has already executed in the persistent kernel.",
+      "Do not repeat successful setup, imports, definitions, client creation, or environment creation.",
+      "Write only the next incremental Python snippet. Fix errors using the state that already exists. Output one code block and no prose.",
     ].join("\n");
-    solveLastStatus = `waiting for revision (iter ${iter})`;
+    solveConversation.push({ role: "user", content: feedback });
+    solveLastStatus = `Thinking... revision ${iter + 1}`;
     markDirty();
     renderFrame(true);
-    const iterationRequest = await requestWithTimeout(
-      [
-        { role: "system", content: solveSystem },
-        { role: "user", content: feedback },
-      ],
-      {}
+    const iterationRequest = await requestWithRetry(
+      solveConversation,
+      `revision ${iter + 1}`
     );
     let nextReply = extractAssistantText(iterationRequest?.choices?.[0]?.message?.content);
     const nextReasoning = normalizeReasoningDetails(
@@ -5909,6 +6252,9 @@ ${stderrText.slice(0, 3000)}` : "STDERR: (none)",
       nextReply = payload.text;
     }
     lastReply = nextReply || "";
+    if (lastReply.trim()) {
+      solveConversation.push({ role: "assistant", content: lastReply });
+    }
     if (nextReasoning) {
       lastReasoning = nextReasoning;
     }
@@ -5920,6 +6266,143 @@ ${stderrText.slice(0, 3000)}` : "STDERR: (none)",
     }
   }
   return Boolean(solveLastStatus && solveLastStatus.includes("SOLVE_OK"));
+}
+
+async function runSolveSessionLifecycle(session, options = {}) {
+  if (!session || !session.workspaceDir) {
+    return { ok: false, error: "saved kernel session has no workspace or task" };
+  }
+  if (solveActive || solveStartupActive) {
+    return { ok: false, error: "another kernel is already running or starting" };
+  }
+
+  const restart = options.restart === true;
+  solveStartupActive = true;
+  solveStartupAbortRequested = false;
+  solveStartupStatus = "Preparing solve workspace...";
+  thinkingStartedAt = Date.now();
+  activeSolveSessionId = session.id;
+  viewingSolveSessionId = session.id;
+  markDirty();
+  updateThinkingAnimationState();
+  renderFrame(true);
+
+  try {
+    const source = await loadSolveTaskSource(session.workspaceDir);
+    if (!source.ok) {
+      return { ok: false, error: source.error || "could not reload workspace task" };
+    }
+    session.taskFull = source.taskText;
+    session.task = source.taskLabel;
+    session.requirementsPath = source.requirementsPath || "";
+    const prep = await prepareKernelWorkspace(session.workspaceDir);
+    if (!prep.ok) {
+      return { ok: false, cancelled: Boolean(prep.cancelled), error: prep.error || "venv preparation failed" };
+    }
+    session.venvReady = true;
+    session.venvError = "";
+
+    if (session.requirementsPath) {
+      const installed = await installKernelRequirements(session.requirementsPath);
+      if (!installed.ok) {
+        session.venvError = installed.error || "requirements install failed";
+        return {
+          ok: false,
+          cancelled: Boolean(installed.cancelled),
+          error: session.venvError,
+        };
+      }
+    }
+    if (solveStartupAbortRequested) {
+      return { ok: false, cancelled: true, error: "kernel startup cancelled" };
+    }
+
+    setSolveStartupStatus("Launching Kernel...");
+    const probe = await kernelExec("pass");
+    if (!probe.ok) {
+      return { ok: false, error: probe.error || "kernel process failed to start" };
+    }
+    if (solveStartupAbortRequested) {
+      await kernelReset();
+      return { ok: false, cancelled: true, error: "kernel startup cancelled" };
+    }
+
+    if (restart) {
+      resetSolveSessionForRestart(session);
+    } else if (options.resume === true) {
+      solveSessionAppend(session, "tool", "Resuming saved kernel session in a fresh persistent process.", {
+        name: "kernel_resume",
+        toolOk: true,
+      });
+    }
+    solveSessionAppend(
+      session,
+      "tool",
+      `Kernel workspace ready: ${session.workspaceDir} (${session.requirementsPath ? "requirements installed" : "no requirements"})`,
+      { name: "kernel_start", toolOk: true }
+    );
+    session.updatedAt = Date.now();
+    saveSolveSession(session);
+
+    solveStartupActive = false;
+    solveStartupStatus = "";
+    thinkingStartedAt = 0;
+    solveActive = true;
+    runningSolveSessionId = session.id;
+    solveAbortRequested = false;
+    stopRequested = false;
+    solveIteration = 0;
+    solveLastStatus = "Thinking...";
+    openSolveBuffer(session.id);
+
+    let solved = false;
+    let solveError = "";
+    try {
+      solved = await runSolveLoop(session.taskFull);
+    } catch (error) {
+      if (!solveAbortRequested && !stopRequested) {
+        solveError = String(error?.message || error);
+        solveSessionAppend(session, "tool", `Solve loop failed: ${solveError}`, {
+          name: "kernel_solve",
+          toolOk: false,
+        });
+      }
+    } finally {
+      solveActive = false;
+      runningSolveSessionId = null;
+      session.solved = Boolean(solved);
+      session.abortRequested = Boolean(solveAbortRequested);
+      session.updatedAt = Date.now();
+      saveSolveSession(session);
+      updateThinkingAnimationState();
+      markDirty();
+      renderFrame(true);
+    }
+    return solveError
+      ? { ok: false, error: solveError, solved: false }
+      : { ok: true, solved: Boolean(solved) };
+  } finally {
+    solveStartupChild = null;
+    if (solveStartupActive) {
+      solveStartupActive = false;
+      solveStartupStatus = "";
+      thinkingStartedAt = 0;
+      updateThinkingAnimationState();
+      markDirty();
+      renderFrame(true);
+    }
+  }
+}
+
+function resetSolveSessionForRestart(session) {
+  if (!session) {
+    return;
+  }
+  session.entries = [{ role: "user", content: String(session.taskFull || ""), ts: Date.now() }];
+  session.iterations = 0;
+  session.solved = false;
+  session.abortRequested = false;
+  session.updatedAt = Date.now();
 }
 
 function shouldBlockPastedInput(text) {
@@ -6263,6 +6746,22 @@ function wrapLineWithPrefixes(text, firstPrefix, continuationPrefix, cols) {
 
 function stripAnsiSgr(text) {
   return String(text ?? "").replace(/\u001b\[[0-9;]*m/g, "");
+}
+
+function sanitizeTerminalOutput(text) {
+  return String(text ?? "")
+    // OSC: window titles, hyperlinks, clipboard operations, etc.
+    .replace(/\u001b\][\s\S]*?(?:\u0007|\u001b\\)/g, "")
+    // DCS/SOS/PM/APC string commands terminated by ST.
+    .replace(/\u001b[P^_X][\s\S]*?\u001b\\/g, "")
+    // CSI commands: colors, cursor movement, erase screen/line, scrolling.
+    .replace(/(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/g, "")
+    // Remaining single-character ESC commands.
+    .replace(/\u001b[@-_]/g, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    // Remove terminal C0 controls while retaining tab and newline.
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "");
 }
 
 function isVisualBlankLine(line) {
@@ -7364,15 +7863,15 @@ async function runSlashCommand(commandName, commandArgs = "") {
   if (commandName === "/solve") {
     const specText = String(commandArgs ?? "").trim();
     if (!specText) {
-      appendTuiErrorMessage("/solve", "invalid usage. Use '/solve <task description>', '/solve <task.md>', or '/solve <dir>'");
+      appendTuiErrorMessage("/solve", "invalid usage. Use '/solve <directory>'");
       return true;
     }
-    if (solveActive) {
+    if (solveActive || solveStartupActive) {
       appendTuiErrorMessage("/solve", "failed because another /solve loop is already running");
       return true;
     }
-    // Resolve the task source: inline text, a .md file, or a directory
-    // workspace containing task.md (+ optional requirements.txt).
+    // Resolve the directory workspace containing task.md (or README.md) and
+    // an optional requirements.txt.
     const source = await loadSolveTaskSource(specText);
     if (!source.ok) {
       appendTuiErrorMessage("/solve", `failed: ${source.error || "could not load task source"}`);
@@ -7381,25 +7880,8 @@ async function runSlashCommand(commandName, commandArgs = "") {
     const taskText = source.taskText;
     const taskLabel = source.taskLabel;
 
-    // Prepare a per-solve venv when the task came from a directory.
-    let workspaceDir = source.workspaceDir || "";
-    let requirementsPath = source.requirementsPath || "";
-    let venvReady = false;
-    let venvError = "";
-    if (workspaceDir) {
-      const prep = await prepareKernelWorkspace(workspaceDir);
-      if (!prep.ok) {
-        venvError = String(prep.error || "venv preparation failed");
-      } else {
-        venvReady = true;
-        if (requirementsPath) {
-          const inst = await installKernelRequirements(requirementsPath);
-          if (!inst.ok) {
-            venvError = String(inst.error || "requirements install failed");
-          }
-        }
-      }
-    }
+    const workspaceDir = source.workspaceDir || "";
+    const requirementsPath = source.requirementsPath || "";
 
     // Dedicated solve session: output goes to its own transcript window, not
     // the main chat. The session is persisted under ~/.nexus/kernels/.
@@ -7409,8 +7891,8 @@ async function runSlashCommand(commandName, commandArgs = "") {
       taskFull: taskText,
       workspaceDir,
       requirementsPath,
-      venvReady,
-      venvError,
+      venvReady: false,
+      venvError: "",
       solved: false,
       abortRequested: false,
       createdAt: Date.now(),
@@ -7418,44 +7900,21 @@ async function runSlashCommand(commandName, commandArgs = "") {
       iterations: 0,
       entries: [{ role: "user", content: taskText, ts: Date.now() }],
     };
-    if (venvReady) {
-      session.entries.push({
-        role: "tool",
-        content: `Kernel workspace: ${workspaceDir} (venv ${
-          requirementsPath ? "with requirements installed" : "without requirements"
-        })`,
-        ts: Date.now(),
-      });
-    } else if (venvError) {
-      session.entries.push({
-        role: "tool",
-        content: `Kernel workspace venv error: ${venvError}`,
-        ts: Date.now(),
-      });
-    }
     solveSessions.unshift(session);
     saveSolveSession(session);
     activeSolveSessionId = session.id;
     viewingSolveSessionId = session.id;
     solveScrollOffset = 0;
 
-    solveActive = true;
-    solveAbortRequested = false;
-    solveIteration = 0;
-    solveLastStatus = "starting";
-    // Ensure the kernel spawns fresh against the new workspace + venv.
-    stopKernelProcess();
-    openSolveBuffer(session.id);
-
-    const solved = await runSolveLoop(taskText);
-
-    solveActive = false;
-    session.solved = Boolean(solved);
-    session.abortRequested = Boolean(solveAbortRequested);
-    session.updatedAt = Date.now();
-    saveSolveSession(session);
-    markDirty();
-    renderFrame(true);
+    const launched = await runSolveSessionLifecycle(session);
+    if (!launched.ok) {
+      session.venvError = launched.error || "kernel startup failed";
+      session.updatedAt = Date.now();
+      saveSolveSession(session);
+      if (!launched.cancelled) {
+        appendTuiErrorMessage("/solve", `failed: ${session.venvError}`);
+      }
+    }
 
     // After the loop, remain in the solve window (Esc/Enter returns to
     // /kernels list). Main chat is untouched.
@@ -7463,7 +7922,6 @@ async function runSlashCommand(commandName, commandArgs = "") {
   }
 
   if (commandName === "/kernels") {
-    loadKernelSessions();
     openKernelsBuffer();
     return true;
   }
@@ -7581,7 +8039,10 @@ function openCommandBuffer(initialQuery = "") {
 function closeCommandBuffer(options = {}) {
   const restoreInput =
     typeof options.restoreInput === "string" ? options.restoreInput : "";
-  exitAltScreenIfNeeded();
+  const transitionToAltBuffer = options.transitionToAltBuffer === true;
+  if (!transitionToAltBuffer) {
+    exitAltScreenIfNeeded({ preserveRestoredScreen: true });
+  }
   activeBuffer = "main";
   commandBufferQuery = "";
   isBracketedPasteActive = false;
@@ -7595,11 +8056,28 @@ function closeCommandBuffer(options = {}) {
   commandMenuDismissed = false;
   commandMenuSelected = 0;
   commandMenuScroll = 0;
-  forceFullClearOnNextRender = true;
   cancelIdleFlush();
   burstMode = false;
+  if (transitionToAltBuffer) {
+    // The destination buffer will paint the already-active alternate screen.
+    // Avoid briefly restoring and rendering the main chat between buffers.
+    dirty = false;
+    return;
+  }
   markDirty();
-  renderFrame(true);
+  renderFrame(false);
+}
+
+function shouldTransitionCommandDirectlyToAltBuffer(commandName) {
+  const normalized = String(commandName || "").toLowerCase();
+  if (
+    normalized === "/kernels" ||
+    normalized === "/providers" ||
+    normalized === "/model"
+  ) {
+    return true;
+  }
+  return normalized === "/resume" && pendingAssistantRequests === 0;
 }
 
 function openModelBuffer() {
@@ -7645,6 +8123,7 @@ function closeModelBuffer() {
 }
 
 function openSessionsBuffer() {
+  const reuseAltScreen = altScreenActive;
   commandBufferQuery = "";
   lastCommandRenderedRows = [];
   lastCommandRenderedCols = 0;
@@ -7665,7 +8144,7 @@ function openSessionsBuffer() {
   lastSessionsRenderedRows = [];
   lastSessionsRenderedCols = 0;
   lastSessionsRenderedHeight = 0;
-  forceFullClearOnNextRender = true;
+  forceFullClearOnNextRender = !reuseAltScreen;
   cancelIdleFlush();
   burstMode = false;
   markDirty();
@@ -7673,8 +8152,8 @@ function openSessionsBuffer() {
   loadSessionFiles();
 }
 
-function closeSessionsBuffer() {
-  exitAltScreenIfNeeded();
+function closeSessionsBuffer(options = {}) {
+  exitAltScreenIfNeeded({ preserveRestoredScreen: true });
   activeBuffer = "main";
   if (APPEND_CHAT_TO_SCROLLBACK) {
     appendTranscriptNow({ replay: true });
@@ -7682,11 +8161,10 @@ function closeSessionsBuffer() {
   lastSessionsRenderedRows = [];
   lastSessionsRenderedCols = 0;
   lastSessionsRenderedHeight = 0;
-  forceFullClearOnNextRender = true;
   cancelIdleFlush();
   burstMode = false;
   markDirty();
-  renderFrame(true);
+  renderFrame(options.refreshChat === true);
 }
 
 function getProvidersVisibleCount() {
@@ -7717,6 +8195,7 @@ function updateProvidersSelectionState() {
 }
 
 function openProvidersBuffer() {
+  const reuseAltScreen = altScreenActive;
   commandBufferQuery = "";
   lastCommandRenderedRows = [];
   lastCommandRenderedCols = 0;
@@ -7738,7 +8217,7 @@ function openProvidersBuffer() {
   lastProvidersRenderedRows = [];
   lastProvidersRenderedCols = 0;
   lastProvidersRenderedHeight = 0;
-  forceFullClearOnNextRender = true;
+  forceFullClearOnNextRender = !reuseAltScreen;
   cancelIdleFlush();
   burstMode = false;
   markDirty();
@@ -7747,16 +8226,15 @@ function openProvidersBuffer() {
 }
 
 function closeProvidersBuffer() {
-  exitAltScreenIfNeeded();
+  exitAltScreenIfNeeded({ preserveRestoredScreen: true });
   activeBuffer = "main";
   lastProvidersRenderedRows = [];
   lastProvidersRenderedCols = 0;
   lastProvidersRenderedHeight = 0;
-  forceFullClearOnNextRender = true;
   cancelIdleFlush();
   burstMode = false;
   markDirty();
-  renderFrame(true);
+  renderFrame(false);
 }
 
 function getLoopsVisibleCount() {
@@ -8440,12 +8918,13 @@ function getDiffBackgroundColor(toolLineText) {
 
 function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80) {
   const role = typeof entry?.role === "string" ? entry.role : "assistant";
-  const message =
+  const rawMessage =
     role === "tool" && typeof entry?.uiContent === "string"
       ? entry.uiContent
       : typeof entry?.content === "string"
         ? entry.content
         : "";
+  const message = sanitizeTerminalOutput(rawMessage);
   const contentWidth = Math.max(1, Number(cols) || 80);
   let logicalLines = message.replace(/\r/g, "\n").split("\n");
   let logicalLineMeta = logicalLines.map((line) => ({ text: line, python: false, fence: false }));
@@ -8776,13 +9255,12 @@ function getStatusBarText() {
     return `${frame} ${applyShineEffect(text, shineFrameIndex, 8)}`;
   }
 
-  // Solve loop status takes priority when a /solve is running, even between
-  // LLM calls (so the user can see iteration progress + know Esc aborts).
-  if (solveActive) {
-    const solveText = getSolveStatusText();
-    if (solveText) {
-      return `${SPINNER_FRAMES[spinnerFrameIndex % SPINNER_FRAMES.length]} ${solveText}`;
-    }
+  if (solveStartupActive) {
+    const frame = SPINNER_FRAMES[spinnerFrameIndex % SPINNER_FRAMES.length];
+    const elapsed = thinkingStartedAt > 0
+      ? Math.max(0, Math.floor((Date.now() - thinkingStartedAt) / 1000))
+      : 0;
+    return `${frame} ${solveStartupStatus || "Launching Kernel..."} (${elapsed}s) - Esc cancels`;
   }
 
   if (!isAssistantThinking()) {
@@ -8832,10 +9310,61 @@ function applyShineEffect(text, frameIndex, windowWidth) {
   return `${out}${SHINE_RESET}`;
 }
 
+function isStatusAnimationNeeded() {
+  if (activeBuffer === "main") {
+    return isAssistantThinking() || isMcpStartupStatusVisible() || solveStartupActive;
+  }
+  if (activeBuffer === "kernels") {
+    return solveStartupActive;
+  }
+  // The solve viewer has no animated status glyph. It repaints only when
+  // transcript/status data changes or the user scrolls.
+  return false;
+}
+
+function renderAnimatedStatusOnly() {
+  if (
+    APPEND_CHAT_TO_SCROLLBACK ||
+    activeBuffer !== "main" ||
+    dirty ||
+    forceFullClearOnNextRender ||
+    !hasInitializedScreen ||
+    !lastStatusVisible ||
+    lastStatusTop === null ||
+    lastStatusHeight <= 0
+  ) {
+    return false;
+  }
+
+  const statusText = getStatusBarText();
+  if (!statusText) {
+    return false;
+  }
+  const rows = process.stdout.rows || 24;
+  const cols = process.stdout.columns || 80;
+  const statusRow = Math.max(
+    0,
+    Math.min(rows - 1, lastStatusTop + STATUS_CHAT_GAP + STATUS_BAR_ROWS - 1)
+  );
+  const visibleLength = stripAnsiSgr(statusText).length;
+  const padding = visibleLength < cols ? " ".repeat(cols - visibleLength) : "";
+  const cursorPosition = `\u001b[${statusRow + 1};1H`;
+  process.stdout.write(
+    `${SAVE_CURSOR}${cursorPosition}${PLACEHOLDER_COLOR}${statusText}${RESET_COLOR}${padding}${RESTORE_CURSOR}`
+  );
+  return true;
+}
+
+function renderStatusAnimationTick() {
+  if (renderAnimatedStatusOnly()) {
+    return;
+  }
+  markDirty();
+  renderFrame(false);
+}
+
 function updateThinkingAnimationState() {
-  const shouldAnimate =
-    activeBuffer === "main" &&
-    (isAssistantThinking() || isMcpStartupStatusVisible());
+  const shouldAnimate = isStatusAnimationNeeded();
 
   if (!shouldAnimate) {
     if (thinkingAnimationTimer) {
@@ -8858,7 +9387,7 @@ function updateThinkingAnimationState() {
 
   if (!thinkingAnimationTimer) {
     thinkingAnimationTimer = setInterval(() => {
-      if (activeBuffer !== "main" || !isAssistantThinking()) {
+      if (!isStatusAnimationNeeded()) {
         updateThinkingAnimationState();
         markDirty();
         renderFrame(false);
@@ -8866,15 +9395,14 @@ function updateThinkingAnimationState() {
       }
 
       thinkingFrameIndex = (thinkingFrameIndex + 1) % THINKING_FRAMES.length;
-      markDirty();
-      renderFrame(false);
+      renderStatusAnimationTick();
     }, THINKING_ANIMATION_INTERVAL_MS);
   }
 
   // High-frequency shine: ~30fps smooth left-to-right sweep.
   if (!shineAnimationTimer) {
     shineAnimationTimer = setInterval(() => {
-      if (activeBuffer !== "main" || !isAssistantThinking()) {
+      if (!isStatusAnimationNeeded()) {
         updateThinkingAnimationState();
         markDirty();
         renderFrame(false);
@@ -8882,15 +9410,14 @@ function updateThinkingAnimationState() {
       }
 
       shineFrameIndex += 1;
-      markDirty();
-      renderFrame(false);
+      renderStatusAnimationTick();
     }, SHINE_ANIMATION_INTERVAL_MS);
   }
 
   // High-frequency spinner: ~60ms per frame -> smooth, complete 10-frame loop.
   if (!spinnerAnimationTimer) {
     spinnerAnimationTimer = setInterval(() => {
-      if (activeBuffer !== "main" || !isAssistantThinking()) {
+      if (!isStatusAnimationNeeded()) {
         updateThinkingAnimationState();
         markDirty();
         renderFrame(false);
@@ -8898,8 +9425,7 @@ function updateThinkingAnimationState() {
       }
 
       spinnerFrameIndex = (spinnerFrameIndex + 1) % SPINNER_FRAMES.length;
-      markDirty();
-      renderFrame(false);
+      renderStatusAnimationTick();
     }, 60);
   }
 }
@@ -9155,16 +9681,30 @@ function highlightPythonCodeLine(line, isFenceLine = false) {
 function buildChatVisualLines(cols, sourceEntries = messages) {
   const revealActive = sourceEntries === messages && hasActiveAnswerReveal();
   let entryStartIndex = -1;
-  if (sourceEntries === messages && !revealActive) {
-    const lastRef = messages.length > 0 ? messages[messages.length - 1] : null;
+  if (sourceEntries === messages) {
+    if (!revealActive) {
+      const lastRef = messages.length > 0 ? messages[messages.length - 1] : null;
+      if (
+        cachedChatLines &&
+        cachedChatLinesCols === cols &&
+        cachedChatLinesLen === messages.length &&
+        cachedChatLinesLastRef === lastRef &&
+        cachedChatLinesSpacing === MESSAGE_SPACING_ROWS
+      ) {
+        return cachedChatLines;
+      }
+    }
+  } else if (Array.isArray(sourceEntries)) {
+    const lastRef = sourceEntries.length > 0 ? sourceEntries[sourceEntries.length - 1] : null;
+    const cached = cachedTranscriptLinesByEntries.get(sourceEntries);
     if (
-      cachedChatLines &&
-      cachedChatLinesCols === cols &&
-      cachedChatLinesLen === messages.length &&
-      cachedChatLinesLastRef === lastRef &&
-      cachedChatLinesSpacing === MESSAGE_SPACING_ROWS
+      cached &&
+      cached.cols === cols &&
+      cached.length === sourceEntries.length &&
+      cached.lastRef === lastRef &&
+      cached.spacing === MESSAGE_SPACING_ROWS
     ) {
-      return cachedChatLines;
+      return cached.lines;
     }
   }
 
@@ -9255,12 +9795,22 @@ function buildChatVisualLines(cols, sourceEntries = messages) {
 
   lastEntryVisualStartIndex = entryStartIndex;
 
-  if (sourceEntries === messages && !revealActive) {
-    cachedChatLines = visualLines;
-    cachedChatLinesCols = cols;
-    cachedChatLinesLen = messages.length;
-    cachedChatLinesLastRef = messages.length > 0 ? messages[messages.length - 1] : null;
-    cachedChatLinesSpacing = MESSAGE_SPACING_ROWS;
+  if (sourceEntries === messages) {
+    if (!revealActive) {
+      cachedChatLines = visualLines;
+      cachedChatLinesCols = cols;
+      cachedChatLinesLen = messages.length;
+      cachedChatLinesLastRef = messages.length > 0 ? messages[messages.length - 1] : null;
+      cachedChatLinesSpacing = MESSAGE_SPACING_ROWS;
+    }
+  } else if (Array.isArray(sourceEntries)) {
+    cachedTranscriptLinesByEntries.set(sourceEntries, {
+      cols,
+      length: sourceEntries.length,
+      lastRef: sourceEntries.length > 0 ? sourceEntries[sourceEntries.length - 1] : null,
+      spacing: MESSAGE_SPACING_ROWS,
+      lines: visualLines,
+    });
   }
 
   return visualLines;
@@ -9391,7 +9941,7 @@ function handleMouseEvent(buttonCode, action) {
     const rows = process.stdout.rows || 24;
     const step = Math.max(1, Math.floor(rows / 6));
     if (activeBuffer === "solve") {
-      const session = getActiveSolveSession();
+      const session = getViewedSolveSession();
       if (session && Array.isArray(session.entries) && session.entries.length > 0) {
         const cols = process.stdout.columns || 80;
         const bodyHeight = Math.max(1, rows - 4);
@@ -10345,8 +10895,10 @@ function renderFrame(forceChatRefresh = false) {
     ? statusChatGapRows + statusRows + statusInputGapRows
     : 0;
   const footerTop = frameTop + renderedFrameHeight + MAIN_FOOTER_GAP;
-  const menuTopBase = footerVisible ? (footerTop + 1) : (frameTop + renderedFrameHeight);
-  const menuTop = menuTopBase + (menuHeight > 0 ? MENU_INPUT_GAP : 0);
+  // Keep the empty menu's anchor stable when the footer appears/disappears.
+  // Otherwise the first typed character (and deleting the last one) looks
+  // like a menu layout change and needlessly repaints the whole chat area.
+  const menuTop = frameTop + renderedFrameHeight + (menuHeight > 0 ? MENU_INPUT_GAP : 0);
   const chatAreaHeight = APPEND_CHAT_TO_SCROLLBACK
     ? 0
     : Math.max(0, frameTop - chatInputGapRows);
@@ -10374,15 +10926,6 @@ function renderFrame(forceChatRefresh = false) {
     (lastStatusTop === null ||
       lastStatusTop !== statusBlockTop ||
       lastStatusHeight !== statusBlockHeight);
-  const statusVisibilityChanged = APPEND_CHAT_TO_SCROLLBACK
-    ? false
-    : lastStatusVisible !== statusVisible;
-  if (statusVisibilityChanged && !APPEND_CHAT_TO_SCROLLBACK) {
-    // Cleanly redraw the whole screen when entering/leaving the thinking
-    // state so stale status rows cannot overlap chat or input text.
-    forceFullClearOnNextRender = true;
-  }
-
   if (!APPEND_CHAT_TO_SCROLLBACK && forceFullClearOnNextRender) {
     readline.cursorTo(process.stdout, 0, 0);
     readline.clearScreenDown(process.stdout);
@@ -10415,6 +10958,24 @@ function renderFrame(forceChatRefresh = false) {
     (hasActiveAnswerReveal() || answerRevealSettlePending) &&
     lastEntryVisualStartIndex >= 0;
 
+  const paintChatLine = (row, line) => {
+    if (line.styledText) {
+      writeStyledLine(row, line.text, line.styledText, cols);
+    } else if (line.color === GREEN_COLOR) {
+      writeColoredLine(row, line.text, cols, GREEN_COLOR);
+    } else if (line.color === RED_COLOR) {
+      writeColoredLine(row, line.text, cols, RED_COLOR);
+    } else if (line.color === PLACEHOLDER_COLOR) {
+      writeColoredLine(row, line.text, cols, PLACEHOLDER_COLOR);
+    } else {
+      writeLine(row, line.text, cols);
+      if (line.assistantBulletMuted) {
+        readline.cursorTo(process.stdout, CHAT_LEFT_PADDING.length, row);
+        process.stdout.write(`${PLACEHOLDER_COLOR}\u2022${RESET_COLOR}`);
+      }
+    }
+  };
+
   if (revealActiveNow) {
     // Repaint every visible chat row in place (no clear step): static rows
     // are rewritten with identical content (invisible), while the revealing
@@ -10422,52 +10983,21 @@ function renderFrame(forceChatRefresh = false) {
     // full-screen clear that happened this frame (arrival or status-bar
     // collapse) so the rest of the chat never disappears mid-fade.
     for (let i = 0; i < chatVisualLines.length; i += 1) {
-      const row = chatStartRow + i;
-      const line = chatVisualLines[i];
-      if (line.styledText) {
-        writeStyledLine(row, line.text, line.styledText, cols);
-      } else if (line.color === GREEN_COLOR) {
-        writeColoredLine(row, line.text, cols, GREEN_COLOR);
-      } else if (line.color === RED_COLOR) {
-        writeColoredLine(row, line.text, cols, RED_COLOR);
-      } else if (line.color === PLACEHOLDER_COLOR) {
-        writeColoredLine(row, line.text, cols, PLACEHOLDER_COLOR);
-      } else {
-        writeLine(row, line.text, cols);
-        if (line.assistantBulletMuted) {
-          readline.cursorTo(process.stdout, CHAT_LEFT_PADDING.length, row);
-          process.stdout.write(`${PLACEHOLDER_COLOR}\u2022${RESET_COLOR}`);
-        }
-      }
+      paintChatLine(chatStartRow + i, chatVisualLines[i]);
     }
     answerRevealSettlePending = false;
   } else if (needsChatRefresh) {
     const oldChatHeight = lastChatAreaHeight ?? 0;
     const chatClearHeight = Math.max(chatAreaHeight, oldChatHeight);
-    for (let y = 0; y < chatClearHeight; y += 1) {
-      writeLine(y, "", cols);
-    }
-
+    // Paint new content first so the transcript never visibly disappears.
     for (let i = 0; i < chatVisualLines.length; i += 1) {
-      if (chatVisualLines[i].styledText) {
-        writeStyledLine(
-          chatStartRow + i,
-          chatVisualLines[i].text,
-          chatVisualLines[i].styledText,
-          cols
-        );
-      } else if (chatVisualLines[i].color === GREEN_COLOR) {
-        writeColoredLine(chatStartRow + i, chatVisualLines[i].text, cols, GREEN_COLOR);
-      } else if (chatVisualLines[i].color === RED_COLOR) {
-        writeColoredLine(chatStartRow + i, chatVisualLines[i].text, cols, RED_COLOR);
-      } else if (chatVisualLines[i].color === PLACEHOLDER_COLOR) {
-        writeColoredLine(chatStartRow + i, chatVisualLines[i].text, cols, PLACEHOLDER_COLOR);
-      } else {
-        writeLine(chatStartRow + i, chatVisualLines[i].text, cols);
-        if (chatVisualLines[i].assistantBulletMuted) {
-          readline.cursorTo(process.stdout, CHAT_LEFT_PADDING.length, chatStartRow + i);
-          process.stdout.write(`${PLACEHOLDER_COLOR}\u2022${RESET_COLOR}`);
-        }
+      paintChatLine(chatStartRow + i, chatVisualLines[i]);
+    }
+    // Then erase only rows no longer occupied by the new chat frame.
+    const occupiedEnd = chatStartRow + chatVisualLines.length;
+    for (let y = 0; y < chatClearHeight; y += 1) {
+      if (y < chatStartRow || y >= occupiedEnd) {
+        writeLine(y, "", cols);
       }
     }
   }
@@ -10631,16 +11161,13 @@ function renderMenuOnly() {
   const inputVisualLines = buildInputVisualLines(cols);
   const menuLines = getCommandMenuVisualLines(cols);
   const menuHeight = menuLines.length;
-  const footerVisible = !APPEND_CHAT_TO_SCROLLBACK && input.length === 0 && menuHeight === 0;
   const footerHeight = menuHeight > 0 ? 0 : 1;
   const frameHeight = inputVisualLines.length;
   const activeBottomPadding = menuHeight > 0 ? BOTTOM_PADDING : INPUT_BOTTOM_PADDING_NO_MENU;
   const footerBlockHeight = menuHeight > 0 ? 0 : MAIN_FOOTER_GAP + footerHeight;
   const menuBlockHeight = footerBlockHeight + (menuHeight > 0 ? MENU_INPUT_GAP + menuHeight : 0);
   const frameTop = Math.max(0, rows - activeBottomPadding - menuBlockHeight - frameHeight);
-  const footerTop = frameTop + frameHeight + MAIN_FOOTER_GAP;
-  const menuTopBase = footerVisible ? (footerTop + 1) : (frameTop + frameHeight);
-  const menuTop = menuTopBase + (menuHeight > 0 ? MENU_INPUT_GAP : 0);
+  const menuTop = frameTop + frameHeight + (menuHeight > 0 ? MENU_INPUT_GAP : 0);
 
   const oldTop = lastMenuTop ?? menuTop;
   const oldLines = lastMenuRenderedLines;
@@ -11169,6 +11696,56 @@ function runAppendSelfTest() {
     ensureSystemMessageAtTop();
     messages.push({ role: "user", content: "hello self test" });
 
+    const BT = String.fromCharCode(96, 96, 96);
+    const NL = String.fromCharCode(10);
+    const completeExecute = BT + "execute" + NL + "print(1)" + NL + BT;
+    const completeEntries = extractAllPythonCodeBlockEntries(completeExecute);
+    if (completeEntries.length !== 1 || completeEntries[0].complete !== true) {
+      out("SELFTEST_FAIL: complete execute block classification\n");
+      return 1;
+    }
+    const truncatedExecute = BT + "execute" + NL + "print(";
+    const truncatedEntries = extractAllPythonCodeBlockEntries(truncatedExecute);
+    if (
+      truncatedEntries.length !== 1 ||
+      truncatedEntries[0].complete !== false ||
+      truncatedEntries[0].code !== "print("
+    ) {
+      out("SELFTEST_FAIL: truncated execute block classification\n");
+      return 1;
+    }
+
+    const hostileTerminalOutput =
+      "\u001b[2J\u001b[H\u001b[31mred\u001b[0m\rnext\u0007" +
+      "\u001b]0;ARC title\u0007done";
+    const sanitizedTerminalOutput = sanitizeTerminalOutput(hostileTerminalOutput);
+    if (
+      sanitizedTerminalOutput.includes("\u001b") ||
+      sanitizedTerminalOutput.includes("\u0007") ||
+      !sanitizedTerminalOutput.includes("red") ||
+      !sanitizedTerminalOutput.includes("next") ||
+      !sanitizedTerminalOutput.includes("done")
+    ) {
+      out(`SELFTEST_FAIL: terminal output sanitization: ${JSON.stringify(sanitizedTerminalOutput)}\n`);
+      return 1;
+    }
+    const cachedSolveEntries = [{ role: "tool", content: "first kernel line" }];
+    const firstSolveRender = buildChatVisualLines(80, cachedSolveEntries);
+    const secondSolveRender = buildChatVisualLines(80, cachedSolveEntries);
+    if (firstSolveRender !== secondSolveRender) {
+      out("SELFTEST_FAIL: solve transcript render cache missed unchanged entries\n");
+      return 1;
+    }
+    cachedSolveEntries.push({ role: "tool", content: "second kernel line" });
+    const updatedSolveRender = buildChatVisualLines(80, cachedSolveEntries);
+    if (
+      updatedSolveRender === firstSolveRender ||
+      !updatedSolveRender.some((line) => String(line.text || "").includes("second kernel line"))
+    ) {
+      out("SELFTEST_FAIL: solve transcript render cache did not invalidate after append\n");
+      return 1;
+    }
+
     if (APPEND_CHAT_TO_SCROLLBACK) {
       const originalWrite = process.stdout.write.bind(process.stdout);
       let captured = "";
@@ -11203,6 +11780,18 @@ function runAppendSelfTest() {
     out("SELFTEST_FAIL\n");
     return 1;
   }
+}
+
+async function runExecuteTransportSelfTest() {
+  const out = process.stdout.write.bind(process.stdout);
+  const largeCode = `${"# large execute transport\n".repeat(2500)}print("LARGE_EXEC_OK")`;
+  const result = await executeCodeWithPythonTool(largeCode);
+  if (!result?.ok || !String(result.output || "").includes("LARGE_EXEC_OK")) {
+    out(`EXECUTE_FAIL: ${JSON.stringify(result)}\n`);
+    return 1;
+  }
+  out("EXECUTE_OK\n");
+  return 0;
 }
 
 function runFormatSelfTest() {
@@ -11313,6 +11902,57 @@ function runFormatSelfTest() {
     if (addBgChunks.length < 2) {
       out(`FORMAT_FAIL: wrapped long diff add-line should keep background on each chunk (got ${addBgChunks.length})`);
       return 1;
+    }
+
+    const revealStart = applyAnswerRevealStyle("\u2022 answer", 0);
+    const revealLater = applyAnswerRevealStyle("\u2022 answer", 0.75);
+    const revealStartColor = Number(revealStart.match(/38;5;(\d+)m/)?.[1]);
+    const revealLaterColor = Number(revealLater.match(/38;5;(\d+)m/)?.[1]);
+    if (
+      revealStartColor !== ANSWER_REVEAL_FADE_FROM ||
+      !Number.isFinite(revealLaterColor) ||
+      revealLaterColor <= revealStartColor
+    ) {
+      out("FORMAT_FAIL: answer reveal must fade from black toward normal foreground");
+      return 1;
+    }
+
+    const savedMessages = messages.slice();
+    const savedCachedChatLines = cachedChatLines;
+    const savedCachedChatLinesCols = cachedChatLinesCols;
+    const savedCachedChatLinesLen = cachedChatLinesLen;
+    const savedCachedChatLinesLastRef = cachedChatLinesLastRef;
+    const savedCachedChatLinesSpacing = cachedChatLinesSpacing;
+    try {
+      const animatedEntry = {
+        role: "assistant",
+        content: "fade cache test",
+        revealUntil: Date.now() + ANSWER_REVEAL_MS,
+      };
+      messages.splice(0, messages.length, animatedEntry);
+      cachedChatLines = null;
+      cachedTranscriptLinesByEntries.delete(messages);
+      const firstFrame = buildChatVisualLines(80)
+        .map((line) => line.styledText || "")
+        .join("\n");
+      animatedEntry.revealUntil = Date.now() + Math.floor(ANSWER_REVEAL_MS * 0.25);
+      const laterFrame = buildChatVisualLines(80)
+        .map((line) => line.styledText || "")
+        .join("\n");
+      const firstFrameColor = Number(firstFrame.match(/38;5;(\d+)m/)?.[1]);
+      const laterFrameColor = Number(laterFrame.match(/38;5;(\d+)m/)?.[1]);
+      if (!Number.isFinite(firstFrameColor) || laterFrameColor <= firstFrameColor) {
+        out("FORMAT_FAIL: animated answer frames were frozen by transcript caching");
+        return 1;
+      }
+    } finally {
+      messages.splice(0, messages.length, ...savedMessages);
+      cachedChatLines = savedCachedChatLines;
+      cachedChatLinesCols = savedCachedChatLinesCols;
+      cachedChatLinesLen = savedCachedChatLinesLen;
+      cachedChatLinesLastRef = savedCachedChatLinesLastRef;
+      cachedChatLinesSpacing = savedCachedChatLinesSpacing;
+      cachedTranscriptLinesByEntries.delete(messages);
     }
 
     out("FORMAT_OK\n");
@@ -11841,6 +12481,17 @@ async function runHooksSelfTest() {
 async function runKernelSelfTest() {
   const out = (s) => process.stdout.write(s);
   try {
+    const previousSolveIteration = solveIteration;
+    solveIteration = 9;
+    if (SOLVE_MAX_ITERATIONS !== 0 || getSolveIterationLabel() !== "9") {
+      out(`KERNEL_FAIL: solve loop should be unlimited: limit=${SOLVE_MAX_ITERATIONS}, label=${getSolveIterationLabel()}\n`);
+      return 1;
+    }
+    solveIteration = previousSolveIteration;
+    if (SOLVE_REQUEST_MIN_TIMEOUT_MS < 300000) {
+      out(`KERNEL_FAIL: solve request timeout floor is too short: ${SOLVE_REQUEST_MIN_TIMEOUT_MS}\n`);
+      return 1;
+    }
     await kernelReset();
 
     // Persistent state: define in one call, use in a later call.
@@ -11916,6 +12567,67 @@ async function runKernelSelfTest() {
       return 1;
     }
 
+    // Workspace isolation: /solve accepts the directory itself, rejects the
+    // task-file path, and runs the kernel from that directory's venv.
+    const workspaceTestDir = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-kernel-test-"));
+    try {
+      const taskPath = path.join(workspaceTestDir, "task.md");
+      const requirementsPath = path.join(workspaceTestDir, "requirements.txt");
+      await fs.writeFile(taskPath, "isolated kernel task", "utf8");
+      await fs.writeFile(requirementsPath, "", "utf8");
+      const rejectedFile = await loadSolveTaskSource(taskPath);
+      if (rejectedFile.ok || !String(rejectedFile.error || "").includes("not a directory")) {
+        out(`KERNEL_FAIL: direct task-file path should be rejected: ${JSON.stringify(rejectedFile)}\n`);
+        return 1;
+      }
+      const source = await loadSolveTaskSource(workspaceTestDir);
+      if (
+        !source.ok ||
+        path.resolve(source.workspaceDir) !== path.resolve(workspaceTestDir) ||
+        path.resolve(source.requirementsPath) !== path.resolve(requirementsPath)
+      ) {
+        out(`KERNEL_FAIL: task-file workspace resolution failed: ${JSON.stringify(source)}\n`);
+        return 1;
+      }
+      let setupHeartbeat = false;
+      const heartbeatTimer = setTimeout(() => {
+        setupHeartbeat = true;
+      }, 25);
+      const prepared = await prepareKernelWorkspace(workspaceTestDir);
+      clearTimeout(heartbeatTimer);
+      if (!prepared.ok) {
+        out(`KERNEL_FAIL: isolated venv preparation failed: ${JSON.stringify(prepared)}\n`);
+        return 1;
+      }
+      if (!setupHeartbeat) {
+        out("KERNEL_FAIL: venv preparation blocked the Node event loop\n");
+        return 1;
+      }
+      const isolated = await kernelExec("import os, sys\nprint(os.getcwd())\nprint(sys.executable)");
+      const isolatedOutput = String(isolated.output || "").toLowerCase();
+      if (
+        !isolated.ok ||
+        !isolatedOutput.includes(path.resolve(workspaceTestDir).toLowerCase()) ||
+        !isolatedOutput.includes(path.resolve(prepared.venvPython).toLowerCase())
+      ) {
+        out(`KERNEL_FAIL: kernel did not use isolated cwd/venv: ${JSON.stringify(isolated)}\n`);
+        return 1;
+      }
+      const reused = await prepareKernelWorkspace(workspaceTestDir);
+      if (!reused.ok || path.resolve(reused.venvPython) !== path.resolve(prepared.venvPython)) {
+        out(`KERNEL_FAIL: workspace venv was not reusable: ${JSON.stringify(reused)}\n`);
+        return 1;
+      }
+      const afterReuse = await kernelExec("import sys\nprint(sys.executable)");
+      if (!afterReuse.ok || !String(afterReuse.output || "").toLowerCase().includes(path.resolve(prepared.venvPython).toLowerCase())) {
+        out(`KERNEL_FAIL: resumed kernel did not reuse workspace venv: ${JSON.stringify(afterReuse)}\n`);
+        return 1;
+      }
+    } finally {
+      await kernelReset();
+      await fs.rm(workspaceTestDir, { recursive: true, force: true }).catch(() => {});
+    }
+
     // Solve-session persistence: a session saved to ~/.nexus/kernels loads
     // back with its entries and metadata intact (/kernels / view).
     const savedSession = {
@@ -11932,6 +12644,18 @@ async function runKernelSelfTest() {
         { role: "tool", content: "Kernel output (iteration 1):\n1", ts: Date.now() },
       ],
     };
+    const restartProbe = JSON.parse(JSON.stringify(savedSession));
+    restartProbe.taskFull = "rotate grid fully";
+    resetSolveSessionForRestart(restartProbe);
+    if (
+      restartProbe.solved ||
+      restartProbe.iterations !== 0 ||
+      restartProbe.entries.length !== 1 ||
+      restartProbe.entries[0].content !== "rotate grid fully"
+    ) {
+      out(`KERNEL_FAIL: restart state reset failed: ${JSON.stringify(restartProbe)}\n`);
+      return 1;
+    }
     const dir = KERNELS_DIR;
     try {
       fsSync.mkdirSync(dir, { recursive: true });
@@ -12203,6 +12927,10 @@ if (process.argv.includes("--self-test-append")) {
   process.exit(code);
 }
 
+if (process.argv.includes("--self-test-execute")) {
+  runExecuteTransportSelfTest().then((code) => process.exit(code));
+}
+
 if (process.argv.includes("--self-test-format")) {
   const code = runFormatSelfTest();
   process.exit(code);
@@ -12244,12 +12972,11 @@ process.stdin.on("data", (rawChunk) => {
   } else if (activeBuffer === "loops" && chunk === "\u001b") {
     closeLoopsBuffer();
   } else if (activeBuffer === "solve" && chunk === "\u001b") {
-    if (solveActive) {
-      solveAbortRequested = true;
-      stopKernelProcess();
-    } else {
-      closeSolveBuffer();
-    }
+    // Handle raw Escape immediately; readline delays standalone Escape while
+    // checking whether it begins a longer terminal sequence.
+    suppressSolveEscapeKeypressUntil = Date.now() + 1500;
+    closeSolveBuffer();
+    return;
   } else if (activeBuffer === "kernels" && chunk === "\u001b") {
     closeKernelsBuffer();
   } else if (activeBuffer === "provider_editor" && chunk === "\u001b") {
@@ -12298,6 +13025,12 @@ process.stdin.on("data", (rawChunk) => {
 
 process.stdin.on("keypress", async (str, key) => {
   const seq = typeof key?.sequence === "string" ? key.sequence : "";
+  const isEscapeKey =
+    key?.name === "escape" || key?.sequence === "\u001b" || str === "\u001b";
+  if (isEscapeKey && Date.now() < suppressSolveEscapeKeypressUntil) {
+    suppressSolveEscapeKeypressUntil = 0;
+    return;
+  }
   const hasMouseNoise =
     isStandaloneMouseSequence(str) ||
     isStandaloneMouseSequence(seq) ||
@@ -12338,6 +13071,10 @@ process.stdin.on("keypress", async (str, key) => {
     activeBuffer === "main" &&
     (key?.name === "escape" || key?.sequence === "\u001b" || str === "\u001b");
   if (isMainBufferEscape) {
+    if (solveStartupActive) {
+      cancelSolveStartup();
+      return;
+    }
     if (isAssistantThinking()) {
       handleStopRequest();
       return;
@@ -12486,7 +13223,7 @@ process.stdin.on("keypress", async (str, key) => {
 
     if (key?.sequence === "\r" || key?.name === "return" || key?.name === "enter") {
       await loadSelectedSessionIntoChat();
-      closeSessionsBuffer();
+      closeSessionsBuffer({ refreshChat: true });
       return;
     }
 
@@ -12503,21 +13240,21 @@ process.stdin.on("keypress", async (str, key) => {
       key?.sequence === "\u001b" ||
       str === "\u001b"
     ) {
-      if (solveActive) {
-        solveAbortRequested = true;
-        // Kill the running kernel so a mid-flight kernelExec unblocks
-        // immediately instead of waiting for the program to finish or time out.
-        stopKernelProcess();
-        markDirty();
-        renderFrame(true);
-      } else {
-        closeSolveBuffer();
-      }
+      closeSolveBuffer();
+      return;
+    }
+
+    if (
+      (key?.name === "s" || str === "s" || str === "S") &&
+      solveActive &&
+      getViewedSolveSession()?.id === runningSolveSessionId
+    ) {
+      stopRunningSolve();
       return;
     }
 
     if (key?.name === "pageup" || key?.name === "pagedown" || key?.name === "up" || key?.name === "down") {
-      const session = getActiveSolveSession();
+      const session = getViewedSolveSession();
       if (session && Array.isArray(session.entries) && session.entries.length > 0) {
         const rows = process.stdout.rows || 24;
         const cols = process.stdout.columns || 80;
@@ -12544,7 +13281,7 @@ process.stdin.on("keypress", async (str, key) => {
   }
 
   if (activeBuffer === "kernels") {
-    if (key?.ctrl) {
+    if (key?.ctrl && !solveStartupActive) {
       return;
     }
 
@@ -12553,7 +13290,15 @@ process.stdin.on("keypress", async (str, key) => {
       key?.sequence === "\u001b" ||
       str === "\u001b"
     ) {
+      if (solveStartupActive) {
+        cancelSolveStartup();
+        return;
+      }
       closeKernelsBuffer();
+      return;
+    }
+
+    if (solveStartupActive) {
       return;
     }
 
@@ -12580,12 +13325,27 @@ process.stdin.on("keypress", async (str, key) => {
 
     if (key?.name === "delete") {
       const session = solveSessions[kernelsSelected];
-      if (session) {
+      if (session && session.id !== runningSolveSessionId) {
         deleteSolveSession(session.id);
         updateKernelsSelectionState();
       }
       markDirty();
       renderFrame(true);
+      return;
+    }
+
+    if ((key?.name === "s" || str === "s" || str === "S") && solveActive) {
+      stopRunningSolve();
+      return;
+    }
+
+    if (key?.name === "r" || str === "r" || str === "R") {
+      await runSelectedKernelSession("resume");
+      return;
+    }
+
+    if (key?.name === "f5") {
+      await runSelectedKernelSession("restart");
       return;
     }
 
@@ -12888,7 +13648,9 @@ process.stdin.on("keypress", async (str, key) => {
           typedCommand === "/thinking" ||
           COMMANDS.some((command) => command.name === typedCommand);
         if (isKnownTypedCommand) {
-          closeCommandBuffer();
+          closeCommandBuffer({
+            transitionToAltBuffer: shouldTransitionCommandDirectlyToAltBuffer(typedCommand),
+          });
           const handled = await runSlashCommand(typedCommand, typedArgs);
           if (!handled) {
             input = normalizedTyped;
@@ -12907,7 +13669,9 @@ process.stdin.on("keypress", async (str, key) => {
         return;
       }
 
-      closeCommandBuffer();
+      closeCommandBuffer({
+        transitionToAltBuffer: shouldTransitionCommandDirectlyToAltBuffer(selectedCommand.name),
+      });
       const handled = await runSlashCommand(selectedCommand.name);
       if (!handled) {
         input = selectedCommand.name;
@@ -13063,11 +13827,9 @@ process.stdin.on("keypress", async (str, key) => {
     const slashFirstToken = trimmedInput.startsWith("/")
       ? trimmedInput.split(/\s+/)[0].toLowerCase()
       : "";
-    // /solve accepts a multi-line task description (pasted with line breaks).
-    const acceptsMultiline = slashFirstToken === "/solve";
     if (
       trimmedInput.startsWith("/") &&
-      (!trimmedInput.includes("\n") || acceptsMultiline)
+      !trimmedInput.includes("\n")
     ) {
       const commandName = trimmedInput.split(/\s+/)[0].toLowerCase();
       const isKnownCommand =
@@ -13114,19 +13876,13 @@ process.stdin.on("keypress", async (str, key) => {
     const modelAtSubmit = selectedModel;
     const didAppend = submit();
     if (didAppend) {
-      if (!APPEND_CHAT_TO_SCROLLBACK) {
-        forceFullClearOnNextRender = true;
-      }
       if (APPEND_CHAT_TO_SCROLLBACK) {
         appendTranscriptNow();
       }
       queueAssistantReply(modelAtSubmit);
     }
     markDirty();
-    renderFrame(true);
-    if (didAppend && !APPEND_CHAT_TO_SCROLLBACK) {
-      scheduleViewportMainRefresh();
-    }
+    renderFrame(false);
     if (didAppend && APPEND_CHAT_TO_SCROLLBACK) {
       markDirty();
       renderFrame(false);
@@ -13196,6 +13952,17 @@ async function initializeApp() {
     matcherValue: "startup",
     input: { source: "startup" },
   }).catch(() => {});
+  const startupSolveIndex = process.argv.indexOf("--solve");
+  if (startupSolveIndex >= 0) {
+    const startupSolveDir = String(process.argv[startupSolveIndex + 1] || "").trim();
+    if (!startupSolveDir) {
+      appendTuiErrorMessage("--solve", "missing directory. Use '--solve <directory>'");
+    } else {
+      await runSlashCommand("/solve", startupSolveDir);
+      return;
+    }
+
+  }
   renderFrame(true);
 }
 
