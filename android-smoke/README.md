@@ -20,6 +20,17 @@ The build succeeds when the script prints `PHONE_BUILD_OK`. Android then asks
 for permission to install the APK. Allow Termux as an installation source if
 the system settings page appears.
 
+Android also needs permission to read the APK through Termux. If the build
+reports that file sharing is disabled, run:
+
+```sh
+mkdir -p "$HOME/.termux"
+sed -i '/^[[:space:]]*allow-external-apps[[:space:]]*=/d' "$HOME/.termux/termux.properties"
+echo 'allow-external-apps = true' >> "$HOME/.termux/termux.properties"
+termux-reload-settings
+sh android-smoke/build-termux.sh --install
+```
+
 The signed output is:
 
 ```text

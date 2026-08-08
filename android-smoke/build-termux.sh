@@ -113,6 +113,22 @@ echo "PHONE_BUILD_OK"
 echo "APK: $SIGNED_APK"
 
 if [ "${1:-}" = "--install" ]; then
+  TERMUX_PROPERTIES="$HOME/.termux/termux.properties"
+  if ! grep -Eq '^[[:space:]]*allow-external-apps[[:space:]]*=[[:space:]]*true[[:space:]]*$' "$TERMUX_PROPERTIES" 2>/dev/null; then
+    echo >&2
+    echo "Android cannot read APKs from Termux yet." >&2
+    echo "Enable Termux file sharing, then retry:" >&2
+    echo "  mkdir -p \"$HOME/.termux\"" >&2
+    echo "  sed -i '/^[[:space:]]*allow-external-apps[[:space:]]*=/d' \"$TERMUX_PROPERTIES\"" >&2
+    echo "  echo 'allow-external-apps = true' >> \"$TERMUX_PROPERTIES\"" >&2
+    echo "  termux-reload-settings" >&2
+    echo "  sh android-smoke/build-termux.sh --install" >&2
+    exit 1
+  fi
+
   echo "Opening Android package installer..."
-  termux-open --view "$SIGNED_APK"
+  termux-open \
+    --view \
+    --content-type application/vnd.android.package-archive \
+    "$SIGNED_APK"
 fi
