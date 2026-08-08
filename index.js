@@ -4262,7 +4262,45 @@ function extractAllPythonCodeBlocks(text) {
     blocks.push(body);
   }
 
+  const truncatedTail = extractUnterminatedExecuteTail(text);
+  if (truncatedTail) {
+    blocks.push(truncatedTail);
+  }
   return blocks;
+}
+
+// Recovers code from an execute fence that was cut off before the closing
+// fence (truncated model output). Fence characters are built via code points
+// so this source stays free of literal fence runs.
+function extractUnterminatedExecuteTail(text) {
+  const source = String(text ?? "");
+  const BT = String.fromCharCode(96, 96, 96);
+  const marker = BT + "execute";
+  let pos = 0;
+  let lastBodyStart = -1;
+  while (true) {
+    const start = source.indexOf(marker, pos);
+    if (start === -1) {
+      break;
+    }
+    const lineStart = source.indexOf(String.fromCharCode(10), start);
+    if (lineStart === -1) {
+      break;
+    }
+    lastBodyStart = lineStart + 1;
+    pos = lineStart + 1;
+  }
+  if (lastBodyStart === -1) {
+    return "";
+  }
+  const tail = source.slice(lastBodyStart);
+  if (!tail.trim()) {
+    return "";
+  }
+  if (tail.indexOf(BT) !== -1) {
+    return "";
+  }
+  return tail.trim();
 }
 
 function getToolRunLabel(pythonCode) {
@@ -5632,6 +5670,11 @@ function extractPythonFencedBlocks(text) {
     }
     const end = text.indexOf(BT, lineStart + 1);
     if (end === -1) {
+      // Unterminated fence (truncated reply): keep everything written so far.
+      const body = text.slice(lineStart + 1).trim();
+      if (body) {
+        blocks.push(body);
+      }
       break;
     }
     const body = text.slice(lineStart + 1, end).trim();
@@ -5661,6 +5704,11 @@ function extractAnyFencedBlocks(text) {
     }
     const end = text.indexOf(BT, lineStart + 1);
     if (end === -1) {
+      // Unterminated fence (truncated reply): keep everything written so far.
+      const body = text.slice(lineStart + 1).trim();
+      if (body) {
+        blocks.push(body);
+      }
       break;
     }
     const body = text.slice(lineStart + 1, end).trim();
@@ -11839,6 +11887,32 @@ async function runKernelSelfTest() {
     const fencedCode = extractPythonFencedBlocks(fencedReply)[0] || "";
     if (!fencedCode.includes("def f(x)") || fencedCode.includes(BT)) {
       out(`KERNEL_FAIL: python-fenced extraction wrong: ${JSON.stringify(fencedCode)}\n`);
+      return 1;
+    }
+
+    // Truncation tolerance: a reply cut off before the closing fence must
+    // still yield the code written so far (execute and python fences alike).
+    const truncPythonReply =
+      "Here is the program:" + NL + BT + "python" + NL +
+      "def rot(g):" + NL + "    return g" + NL; // no closing fence
+    const truncPythonCode = extractPythonFencedBlocks(truncPythonReply)[0] || "";
+    if (!truncPythonCode.includes("def rot(g)")) {
+      out(`KERNEL_FAIL: unterminated python fence should yield partial code: ${JSON.stringify(truncPythonCode)}\n`);
+      return 1;
+    }
+    const truncExecReply =
+      "Run this:" + NL + BT + "execute" + NL + "x = 6 * 7" + NL; // no closing fence
+    const truncExecCode = extractAllPythonCodeBlocks(truncExecReply)[0] || "";
+    if (!truncExecCode.includes("x = 6 * 7")) {
+      out(`KERNEL_FAIL: unterminated execute fence should yield partial code: ${JSON.stringify(truncExecCode)}\n`);
+      return 1;
+    }
+
+    // extractRawCodeFromReply must prefer the partial extracted code over the
+    // raw markdown fallback for a truncated python fence.
+    const rawTrunc = extractRawCodeFromReply(truncPythonReply);
+    if (rawTrunc.indexOf("def rot(g)") === -1 || rawTrunc.indexOf(BT) !== -1) {
+      out(`KERNEL_FAIL: raw extractor should use partial fence code: ${JSON.stringify(rawTrunc)}\n`);
       return 1;
     }
 
