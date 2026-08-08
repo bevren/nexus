@@ -12608,7 +12608,15 @@ process.stdin.on("keypress", async (str, key) => {
 
   if (key?.sequence === "\r" || key?.name === "return" || key?.name === "enter") {
     const trimmedInput = input.trim();
-    if (trimmedInput.startsWith("/") && !trimmedInput.includes("\n")) {
+    const slashFirstToken = trimmedInput.startsWith("/")
+      ? trimmedInput.split(/\s+/)[0].toLowerCase()
+      : "";
+    // /solve accepts a multi-line task description (pasted with line breaks).
+    const acceptsMultiline = slashFirstToken === "/solve";
+    if (
+      trimmedInput.startsWith("/") &&
+      (!trimmedInput.includes("\n") || acceptsMultiline)
+    ) {
       const commandName = trimmedInput.split(/\s+/)[0].toLowerCase();
       const isKnownCommand =
         commandName === "/model" ||
