@@ -5254,12 +5254,57 @@ function renderKernelsBuffer() {
   dirty = false;
 }
 
+function buildSolveSessionLines(session, width) {
+  const out = [];
+  if (!session || !Array.isArray(session.entries)) {
+    return out;
+  }
+  const bodyWidth = Math.max(1, width - 2);
+  for (const entry of session.entries) {
+    const role = typeof entry?.role === "string" ? entry.role : "";
+    const content = String(entry?.content ?? "").replace(/\r?\n/g, "\n");
+    const logical = content.split("\n");
+    if (role === "reasoning") {
+      // Dimmed trace, dot only on the first line (like the chat window).
+      for (let i = 0; i < logical.length; i += 1) {
+        const wrapped = wrapLineWithPrefixes(
+          logical[i],
+          i === 0 ? "  \u25e6 " : "    ",
+          "    ",
+          bodyWidth
+        );
+        for (const part of wrapped) {
+          out.push({ text: part.fullText, color: PLACEHOLDER_COLOR });
+        }
+      }
+      continue;
+    }
+    const roleLabel = role === "user" ? "task" : role === "assistant" ? "model" : role;
+    let baseColor = null;
+    if (role === "tool") {
+      baseColor = PLACEHOLDER_COLOR;
+    } else if (role === "assistant") {
+      baseColor = TOKEN_COLOR;
+    } else if (role === "user") {
+      baseColor = GREEN_COLOR;
+    }
+    for (let i = 0; i < logical.length; i += 1) {
+      const firstPrefix = i === 0 ? `  [${roleLabel}] ` : "  ";
+      const wrapped = wrapLineWithPrefixes(logical[i], firstPrefix, "  ", bodyWidth);
+      for (const part of wrapped) {
+        out.push({ text: part.fullText, color: baseColor });
+      }
+    }
+  }
+  return out;
+}
+
 function renderSolveBuffer() {
   process.stdout.write(HIDE_CURSOR);
   const rows = process.stdout.rows || 24;
   const cols = process.stdout.columns || 80;
   const session = getActiveSolveSession();
-  const panelWidth = Math.min(Math.max(60, Math.floor(cols * 0.85)), cols);
+  const panelWidth = Math.min(Math.max(60, Math.floor(cols * 0.92)), cols);
   const panelLeft = Math.max(0, Math.floor((cols - panelWidth) / 2));
 
   if (!hasInitializedScreen) {
@@ -5298,51 +5343,36 @@ function renderSolveBuffer() {
     row += 1;
   } else if (session) {
     const endState = session.solved ? "SOLVE_OK reached" : session.abortRequested ? "aborted" : "unsolved";
-    setRow(row, `Status: ${endState} (${session.entries.length} entries) - Esc returns`, PLACEHOLDER_COLOR);
+    setRow(row, `Status: ${endState} - Esc returns`, PLACEHOLDER_COLOR);
     row += 1;
   }
 
-  if (session && session.entries.length > 0) {
-    const visibleRows = Math.max(1, rows - row - 2);
-    const maxOffset = Math.max(0, session.entries.length - visibleRows);
+  const allLines = buildSolveSessionLines(session, panelWidth - 2);
+  const footerRow = rows - 1;
+  const headerRows = row;
+  const visibleRows = Math.max(1, footerRow - headerRows);
+  const total = allLines.length;
+
+  if (total > 0) {
+    const maxOffset = Math.max(0, total - visibleRows);
     if (solveScrollOffset > maxOffset) {
       solveScrollOffset = maxOffset;
     }
-    const startIdx = Math.max(0, session.entries.length - visibleRows - solveScrollOffset);
-    for (let i = startIdx; i < session.entries.length; i += 1) {
-      const entry = session.entries[i];
-      if (entry.role === "reasoning") {
-        // Reasoning traces render dimmed like the chat window's trace blocks:
-        // a single dot on the first line, indented continuations.
-        const traceText = String(entry.content || "");
-        const traceLines = traceText.split("\n").slice(0, visibleRows);
-        for (let tl = 0; tl < traceLines.length && row < rows - 1; tl += 1) {
-          const lineText = "  \u25e6 " + traceLines[tl];
-          setRow(row, lineText.slice(0, panelWidth), PLACEHOLDER_COLOR);
-          row += 1;
-        }
-        continue;
-      }
-      const roleLabel = entry.role === "user" ? "task" : entry.role === "assistant" ? "model" : entry.role;
-      const content = String(entry.content || "").replace(/\r?\n/g, " ");
-      const clipped = content.length > panelWidth - 6 ? content.slice(0, panelWidth - 9) + "..." : content;
-      const line = `  [${roleLabel}] ${clipped}`;
-      if (entry.role === "tool") {
-        setRow(row, line, PLACEHOLDER_COLOR);
-      } else if (entry.role === "assistant") {
-        setRow(row, line, TOKEN_COLOR);
-      } else {
-        setRow(row, line);
-      }
-      row += 1;
-      if (row >= rows - 1) {
-        break;
-      }
+    if (solveScrollOffset < 0) {
+      solveScrollOffset = 0;
     }
-  } else {
+    const startLine = Math.max(0, total - visibleRows - solveScrollOffset);
+    for (let li = startLine; li < total && row < footerRow; li += 1) {
+      const line = allLines[li];
+      setRow(row, line.text.slice(0, panelWidth), line.color || null);
+      row += 1;
+    }
+  } else if (!solveActive) {
     setRow(row, "waiting for first program...", PLACEHOLDER_COLOR);
   }
-  setRow(rows - 1, "Esc: return  PgUp/PgDn: scroll", PLACEHOLDER_COLOR);
+
+  const scrollHint = total > visibleRows ? "  PgUp/PgDn scroll" : "";
+  setRow(footerRow, "Esc: return" + scrollHint, PLACEHOLDER_COLOR);
 
   for (let y = 0; y < rows; y += 1) {
     const nextRow = frameRows[y];
@@ -12084,16 +12114,21 @@ process.stdin.on("keypress", async (str, key) => {
       const session = getActiveSolveSession();
       if (session && session.entries.length > 0) {
         const rows = process.stdout.rows || 24;
-        let visibleRows = Math.max(1, rows - 5);
-        let maxOffset = Math.max(0, session.entries.length - visibleRows);
+        const cols = process.stdout.columns || 80;
+        const panelWidth = Math.min(Math.max(60, Math.floor(cols * 0.92)), cols);
+        const allLines = buildSolveSessionLines(session, panelWidth - 2);
+        const total = allLines.length;
+        // Header = title (1) + status (1) under active/complete; footer = 1 line.
+        const visibleRows = Math.max(1, rows - 3);
+        const maxOffset = Math.max(0, total - visibleRows);
         if (key.name === "pageup") {
           solveScrollOffset = Math.min(maxOffset, solveScrollOffset + Math.max(1, Math.floor(rows / 2)));
         } else if (key.name === "pagedown") {
           solveScrollOffset = Math.max(0, solveScrollOffset - Math.max(1, Math.floor(rows / 2)));
         } else if (key.name === "up") {
-          solveScrollOffset = Math.min(maxOffset, solveScrollOffset + 3);
+          solveScrollOffset = Math.min(maxOffset, solveScrollOffset + 1);
         } else {
-          solveScrollOffset = Math.max(0, solveScrollOffset - 3);
+          solveScrollOffset = Math.max(0, solveScrollOffset - 1);
         }
       }
       markDirty();
