@@ -5075,11 +5075,24 @@ function getActiveSolveSession() {
   return solveSessions[0] || null;
 }
 
-function solveSessionAppend(session, role, content) {
+function solveSessionAppend(session, role, content, options = {}) {
   if (!session) {
     return;
   }
-  session.entries.push({ role, content: String(content ?? ""), ts: Date.now() });
+  const entry = { role, content: String(content ?? ""), ts: Date.now() };
+  if (options && options.reasoningDetails) {
+    entry.reasoningDetails = normalizeReasoningDetails(options.reasoningDetails);
+  }
+  if (options && options.name) {
+    entry.name = options.name;
+  }
+  if (options && options.toolInput) {
+    entry.toolInput = options.toolInput;
+  }
+  if (typeof options?.toolOk === "boolean") {
+    entry.toolOk = options.toolOk;
+  }
+  session.entries.push(entry);
   session.updatedAt = Date.now();
   session.iterations = solveIteration;
   saveSolveSession(session);
@@ -5254,58 +5267,11 @@ function renderKernelsBuffer() {
   dirty = false;
 }
 
-function buildSolveSessionLines(session, width) {
-  const out = [];
-  if (!session || !Array.isArray(session.entries)) {
-    return out;
-  }
-  const bodyWidth = Math.max(1, width - 2);
-  for (const entry of session.entries) {
-    const role = typeof entry?.role === "string" ? entry.role : "";
-    const content = String(entry?.content ?? "").replace(/\r?\n/g, "\n");
-    const logical = content.split("\n");
-    if (role === "reasoning") {
-      // Dimmed trace, dot only on the first line (like the chat window).
-      for (let i = 0; i < logical.length; i += 1) {
-        const wrapped = wrapLineWithPrefixes(
-          logical[i],
-          i === 0 ? "  \u25e6 " : "    ",
-          "    ",
-          bodyWidth
-        );
-        for (const part of wrapped) {
-          out.push({ text: part.fullText, color: PLACEHOLDER_COLOR });
-        }
-      }
-      continue;
-    }
-    const roleLabel = role === "user" ? "task" : role === "assistant" ? "model" : role;
-    let baseColor = null;
-    if (role === "tool") {
-      baseColor = PLACEHOLDER_COLOR;
-    } else if (role === "assistant") {
-      baseColor = TOKEN_COLOR;
-    } else if (role === "user") {
-      baseColor = GREEN_COLOR;
-    }
-    for (let i = 0; i < logical.length; i += 1) {
-      const firstPrefix = i === 0 ? `  [${roleLabel}] ` : "  ";
-      const wrapped = wrapLineWithPrefixes(logical[i], firstPrefix, "  ", bodyWidth);
-      for (const part of wrapped) {
-        out.push({ text: part.fullText, color: baseColor });
-      }
-    }
-  }
-  return out;
-}
-
 function renderSolveBuffer() {
   process.stdout.write(HIDE_CURSOR);
   const rows = process.stdout.rows || 24;
   const cols = process.stdout.columns || 80;
   const session = getActiveSolveSession();
-  const panelWidth = Math.min(Math.max(60, Math.floor(cols * 0.92)), cols);
-  const panelLeft = Math.max(0, Math.floor((cols - panelWidth) / 2));
 
   if (!hasInitializedScreen) {
     readline.cursorTo(process.stdout, 0, 0);
@@ -5318,79 +5284,67 @@ function renderSolveBuffer() {
     forceFullClearOnNextRender = false;
   }
 
-  const frameRows = Array.from({ length: rows }, () => ({ text: " ".repeat(cols), color: null }));
-  const setRow = (y, content, color = null) => {
-    if (y < 0 || y >= rows) {
-      return;
-    }
-    const clipped = content.slice(0, panelWidth).padEnd(panelWidth, " ");
-    const left = " ".repeat(panelLeft);
-    const right = " ".repeat(Math.max(0, cols - panelLeft - panelWidth));
-    frameRows[y] = { text: left + clipped + right, color };
-  };
-
   const idShort = session ? String(session.id || "").slice(0, 8) : "";
-  const taskPreview = session ? String(session.task || "").slice(0, 40) : "no session";
-  setRow(0, `Solve ${idShort} - ${taskPreview}`);
-
-  let row = 1;
+  const taskPreview = session ? String(session.task || "").slice(0, 44) : "no session";
+  const header1 = `Solve ${idShort} - ${taskPreview}`;
+  writeColoredLine(0, header1, cols, TOKEN_COLOR);
+  let statusText = "";
   if (solveActive) {
-    setRow(
-      row,
-      `Status: ${solveLastStatus || "working..."} (iteration ${solveIteration}/${SOLVE_MAX_ITERATIONS}) - Esc aborts`,
-      BLUE_COLOR
-    );
-    row += 1;
+    statusText = `Status: ${solveLastStatus || "working..."} (iteration ${solveIteration}/${SOLVE_MAX_ITERATIONS}) - Esc aborts`;
   } else if (session) {
     const endState = session.solved ? "SOLVE_OK reached" : session.abortRequested ? "aborted" : "unsolved";
-    setRow(row, `Status: ${endState} - Esc returns`, PLACEHOLDER_COLOR);
-    row += 1;
+    statusText = `Status: ${endState} - Esc returns`;
+  }
+  if (statusText) {
+    writeColoredLine(1, statusText, cols, solveActive ? BLUE_COLOR : PLACEHOLDER_COLOR);
   }
 
-  const allLines = buildSolveSessionLines(session, panelWidth - 2);
-  const footerRow = rows - 1;
-  const headerRows = row;
-  const visibleRows = Math.max(1, footerRow - headerRows);
+  // Body: reuse the exact chat transcript renderer so reasoning traces,
+  // tool blocks, bullets, and markdown styling match the main window.
+  const bodyTop = 2;
+  const bodyHeight = Math.max(1, rows - bodyTop - 1);
+  const entries = session && Array.isArray(session.entries) ? session.entries : [];
+  const allLines = buildChatVisualLines(cols, entries);
   const total = allLines.length;
-
   if (total > 0) {
-    const maxOffset = Math.max(0, total - visibleRows);
+    const maxOffset = Math.max(0, total - bodyHeight);
     if (solveScrollOffset > maxOffset) {
       solveScrollOffset = maxOffset;
     }
     if (solveScrollOffset < 0) {
       solveScrollOffset = 0;
     }
-    const startLine = Math.max(0, total - visibleRows - solveScrollOffset);
-    for (let li = startLine; li < total && row < footerRow; li += 1) {
-      const line = allLines[li];
-      setRow(row, line.text.slice(0, panelWidth), line.color || null);
-      row += 1;
+    const startIndex = Math.max(0, total - bodyHeight - solveScrollOffset);
+    for (let row = 0; row < bodyHeight; row += 1) {
+      const line = allLines[startIndex + row];
+      if (!line) {
+        writeLine(bodyTop + row, "", cols);
+        continue;
+      }
+      if (line.styledText) {
+        writeStyledLine(bodyTop + row, line.text, line.styledText, cols);
+      } else if (line.color === GREEN_COLOR) {
+        writeColoredLine(bodyTop + row, line.text, cols, GREEN_COLOR);
+      } else if (line.color === RED_COLOR) {
+        writeColoredLine(bodyTop + row, line.text, cols, RED_COLOR);
+      } else if (line.color === PLACEHOLDER_COLOR) {
+        writeColoredLine(bodyTop + row, line.text, cols, PLACEHOLDER_COLOR);
+      } else {
+        writeLine(bodyTop + row, line.text, cols);
+        if (line.assistantBulletMuted) {
+          readline.cursorTo(process.stdout, CHAT_LEFT_PADDING.length, bodyTop + row);
+          process.stdout.write(`${PLACEHOLDER_COLOR}•${RESET_COLOR}`);
+        }
+      }
     }
   } else if (!solveActive) {
-    setRow(row, "waiting for first program...", PLACEHOLDER_COLOR);
+    writeColoredLine(bodyTop, "waiting for first program...", cols, PLACEHOLDER_COLOR);
   }
 
-  const scrollHint = total > visibleRows ? "  PgUp/PgDn scroll" : "";
-  setRow(footerRow, "Esc: return" + scrollHint, PLACEHOLDER_COLOR);
-
-  for (let y = 0; y < rows; y += 1) {
-    const nextRow = frameRows[y];
-    if (nextRow.color === BLUE_COLOR) {
-      writeColoredLine(y, nextRow.text, cols, BLUE_COLOR);
-    } else if (nextRow.color === GREEN_COLOR) {
-      writeColoredLine(y, nextRow.text, cols, GREEN_COLOR);
-    } else if (nextRow.color === TOKEN_COLOR) {
-      writeColoredLine(y, nextRow.text, cols, TOKEN_COLOR);
-    } else if (nextRow.color === PLACEHOLDER_COLOR) {
-      writeColoredLine(y, nextRow.text, cols, PLACEHOLDER_COLOR);
-    } else {
-      writeLine(y, nextRow.text, cols);
-    }
-  }
+  const scrollHint = total > bodyHeight ? "  PgUp/PgDn scroll" : "";
+  writeColoredLine(rows - 1, "Esc: return" + scrollHint, cols, PLACEHOLDER_COLOR);
   dirty = false;
 }
-
 function getSolveStatusText() {
   if (!solveActive) {
     return "";
@@ -5549,17 +5503,11 @@ async function runSolveLoop(taskText) {
     lastReply = payload.text;
   }
   if (session) {
+    // The first model reply's reasoning trace rides on the assistant entry
+    // (exactly like chat), so buildChatVisualLines renders the ◦ block above
+    // the program in the same style as the main window.
     solveSessionAppend(session, "assistant", "Requesting the first program from the model...");
-    const firstTrace = extractReasoningDisplayText(lastReasoning);
-    if (firstTrace && firstTrace.trim()) {
-      session.entries.push({
-        role: "reasoning",
-        content: firstTrace.trim(),
-        ts: Date.now(),
-      });
-      session.updatedAt = Date.now();
-      saveSolveSession(session);
-    }
+    void lastReasoning;
   }
 
   for (let iter = 1; iter <= SOLVE_MAX_ITERATIONS; iter += 1) {
@@ -5587,8 +5535,10 @@ async function runSolveLoop(taskText) {
     }
 
     if (session) {
-      const codePreview = code.slice(0, 400) + (code.length > 400 ? "…" : "");
-      solveSessionAppend(session, "assistant", `Iteration ${iter} program:\n${codePreview}`);
+      const codePreview = code.slice(0, 4000) + (code.length > 4000 ? "…" : "");
+      solveSessionAppend(session, "assistant", `Iteration ${iter} program:\n${codePreview}`, {
+        reasoningDetails: lastReasoning,
+      });
     }
     markDirty();
     renderFrame(true);
@@ -5599,9 +5549,13 @@ async function runSolveLoop(taskText) {
     const gotSolvedMarker = stdoutText.includes(SOLVE_OK_SENTINEL);
 
     if (session) {
-      const outputText = (stdoutText || "(no stdout)").slice(0, 4000);
-      const errText = stderrText ? `\n[error] ${stderrText.slice(0, 2000)}` : "";
-      solveSessionAppend(session, "tool", `Kernel output (iteration ${iter}):\n${outputText}${errText}`);
+      const outputText = (stdoutText || "(no stdout)").slice(0, 6000);
+      const errText = stderrText ? `\n[error] ${stderrText.slice(0, 3000)}` : "";
+      solveSessionAppend(session, "tool", `Kernel output (iteration ${iter}):\n${outputText}${errText}`, {
+        name: "kernel_exec",
+        toolInput: `iteration ${iter}`,
+        toolOk: Boolean(kernelResult?.ok),
+      });
     }
     markDirty();
     renderFrame(true);
@@ -5657,16 +5611,8 @@ ${stderrText.slice(0, 3000)}` : "STDERR: (none)",
     // Persist the reasoning trace for this model reply so the solve window
     // can render it dimmed like the chat window.
     if (session) {
-      const traceText = extractReasoningDisplayText(lastReasoning);
-      if (traceText.trim()) {
-        session.entries.push({
-          role: "reasoning",
-          content: traceText,
-          ts: Date.now(),
-        });
-        session.updatedAt = Date.now();
-        saveSolveSession(session);
-      }
+      // Reasoning for the revised program rides on the assistant entry that
+      // gets appended next iteration; nothing extra to persist here.
     }
   }
   return Boolean(solveLastStatus && solveLastStatus.includes("SOLVE_OK"));
@@ -12112,19 +12058,17 @@ process.stdin.on("keypress", async (str, key) => {
 
     if (key?.name === "pageup" || key?.name === "pagedown" || key?.name === "up" || key?.name === "down") {
       const session = getActiveSolveSession();
-      if (session && session.entries.length > 0) {
+      if (session && Array.isArray(session.entries) && session.entries.length > 0) {
         const rows = process.stdout.rows || 24;
         const cols = process.stdout.columns || 80;
-        const panelWidth = Math.min(Math.max(60, Math.floor(cols * 0.92)), cols);
-        const allLines = buildSolveSessionLines(session, panelWidth - 2);
+        const bodyHeight = Math.max(1, rows - 4);
+        const allLines = buildChatVisualLines(cols, session.entries);
         const total = allLines.length;
-        // Header = title (1) + status (1) under active/complete; footer = 1 line.
-        const visibleRows = Math.max(1, rows - 3);
-        const maxOffset = Math.max(0, total - visibleRows);
+        const maxOffset = Math.max(0, total - bodyHeight);
         if (key.name === "pageup") {
-          solveScrollOffset = Math.min(maxOffset, solveScrollOffset + Math.max(1, Math.floor(rows / 2)));
+          solveScrollOffset = Math.min(maxOffset, solveScrollOffset + Math.max(1, Math.floor(bodyHeight / 2)));
         } else if (key.name === "pagedown") {
-          solveScrollOffset = Math.max(0, solveScrollOffset - Math.max(1, Math.floor(rows / 2)));
+          solveScrollOffset = Math.max(0, solveScrollOffset - Math.max(1, Math.floor(bodyHeight / 2)));
         } else if (key.name === "up") {
           solveScrollOffset = Math.min(maxOffset, solveScrollOffset + 1);
         } else {
