@@ -33,8 +33,15 @@ const CODE_BLOCK_STRING_COLOR = "\u001b[38;5;151m";
 const CODE_BLOCK_NUMBER_COLOR = "\u001b[38;5;222m";
 const CODE_BLOCK_COMMENT_COLOR = "\u001b[38;5;244m";
 const CODE_BLOCK_BUILTIN_COLOR = "\u001b[38;5;117m";
-const DIFF_ADD_BG_COLOR = "\u001b[48;5;22m\u001b[38;5;231m";
-const DIFF_REMOVE_BG_COLOR = "\u001b[48;5;52m\u001b[38;5;231m";
+const DIFF_ADD_BG_COLOR = "\u001b[48;2;12;50;28m";
+const DIFF_REMOVE_BG_COLOR = "\u001b[48;2;58;24;28m";
+const DIFF_LINE_NUMBER_COLOR = "\u001b[38;5;245m";
+const DIFF_ADD_MARKER_COLOR = "\u001b[38;5;157m";
+const DIFF_REMOVE_MARKER_COLOR = "\u001b[38;5;210m";
+const DIFF_DEFAULT_TEXT_COLOR = "\u001b[38;5;250m";
+const DIFF_DIM_TEXT = "\u001b[2m";
+const DIFF_NORMAL_INTENSITY = "\u001b[22m";
+const DIFF_LEFT_PADDING = "  ";
 const MARKDOWN_HEADER_COLOR = "\u001b[96m";
 const MARKDOWN_LIST_MARKER_COLOR = "\u001b[96m";
 const MARKDOWN_QUOTE_COLOR = "\u001b[90m";
@@ -4876,6 +4883,56 @@ function applyHistoryActionsFromTool(actions, generation) {
   return { processedActions, appliedCount, changed, errorCount };
 }
 
+function addUnifiedDiffLineNumbers(lines) {
+  const sourceLines = Array.isArray(lines) ? lines.map((line) => String(line ?? "")) : [];
+  let largestLineNumber = 1;
+  for (const line of sourceLines) {
+    const match = line.match(/^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/);
+    if (!match) {
+      continue;
+    }
+    const oldEnd = Number(match[1]) + Math.max(1, Number(match[2]) || 1) - 1;
+    const newEnd = Number(match[3]) + Math.max(1, Number(match[4]) || 1) - 1;
+    largestLineNumber = Math.max(largestLineNumber, oldEnd, newEnd);
+  }
+
+  const width = Math.max(3, String(largestLineNumber).length);
+  const output = [];
+  let oldLine = 0;
+  let newLine = 0;
+  let insideHunk = false;
+
+  for (const line of sourceLines) {
+    const hunk = line.match(/^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/);
+    if (hunk) {
+      oldLine = Number(hunk[1]);
+      newLine = Number(hunk[3]);
+      insideHunk = true;
+      continue;
+    }
+
+    if (!insideHunk || line.startsWith("---") || line.startsWith("+++")) {
+      continue;
+    }
+    if (line.startsWith("\\ No newline at end of file")) {
+      continue;
+    } else if (line.startsWith("+") && !line.startsWith("+++")) {
+      output.push(`${DIFF_LEFT_PADDING}${String(newLine).padStart(width)} + ${line.slice(1)}`);
+      newLine += 1;
+    } else if (line.startsWith("-") && !line.startsWith("---")) {
+      output.push(`${DIFF_LEFT_PADDING}${String(oldLine).padStart(width)} - ${line.slice(1)}`);
+      oldLine += 1;
+    } else if (line.startsWith(" ")) {
+      output.push(`${DIFF_LEFT_PADDING}${String(newLine).padStart(width)}   ${line.slice(1)}`);
+      oldLine += 1;
+      newLine += 1;
+    } else {
+      insideHunk = false;
+    }
+  }
+  return output;
+}
+
 function getToolResultLinesForDisplay(text) {
   const normalized = String(text ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trimEnd();
   if (!normalized) {
@@ -4888,7 +4945,7 @@ function getToolResultLinesForDisplay(text) {
     /(^|\n)\+\+\+\s+b\//.test(normalized) &&
     /(^|\n)@@\s/.test(normalized);
   if (hasUnifiedDiffMarkers) {
-    return originalLines;
+    return addUnifiedDiffLineNumbers(originalLines);
   }
 
   const wrapCols = Math.max(20, TOOL_RESULT_TRUNCATE_WRAP_COLS);
@@ -8906,14 +8963,96 @@ function getDiffBackgroundColor(toolLineText) {
     return null;
   }
 
-  const normalized = raw.startsWith("\u2514 ") ? raw.slice(2) : raw.startsWith("  ") ? raw.slice(2) : raw;
-  if (normalized.startsWith("+") && !normalized.startsWith("+++")) {
+  const normalized = raw.startsWith("\u2514 ") ? raw.slice(2) : raw;
+  if (/^\s*\d+ \+ /.test(normalized)) {
     return DIFF_ADD_BG_COLOR;
   }
-  if (normalized.startsWith("-") && !normalized.startsWith("---")) {
+  if (/^\s*\d+ - /.test(normalized)) {
     return DIFF_REMOVE_BG_COLOR;
   }
   return null;
+}
+
+function getUnifiedDiffTargetPath(text) {
+  const match = String(text ?? "").match(/^\+\+\+\s+b\/(.+)$/m);
+  return match ? match[1].trim() : "";
+}
+
+function highlightDiffCode(code, filePath) {
+  const source = String(code ?? "");
+  const extension = path.extname(String(filePath || "")).toLowerCase();
+  const keywords = new Set([
+    "async", "await", "break", "case", "catch", "class", "const", "continue",
+    "def", "delete", "do", "else", "export", "extends", "false", "finally",
+    "for", "from", "function", "if", "import", "in", "let", "new", "None",
+    "null", "return", "switch", "throw", "true", "try", "var", "while", "yield",
+  ]);
+  const tokenPattern = /<!--.*?-->|\/\/.*$|\/\*.*?\*\/|#[^\s{][^\r\n]*$|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|#[0-9a-fA-F]{3,8}\b|\b\d+(?:\.\d+)?(?:px|rem|em|vh|vw|%|ms|s)?\b|\b[A-Za-z_$][\w$-]*\b/g;
+  let output = "";
+  let cursor = 0;
+  let match = null;
+  while ((match = tokenPattern.exec(source)) !== null) {
+    output += source.slice(cursor, match.index);
+    const token = match[0];
+    let color = DIFF_DEFAULT_TEXT_COLOR;
+    if (/^(?:<!--|\/\/|\/\*|#(?![0-9a-fA-F]{3,8}\b))/.test(token)) {
+      color = CODE_BLOCK_COMMENT_COLOR;
+    } else if (/^["'`]/.test(token) || /^#[0-9a-fA-F]{3,8}$/.test(token)) {
+      color = CODE_BLOCK_STRING_COLOR;
+    } else if (/^\d/.test(token)) {
+      color = CODE_BLOCK_NUMBER_COLOR;
+    } else if (keywords.has(token)) {
+      color = CODE_BLOCK_KEYWORD_COLOR;
+    } else if (
+      (extension === ".html" || extension === ".htm" || extension === ".xml" || extension === ".svg") &&
+      source.slice(Math.max(0, match.index - 2), match.index).includes("<")
+    ) {
+      color = CODE_BLOCK_BUILTIN_COLOR;
+    } else if (
+      (extension === ".css" || extension === ".scss" || extension === ".less") &&
+      /^\s*:/.test(source.slice(tokenPattern.lastIndex))
+    ) {
+      color = CODE_BLOCK_KEYWORD_COLOR;
+    }
+    output += `${color}${token}${DIFF_DEFAULT_TEXT_COLOR}`;
+    cursor = tokenPattern.lastIndex;
+  }
+  return output + source.slice(cursor);
+}
+
+function styleCompactDiffLine(visibleText, contentWidth, filePath, backgroundColor = "") {
+  const source = String(visibleText ?? "");
+  const changed = source.match(/^(\s*\d+) ([+-]) (.*)$/);
+  const context = changed ? null : source.match(/^(\s*\d+)   (.*)$/);
+  if (!changed && !context) {
+    return null;
+  }
+  const lineNumber = (changed || context)[1];
+  const marker = changed ? changed[2] : " ";
+  const code = changed ? changed[3] : context[2];
+  const markerColor = marker === "+"
+    ? DIFF_ADD_MARKER_COLOR
+    : marker === "-"
+      ? DIFF_REMOVE_MARKER_COLOR
+      : DIFF_DEFAULT_TEXT_COLOR;
+  const prefix = `${DIFF_LINE_NUMBER_COLOR}${lineNumber}${DIFF_DEFAULT_TEXT_COLOR} ${markerColor}${marker}${DIFF_DEFAULT_TEXT_COLOR} `;
+  const visibleLength = lineNumber.length + 3 + code.length;
+  const padding = visibleLength < contentWidth ? " ".repeat(contentWidth - visibleLength) : "";
+  const codeIntensity = marker === "-" ? DIFF_DIM_TEXT : "";
+  const restoreIntensity = marker === "-" ? DIFF_NORMAL_INTENSITY : "";
+  return `${backgroundColor}${prefix}${codeIntensity}${highlightDiffCode(code, filePath)}${restoreIntensity}${DIFF_DEFAULT_TEXT_COLOR}${padding}${RESET_COLOR}`;
+}
+
+function styleCompactDiffContinuation(
+  visibleText,
+  contentWidth,
+  filePath,
+  backgroundColor = "",
+  dimText = false
+) {
+  const source = String(visibleText ?? "");
+  const padding = source.length < contentWidth ? " ".repeat(contentWidth - source.length) : "";
+  return `${backgroundColor}${DIFF_DEFAULT_TEXT_COLOR}${dimText ? DIFF_DIM_TEXT : ""}${highlightDiffCode(source, filePath)}${dimText ? DIFF_NORMAL_INTENSITY : ""}${DIFF_DEFAULT_TEXT_COLOR}${padding}${RESET_COLOR}`;
 }
 
 function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80) {
@@ -8954,8 +9093,9 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
       }
     }
     const resultLines = getToolResultLinesForDisplay(resultSource);
+    const resultIsDiff = isUnifiedDiffText(resultSource);
     const formattedResults = (resultLines.length > 0 ? resultLines : [""]).map((line, i) =>
-      i === 0 ? `\u2514 ${line}` : `  ${line}`
+      resultIsDiff ? line : i === 0 ? `\u2514 ${line}` : `  ${line}`
     );
     const hasDistinctCode = executedCode.length > 0 && executedCode !== assistantInput;
     logicalLines = [toolHeader];
@@ -8980,6 +9120,11 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
     }
   }
 
+  if (role === "tool" && !hasStructuredToolMeta && isUnifiedDiffText(message)) {
+    logicalLines = getToolResultLinesForDisplay(message);
+    logicalLineMeta = logicalLines.map((line) => ({ text: line, python: false, fence: false }));
+  }
+
   if (role === "assistant" && !hasStructuredToolMeta) {
     logicalLineMeta = annotateAssistantCodeBlocks(message);
     logicalLines = logicalLineMeta.map((item) => item.text);
@@ -8990,6 +9135,7 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
   // Unified-diff detection for the whole tool payload; +/- lines only get
   // the diff background when the output genuinely contains a patch.
   const looksLikeDiff = isToolCall && isUnifiedDiffText(message);
+  const diffTargetPath = looksLikeDiff ? getUnifiedDiffTargetPath(message) : "";
   const isErrorMessage = role === "error";
   const toolColor = isToolCall
     ? (structuredToolOk === true
@@ -9028,6 +9174,7 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
       const wrappedLine = wrapped[w];
       const visibleText = wrappedLine.fullText;
       let line = visibleText;
+      let preserveDiffStyle = false;
 
       if (isErrorMessage) {
         line = `${RED_COLOR}${visibleText}${RESET_COLOR}`;
@@ -9041,8 +9188,25 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
         // not a +/- prefix, so per-chunk detection would miss them).
         const lineDiffBgColor =
           isToolCall && looksLikeDiff && i > 0 ? getDiffBackgroundColor(body) : null;
-        if (lineDiffBgColor) {
-          line = `${lineDiffBgColor}${visibleText.padEnd(contentWidth, " ")}${RESET_COLOR}`;
+        const compactDiffLine = looksLikeDiff
+          ? styleCompactDiffLine(visibleText, contentWidth, diffTargetPath, lineDiffBgColor || "")
+          : null;
+        if (compactDiffLine) {
+          line = compactDiffLine;
+          preserveDiffStyle = true;
+        } else if (
+          looksLikeDiff &&
+          w > 0 &&
+          /^\s*\d+ (?:[+-] |  )/.test(body)
+        ) {
+          line = styleCompactDiffContinuation(
+            visibleText,
+            contentWidth,
+            diffTargetPath,
+            lineDiffBgColor || "",
+            /^\s*\d+ - /.test(body)
+          );
+          preserveDiffStyle = true;
         } else {
           const color = i === 0 && w === 0 ? toolColor : PLACEHOLDER_COLOR;
           const editedHeaderStyled =
@@ -9064,11 +9228,11 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
         }
       }
 
-      output.push(styleInlineTokens(line));
+      output.push(preserveDiffStyle ? line : styleInlineTokens(line));
     }
   }
 
-  if (role === "tool") {
+  if (role === "tool" && !looksLikeDiff) {
     const divider = "\u2500".repeat(Math.max(3, contentWidth));
     output.push("");
     output.push(`${PLACEHOLDER_COLOR}${divider}${RESET_COLOR}`);
@@ -11869,6 +12033,16 @@ function runFormatSelfTest() {
       out("FORMAT_FAIL: real unified diff should be detected");
       return 1;
     }
+    const numberedDiff = getToolResultLinesForDisplay(realDiff).join("\n");
+    if (
+      !/^\s*10\s{3}console\.log\("start"\);$/m.test(numberedDiff) ||
+      !/^\s*11 - console\.log\("removed"\);$/m.test(numberedDiff) ||
+      !/^\s*11 \+ console\.log\("added"\);$/m.test(numberedDiff) ||
+      /(?:^|\n)(?:---|\+\+\+|@@|\s*old\s+new)|\u2502/.test(numberedDiff)
+    ) {
+      out(`FORMAT_FAIL: compact unified diff line numbers are incorrect\n${numberedDiff}`);
+      return 1;
+    }
     if (isUnifiedDiffText("- some bullet text\nnothing else")) {
       out("FORMAT_FAIL: plain tool text starting with '-' must not be a diff");
       return 1;
@@ -11890,6 +12064,15 @@ function runFormatSelfTest() {
     const diffToolJoined = diffToolLines.join("\n");
     if (!diffToolJoined.includes(DIFF_REMOVE_BG_COLOR) || !diffToolJoined.includes(DIFF_ADD_BG_COLOR)) {
       out("FORMAT_FAIL: real diff lines should get diff backgrounds");
+      return 1;
+    }
+    if (
+      !diffToolJoined.includes(DIFF_ADD_MARKER_COLOR) ||
+      !diffToolJoined.includes(DIFF_REMOVE_MARKER_COLOR) ||
+      !diffToolJoined.includes(DIFF_DIM_TEXT) ||
+      !diffToolJoined.includes(CODE_BLOCK_STRING_COLOR)
+    ) {
+      out("FORMAT_FAIL: diff markers, removed-line dimming, or syntax highlighting is missing");
       return 1;
     }
 
