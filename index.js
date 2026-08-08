@@ -5311,6 +5311,18 @@ function renderSolveBuffer() {
     const startIdx = Math.max(0, session.entries.length - visibleRows - solveScrollOffset);
     for (let i = startIdx; i < session.entries.length; i += 1) {
       const entry = session.entries[i];
+      if (entry.role === "reasoning") {
+        // Reasoning traces render dimmed like the chat window's trace blocks:
+        // a single dot on the first line, indented continuations.
+        const traceText = String(entry.content || "");
+        const traceLines = traceText.split("\n").slice(0, visibleRows);
+        for (let tl = 0; tl < traceLines.length && row < rows - 1; tl += 1) {
+          const lineText = "  \u25e6 " + traceLines[tl];
+          setRow(row, lineText.slice(0, panelWidth), PLACEHOLDER_COLOR);
+          row += 1;
+        }
+        continue;
+      }
       const roleLabel = entry.role === "user" ? "task" : entry.role === "assistant" ? "model" : entry.role;
       const content = String(entry.content || "").replace(/\r?\n/g, " ");
       const clipped = content.length > panelWidth - 6 ? content.slice(0, panelWidth - 9) + "..." : content;
