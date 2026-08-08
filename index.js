@@ -7777,7 +7777,7 @@ async function runSlashCommand(commandName, commandArgs = "") {
         ? args.slice("cancel".length).trim()
         : "";
       if (cancelId) {
-        const removed = removeLoopTask(cancelId);
+        let removed = removeLoopTask(cancelId);
         if (!removed && cancelId.startsWith("/")) {
           // Allow: /loops cancel <id> where the id contains no slashes
           const normalizedId = cancelId.replace(/^\/+/, "");
