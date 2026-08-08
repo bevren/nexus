@@ -5493,15 +5493,31 @@ async function runSolveLoop(taskText) {
     ],
     {}
   );
-  if (session) {
-    solveSessionAppend(session, "assistant", "Requesting the first program from the model...");
-  }
   let lastReply = extractAssistantText(firstRequest?.choices?.[0]?.message?.content);
+  let lastReasoning = normalizeReasoningDetails(
+    extractAssistantPayloadFromCompletion(firstRequest, { allowReasoningTextFallback: false }).reasoningDetails
+  );
+  if (!lastReasoning) {
+    lastReasoning = normalizeReasoningDetails(firstRequest?.choices?.[0]?.message?.reasoning_details);
+  }
   if (!lastReply.trim()) {
     const payload = extractAssistantPayloadFromCompletion(firstRequest, {
       allowReasoningTextFallback: true,
     });
     lastReply = payload.text;
+  }
+  if (session) {
+    solveSessionAppend(session, "assistant", "Requesting the first program from the model...");
+    const firstTrace = extractReasoningDisplayText(lastReasoning);
+    if (firstTrace && firstTrace.trim()) {
+      session.entries.push({
+        role: "reasoning",
+        content: firstTrace.trim(),
+        ts: Date.now(),
+      });
+      session.updatedAt = Date.now();
+      saveSolveSession(session);
+    }
   }
 
   for (let iter = 1; iter <= SOLVE_MAX_ITERATIONS; iter += 1) {
@@ -5583,6 +5599,9 @@ ${stderrText.slice(0, 3000)}` : "STDERR: (none)",
       {}
     );
     let nextReply = extractAssistantText(iterationRequest?.choices?.[0]?.message?.content);
+    const nextReasoning = normalizeReasoningDetails(
+      extractAssistantPayloadFromCompletion(iterationRequest, { allowReasoningTextFallback: false }).reasoningDetails
+    );
     if (!nextReply.trim()) {
       const payload = extractAssistantPayloadFromCompletion(iterationRequest, {
         allowReasoningTextFallback: true,
@@ -5590,6 +5609,23 @@ ${stderrText.slice(0, 3000)}` : "STDERR: (none)",
       nextReply = payload.text;
     }
     lastReply = nextReply || "";
+    if (nextReasoning) {
+      lastReasoning = nextReasoning;
+    }
+    // Persist the reasoning trace for this model reply so the solve window
+    // can render it dimmed like the chat window.
+    if (session) {
+      const traceText = extractReasoningDisplayText(lastReasoning);
+      if (traceText.trim()) {
+        session.entries.push({
+          role: "reasoning",
+          content: traceText,
+          ts: Date.now(),
+        });
+        session.updatedAt = Date.now();
+        saveSolveSession(session);
+      }
+    }
   }
   return Boolean(solveLastStatus && solveLastStatus.includes("SOLVE_OK"));
 }
