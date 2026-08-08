@@ -7,7 +7,7 @@ if [ -z "${PREFIX:-}" ] || [ ! -x "${PREFIX}/bin/pkg" ]; then
 fi
 
 echo "Installing the on-phone Android build toolchain..."
-pkg install -y openjdk-21 aapt d8 apksigner
+pkg install -y openjdk-21 aapt aapt2 d8 apksigner curl unzip
 
 missing=""
 for command_name in java javac jar keytool aapt d8 apksigner; do
@@ -21,9 +21,32 @@ if [ -n "$missing" ]; then
   exit 1
 fi
 
-ANDROID_JAR="${PREFIX}/share/aapt/android.jar"
+SDK_ROOT="${NEXUS_ANDROID_SDK_ROOT:-$HOME/.nexus/android-sdk}"
+PLATFORM_DIR="$SDK_ROOT/platforms/android-34"
+ANDROID_JAR="$PLATFORM_DIR/android.jar"
+PLATFORM_URL="https://dl.google.com/android/repository/platform-34-ext7_r03.zip"
+PLATFORM_SHA1="1f2e9478d6a7601425ceaa553311dc43191f103d"
+
 if [ ! -f "$ANDROID_JAR" ]; then
-  echo "Android framework jar was not installed at: $ANDROID_JAR" >&2
+  DOWNLOAD_DIR="${TMPDIR:-${PREFIX}/tmp}"
+  PLATFORM_ZIP="$DOWNLOAD_DIR/nexus-platform-34.zip"
+  mkdir -p "$DOWNLOAD_DIR" "$SDK_ROOT/platforms"
+
+  echo "Downloading Android SDK Platform 34 (about 63 MB)..."
+  curl -fL --retry 3 --progress-bar "$PLATFORM_URL" -o "$PLATFORM_ZIP"
+  if ! echo "$PLATFORM_SHA1  $PLATFORM_ZIP" | sha1sum -c -; then
+    rm -f "$PLATFORM_ZIP"
+    echo "Android platform checksum verification failed." >&2
+    exit 1
+  fi
+
+  rm -rf "$PLATFORM_DIR"
+  unzip -q "$PLATFORM_ZIP" -d "$SDK_ROOT/platforms"
+  rm -f "$PLATFORM_ZIP"
+fi
+
+if [ ! -f "$ANDROID_JAR" ]; then
+  echo "Android framework jar was not created at: $ANDROID_JAR" >&2
   exit 1
 fi
 

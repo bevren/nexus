@@ -10,12 +10,25 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 BUILD_DIR="$SCRIPT_DIR/build"
 CLASSES_DIR="$BUILD_DIR/classes"
 DEX_DIR="$BUILD_DIR/dex"
-ANDROID_JAR="${PREFIX}/share/aapt/android.jar"
 UNSIGNED_APK="$BUILD_DIR/nexus-phone-build-unsigned.apk"
 ALIGNED_APK="$BUILD_DIR/nexus-phone-build-aligned.apk"
 SIGNED_APK="$BUILD_DIR/nexus-phone-build.apk"
 KEYSTORE_DIR="$HOME/.nexus/android"
 KEYSTORE="$KEYSTORE_DIR/debug.keystore"
+
+find_android_jar() {
+  for candidate in \
+    "${NEXUS_ANDROID_JAR:-}" \
+    "$HOME/.nexus/android-sdk/platforms/android-34/android.jar" \
+    "${ANDROID_HOME:-}/platforms/android-34/android.jar" \
+    "${PREFIX}/share/aapt/android.jar"; do
+    if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
 
 for command_name in javac jar keytool aapt d8 apksigner; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -24,11 +37,14 @@ for command_name in javac jar keytool aapt d8 apksigner; do
   fi
 done
 
-if [ ! -f "$ANDROID_JAR" ]; then
-  echo "Missing Android framework: $ANDROID_JAR" >&2
+ANDROID_JAR=$(find_android_jar || true)
+if [ -z "$ANDROID_JAR" ]; then
+  echo "Missing Android framework (android.jar)." >&2
   echo "Run: sh termux/setup-android-build.sh" >&2
   exit 1
 fi
+
+echo "Using Android framework: $ANDROID_JAR"
 
 rm -rf "$BUILD_DIR"
 mkdir -p "$CLASSES_DIR" "$DEX_DIR" "$KEYSTORE_DIR"

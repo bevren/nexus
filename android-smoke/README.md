@@ -11,6 +11,11 @@ sh termux/setup-android-build.sh
 sh android-smoke/build-termux.sh --install
 ```
 
+The setup downloads Google's Android SDK Platform 34 archive (about 63 MB),
+verifies its published SHA-1 checksum, and stores it under
+`$HOME/.nexus/android-sdk`. The Termux `aapt` package supplies the native ARM64
+packaging binary but does not itself contain `android.jar`.
+
 The build succeeds when the script prints `PHONE_BUILD_OK`. Android then asks
 for permission to install the APK. Allow Termux as an installation source if
 the system settings page appears.
