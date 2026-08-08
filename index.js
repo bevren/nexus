@@ -5535,8 +5535,16 @@ async function runSolveLoop(taskText) {
     }
 
     if (session) {
-      const codePreview = code.slice(0, 4000) + (code.length > 4000 ? "…" : "");
-      solveSessionAppend(session, "assistant", `Iteration ${iter} program:\n${codePreview}`, {
+      // Store the program as a fenced python block so the solve transcript
+      // renders it exactly like a chat assistant code block (syntax
+      // highlighting from annotateAssistantCodeBlocks -> highlightPythonCodeLine)
+      // with no "Iteration N program:" label.
+      let codeText = code;
+      if (codeText.length > 4000) {
+        codeText = codeText.slice(0, 4000) + "\n# ...truncated";
+      }
+      const BT = String.fromCharCode(96, 96, 96);
+      solveSessionAppend(session, "assistant", `${BT}python\n${codeText}\n${BT}`, {
         reasoningDetails: lastReasoning,
       });
     }
