@@ -2619,6 +2619,38 @@ function pickDynamicLoopDelay(task) {
   return task.lastDelayMs;
 }
 
+function buildReminderNotificationInput(task, content, scheduledAt) {
+  const label = String(task?.displayLabel || "").trim();
+  const fireTime = Number(scheduledAt);
+  return {
+    notification_type: "reminder",
+    title: label || "Scheduled reminder",
+    message: String(content || ""),
+    reminder_id: String(task?.id || ""),
+    reminder_label: label,
+    recurring: task?.oneshot !== true,
+    scheduled_at: Number.isFinite(fireTime) ? fireTime : Date.now(),
+  };
+}
+
+function appendPendingHookContext(context) {
+  const value = String(context || "").trim();
+  if (!value) {
+    return;
+  }
+  pendingHookContext += `${pendingHookContext ? "\n" : ""}${value}`;
+}
+
+async function runReminderArrivalHooks(task, content, scheduledAt) {
+  const hookRun = await runHooks({
+    eventName: "Notification",
+    matcherValue: "reminder",
+    input: buildReminderNotificationInput(task, content, scheduledAt),
+    timeoutMs: 10000,
+  });
+  appendPendingHookContext(hookRun.additionalContext);
+}
+
 async function checkDueLoops() {
   if (loopFiring || loopTasks.length === 0) {
     return;
@@ -2638,6 +2670,7 @@ async function checkDueLoops() {
       if (!loopTasks.includes(task)) {
         continue;
       }
+      const scheduledAt = Number(task.nextFireAt) || now;
       if (task.oneshot) {
         removeLoopTask(task.id);
       } else {
@@ -2648,6 +2681,10 @@ async function checkDueLoops() {
         typeof task.prompt === "string" && task.prompt.trim()
           ? task.prompt.trim()
           : LOOP_MAINTENANCE_PROMPT;
+      // Reminder delivery is a Notification lifecycle event. Hooks observe it
+      // with matcher "reminder"; failures and block decisions never suppress
+      // the reminder itself.
+      await runReminderArrivalHooks(task, content, scheduledAt).catch(() => {});
       ensureSystemMessageAtTop();
       // Fire as a tool output (not a user message) so the transcript shows a
       // machine-originated event, and the model sees it as [tool result].
@@ -2951,6 +2988,7 @@ function parseEveryPhrase(text) {
 // - Events fired by the TUI: SessionStart, UserPromptSubmit, PreToolUse,
 //   PostToolUse, PostToolUseFailure, Stop, Notification, PreCompact,
 //   PostCompact, SessionEnd
+// - Notification matcher values include idle_prompt and reminder.
 // - Exit code 2 blocks the action; stderr becomes Claude feedback.
 //   stdout JSON may carry { hookSpecificOutput: { additionalContext, ... } }.
 // - Stop hooks are capped (stopHookBlockCount, stop_hook_active guard).
@@ -5103,15 +5141,6 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
     );
     return;
   }
-  const requestMessages = buildOpenRouterMessagesFromHistory(resolvedModel);
-  if (requestMessages.length === 0) {
-    finalizePendingAssistantMessage(pendingIndex, "(empty request)", generation, {
-      role: "error",
-      persistHistory: true,
-    });
-    return;
-  }
-
   // additionalContext from hooks (UserPromptSubmit/PreToolUse) is injected as
   // a system-reminder-style user entry before the LLM request.
   if (String(pendingHookContext || "").trim()) {
@@ -5122,6 +5151,15 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
       excludeFromRequest: false,
     });
     pendingHookContext = "";
+  }
+
+  const requestMessages = buildOpenRouterMessagesFromHistory(resolvedModel);
+  if (requestMessages.length === 0) {
+    finalizePendingAssistantMessage(pendingIndex, "(empty request)", generation, {
+      role: "error",
+      persistHistory: true,
+    });
+    return;
   }
 
   const requestWithTimeout = async (messagesForRequest, options = {}) => {
@@ -12263,6 +12301,25 @@ async function runLoopSelfTest() {
       out("LOOP_FAIL: normalizeLoopTask lost dynamic/oneshot flags\n");
       return 1;
     }
+
+    // Reminder hooks receive a stable Notification payload describing the
+    // occurrence before a recurring task's nextFireAt is advanced.
+    const reminderInput = buildReminderNotificationInput(
+      { id: "reminder-test", displayLabel: "in 5 minutes", oneshot: true },
+      "check the build",
+      123456
+    );
+    if (
+      reminderInput.notification_type !== "reminder" ||
+      reminderInput.title !== "in 5 minutes" ||
+      reminderInput.message !== "check the build" ||
+      reminderInput.reminder_id !== "reminder-test" ||
+      reminderInput.recurring !== false ||
+      reminderInput.scheduled_at !== 123456
+    ) {
+      out(`LOOP_FAIL: reminder hook payload wrong: ${JSON.stringify(reminderInput)}\n`);
+      return 1;
+    }
     if (restored.intervalMs !== 60000 || restored.nextFireAt !== stored.nextFireAt) {
       out("LOOP_FAIL: normalizeLoopTask lost schedule fields\n");
       return 1;
@@ -12575,6 +12632,42 @@ async function runHooksSelfTest() {
     }
     if (!hookMatcherMatches("", "anything")) {
       out("HOOKS_FAIL: empty matcher should match everything\n");
+      return 1;
+    }
+
+    // Reminder arrival uses Notification + matcher "reminder" and carries
+    // hook additionalContext into the immediately queued assistant turn.
+    const reminderSavedProject = hooksProject;
+    const reminderSavedUser = hooksUser;
+    const reminderSavedContext = pendingHookContext;
+    const reminderScriptPath = path.join(os.tmpdir(), `nexus-hook-reminder-${process.pid}.js`);
+    fsSync.writeFileSync(
+      reminderScriptPath,
+      "console.log(JSON.stringify({hookSpecificOutput:{additionalContext:'reminder hook context'}}))",
+      "utf8"
+    );
+    hooksProject = {
+      Notification: [
+        {
+          matcher: "reminder",
+          hooks: [{ type: "command", command: `"${process.execPath}" "${reminderScriptPath}"` }],
+        },
+      ],
+    };
+    hooksUser = {};
+    pendingHookContext = "existing context";
+    await runReminderArrivalHooks(
+      { id: "hook-reminder", displayLabel: "soon", oneshot: true },
+      "check it",
+      123456
+    );
+    const reminderContextResult = pendingHookContext;
+    hooksProject = reminderSavedProject;
+    hooksUser = reminderSavedUser;
+    pendingHookContext = reminderSavedContext;
+    fsSync.rmSync(reminderScriptPath, { force: true });
+    if (reminderContextResult !== "existing context\nreminder hook context") {
+      out(`HOOKS_FAIL: reminder hook context was not appended: ${JSON.stringify(reminderContextResult)}\n`);
       return 1;
     }
 
