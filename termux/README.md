@@ -57,3 +57,19 @@ sh termux/run.sh
 - Use Termux's extra-key row for Esc, arrows, and Ctrl.
 - Mouse tracking is disabled by the launcher because touch gestures can emit
   terminal mouse sequences. Set `TUI_ENABLE_MOUSE=1` to enable it deliberately.
+
+## Build Android apps on the phone
+
+The repository includes an editable starter app and an `android_build` agent
+tool. Set up the compiler and pair Wireless Debugging once:
+
+```sh
+sh termux/setup-android-build.sh
+sh termux/connect-adb.sh IP:PAIR_PORT PAIR_CODE IP:DEBUG_PORT
+```
+
+Then ask the TUI agent to edit the app and deploy it, or run:
+
+```sh
+sh android-smoke/build-termux.sh --deploy
+```

@@ -1,7 +1,8 @@
-# Phone-local Android build smoke test
+# Phone-local live Android project
 
-This app proves that the Android phone can compile Java, create DEX bytecode,
-package resources, sign an APK, and open the Android installer without a PC.
+This is an editable Android app that the TUI can build, update, and relaunch
+entirely on the phone. It deliberately uses the small native toolchain instead
+of Gradle: `AAPT -> javac -> D8 -> apksigner`.
 
 From the `simple-code-tui` repository in Termux:
 
@@ -37,6 +38,41 @@ The signed output is:
 android-smoke/build/nexus-phone-build.apk
 ```
 
-This deliberately avoids Gradle. It validates the smallest useful native
-pipeline first: `javac -> D8 -> AAPT -> apksigner`. Gradle and an agent-facing
-`android_build` tool come after this passes on the target phone.
+## Automatic edit-build-run loop
+
+Install the current toolchain, including on-phone ADB:
+
+```sh
+sh termux/setup-android-build.sh
+```
+
+Enable **Developer options > Wireless debugging**. Open **Pair device with
+pairing code**, note its address and code, and also note the separate address
+on the main Wireless debugging screen. Then pair once:
+
+```sh
+sh termux/connect-adb.sh IP:PAIR_PORT PAIR_CODE IP:DEBUG_PORT
+```
+
+After ADB reports `PHONE_ADB_OK`, one command rebuilds, reinstalls, and
+relaunches the app:
+
+```sh
+sh android-smoke/build-termux.sh --deploy
+```
+
+The TUI agent has the equivalent tool:
+
+```python
+android_build(project_path="android-smoke", deploy=True)
+```
+
+Ask the agent to change the app and show it on screen. It can edit these files:
+
+- `res/layout/activity_main.xml` for layout
+- `res/values/strings.xml` for text
+- `res/values/colors.xml` for colors
+- `src/dev/nexus/smoke/MainActivity.java` for behavior
+
+Wireless debugging may disconnect after a reboot or when Android disables the
+setting. Run `sh termux/connect-adb.sh IP:DEBUG_PORT` to reconnect.

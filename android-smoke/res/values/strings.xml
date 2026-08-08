@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Nexus Live App</string>
+    <string name="title">Built and edited entirely on this phone</string>
+    <string name="status">Termux to javac to D8 to AAPT to signed APK</string>
+    <string name="action">Test the live app</string>
+    <string name="tap_status">Live update works - tap %1$d</string>
+</resources>

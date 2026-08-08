@@ -219,6 +219,8 @@ const FALLBACK_TOOL_DESCRIPTIONS = {
     "replace_in_file(path: str, old: str, new: str, count: int = -1, use_regex: bool = False, regex_flags: str = '') -> dict: Replace text in a file (literal or regex).",
   run_shell:
     "run_shell(command: str, timeout: int|float = 10) -> dict: Run shell command with timeout seconds.",
+  android_build:
+    "android_build(project_path: str = 'android-smoke', deploy: bool = True, timeout: int|float = 300) -> dict: Build an Android project locally in Termux. With deploy=true, install the APK over paired on-phone ADB, stop the old app, and launch the updated activity.",
   get_git_status:
     "get_git_status() -> dict: Return git status summary.",
   get_git_diff:
