@@ -9075,8 +9075,10 @@ function handleMouseEvent(buttonCode, action) {
   // Wheel scrolling works in the buffer windows too:
   // - solve window: scroll the kernel transcript
   // - kernels window: move the selection through the session list
-  const isWheelUp = isWheel && (buttonCode & 1) === 1;
-  const isWheelDown = isWheel && (buttonCode & 1) !== 1;
+  // SGR mouse: wheel-up = 64, wheel-down = 65. `(buttonCode & 1)` is the
+  // "down" flag, so up is when that bit is NOT set.
+  const isWheelUp = isWheel && (buttonCode & 1) === 0;
+  const isWheelDown = isWheel && (buttonCode & 1) === 1;
   if (isWheel && (activeBuffer === "solve" || activeBuffer === "kernels")) {
     if (action !== "M") {
       return;
@@ -9154,7 +9156,8 @@ function handleMouseEvent(buttonCode, action) {
 
   const rows = process.stdout.rows || 24;
   const step = Math.max(1, Math.floor(rows / 6));
-  const changed = isWheelUp ? scrollChatBy(-step) : scrollChatBy(step);
+  // +step = toward history/top, -step = toward bottom/latest.
+  const changed = isWheelUp ? scrollChatBy(step) : scrollChatBy(-step);
   if (!changed) {
     return;
   }
