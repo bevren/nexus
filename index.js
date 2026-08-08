@@ -9069,13 +9069,59 @@ function scrollChatToTop() {
 }
 
 function handleMouseEvent(buttonCode, action) {
+  const isWheel = (buttonCode & 64) !== 0;
+  const buttonBase = buttonCode & 3;
+
+  // Wheel scrolling works in the buffer windows too:
+  // - solve window: scroll the kernel transcript
+  // - kernels window: move the selection through the session list
+  const isWheelUp = isWheel && (buttonCode & 1) === 1;
+  const isWheelDown = isWheel && (buttonCode & 1) !== 1;
+  if (isWheel && (activeBuffer === "solve" || activeBuffer === "kernels")) {
+    if (action !== "M") {
+      return;
+    }
+    const rows = process.stdout.rows || 24;
+    const step = Math.max(1, Math.floor(rows / 6));
+    if (activeBuffer === "solve") {
+      const session = getActiveSolveSession();
+      if (session && Array.isArray(session.entries) && session.entries.length > 0) {
+        const cols = process.stdout.columns || 80;
+        const bodyHeight = Math.max(1, rows - 4);
+        const allLines = buildChatVisualLines(cols, session.entries);
+        const total = allLines.length;
+        const maxOffset = Math.max(0, total - bodyHeight);
+        solveScrollOffset = Math.max(
+          0,
+          Math.min(maxOffset, solveScrollOffset + (isWheelUp ? step : -step))
+        );
+      }
+    } else {
+      if (solveSessions.length > 0) {
+        if (isWheelUp) {
+          kernelsSelected = Math.max(0, kernelsSelected - 1);
+        } else {
+          kernelsSelected = Math.min(solveSessions.length - 1, kernelsSelected + 1);
+        }
+        if (kernelsSelected < kernelsScroll) {
+          kernelsScroll = kernelsSelected;
+        } else {
+          const visibleCount = Math.max(1, Math.min(20, (process.stdout.rows || 24) - 4));
+          if (kernelsSelected >= kernelsScroll + visibleCount) {
+            kernelsScroll = kernelsSelected - visibleCount + 1;
+          }
+        }
+      }
+    }
+    markDirty();
+    renderFrame(true);
+    return;
+  }
+
   if (activeBuffer !== "main") {
     exitMouseSelectionMode();
     return;
   }
-
-  const isWheel = (buttonCode & 64) !== 0;
-  const buttonBase = buttonCode & 3;
 
   if (!isWheel) {
     const isLeftDown = action === "M" && buttonBase === 0;
@@ -9108,7 +9154,7 @@ function handleMouseEvent(buttonCode, action) {
 
   const rows = process.stdout.rows || 24;
   const step = Math.max(1, Math.floor(rows / 6));
-  const changed = (buttonCode & 1) === 1 ? scrollChatBy(-step) : scrollChatBy(step);
+  const changed = isWheelUp ? scrollChatBy(-step) : scrollChatBy(step);
   if (!changed) {
     return;
   }
