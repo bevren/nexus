@@ -1492,6 +1492,71 @@ def run_shell(command: str, timeout: int | float = 10) -> dict[str, object]:
         }
 
 
+def android_build(
+    project_path: str = "android-smoke",
+    deploy: bool = True,
+    timeout: int | float = 300,
+) -> dict[str, object]:
+    """Build an on-phone Android project and optionally install/relaunch it over ADB."""
+    if not isinstance(deploy, bool):
+        raise ValueError("deploy must be a boolean")
+    try:
+        timeout_seconds = float(timeout)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("timeout must be a number") from exc
+    if timeout_seconds <= 0 or timeout_seconds > 600:
+        raise ValueError("timeout must be > 0 and <= 600 seconds")
+
+    project_dir = _resolve_workspace_path(project_path)
+    if not project_dir.is_dir():
+        raise ValueError("project_path must point to a project directory")
+    build_script = project_dir / "build-termux.sh"
+    if not build_script.is_file():
+        raise ValueError("project_path must contain build-termux.sh")
+
+    command = ["sh", str(build_script)]
+    if deploy:
+        command.append("--deploy")
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(WORKSPACE_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+        return {
+            "ok": completed.returncode == 0,
+            "exit_code": int(completed.returncode),
+            "project_path": project_dir.relative_to(WORKSPACE_ROOT).as_posix(),
+            "deployed": deploy and completed.returncode == 0,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "timed_out": False,
+        }
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "exit_code": None,
+            "project_path": project_dir.relative_to(WORKSPACE_ROOT).as_posix(),
+            "deployed": False,
+            "stdout": "",
+            "stderr": "The sh command is unavailable; android_build must run inside Termux.",
+            "timed_out": False,
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "exit_code": None,
+            "project_path": project_dir.relative_to(WORKSPACE_ROOT).as_posix(),
+            "deployed": False,
+            "stdout": exc.stdout or "",
+            "stderr": exc.stderr or "",
+            "timed_out": True,
+            "error": f"Android build timed out after {timeout_seconds:g}s",
+        }
+
+
 async def get_file_info(path: str) -> dict[str, object]:
     """Return basic metadata for a file or directory."""
     target = _resolve_workspace_path(path)
@@ -2358,6 +2423,7 @@ FUNCTIONS = {
     "write_file": write_file,
     "replace_in_file": replace_in_file,
     "run_shell": run_shell,
+    "android_build": android_build,
     "get_git_status": get_git_status,
     "get_git_diff": get_git_diff,
     "get_git_log": get_git_log,
@@ -2402,6 +2468,7 @@ FUNCTION_DESCRIPTIONS = {
     "write_file": "write_file(path: str, content: str) -> dict: Write text file (create/overwrite) in workspace.",
     "replace_in_file": "replace_in_file(path: str, old: str, new: str, count: int = -1, use_regex: bool = False, regex_flags: str = '') -> dict: Replace text in a file (literal or regex).",
     "run_shell": "run_shell(command: str, timeout: int|float = 10) -> dict: Run shell command with timeout seconds.",
+    "android_build": "android_build(project_path: str = 'android-smoke', deploy: bool = True, timeout: int|float = 300) -> dict: Build an Android project locally in Termux. With deploy=true, install the APK over paired on-phone ADB, stop the old app, and launch the updated activity.",
     "get_git_status": "get_git_status() -> dict: Return git status summary.",
     "get_git_diff": "get_git_diff(path: str = '', staged: bool = False, context_lines: int = 3, max_chars: int = 60000) -> dict: Return git diff text.",
     "get_git_log": "get_git_log(max_count: int = 20) -> dict: Return recent git commits.",

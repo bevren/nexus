@@ -10,11 +10,14 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 BUILD_DIR="$SCRIPT_DIR/build"
 CLASSES_DIR="$BUILD_DIR/classes"
 DEX_DIR="$BUILD_DIR/dex"
+GENERATED_DIR="$BUILD_DIR/generated"
 UNSIGNED_APK="$BUILD_DIR/nexus-phone-build-unsigned.apk"
 ALIGNED_APK="$BUILD_DIR/nexus-phone-build-aligned.apk"
 SIGNED_APK="$BUILD_DIR/nexus-phone-build.apk"
 KEYSTORE_DIR="$HOME/.nexus/android"
 KEYSTORE="$KEYSTORE_DIR/debug.keystore"
+APP_PACKAGE="dev.nexus.smoke"
+APP_ACTIVITY="$APP_PACKAGE/.MainActivity"
 
 find_android_jar() {
   for candidate in \
@@ -47,17 +50,27 @@ fi
 echo "Using Android framework: $ANDROID_JAR"
 
 rm -rf "$BUILD_DIR"
-mkdir -p "$CLASSES_DIR" "$DEX_DIR" "$KEYSTORE_DIR"
+mkdir -p "$CLASSES_DIR" "$DEX_DIR" "$GENERATED_DIR" "$KEYSTORE_DIR"
 
-echo "[1/5] Compiling Java..."
-javac \
+echo "[1/5] Packaging resources and generating R.java..."
+aapt package \
+  -f \
+  -m \
+  -J "$GENERATED_DIR" \
+  -M "$SCRIPT_DIR/AndroidManifest.xml" \
+  -S "$SCRIPT_DIR/res" \
+  -I "$ANDROID_JAR" \
+  -F "$UNSIGNED_APK"
+
+echo "[2/5] Compiling Java..."
+find "$SCRIPT_DIR/src" "$GENERATED_DIR" -name '*.java' -exec javac \
   -source 8 \
   -target 8 \
   -bootclasspath "$ANDROID_JAR" \
   -d "$CLASSES_DIR" \
-  "$SCRIPT_DIR/src/dev/nexus/smoke/MainActivity.java"
+  {} +
 
-echo "[2/5] Creating classes.dex..."
+echo "[3/5] Creating classes.dex..."
 jar cf "$BUILD_DIR/classes.jar" -C "$CLASSES_DIR" .
 d8 \
   --lib "$ANDROID_JAR" \
@@ -65,20 +78,13 @@ d8 \
   --output "$DEX_DIR" \
   "$BUILD_DIR/classes.jar"
 
-echo "[3/5] Packaging resources and manifest..."
-aapt package \
-  -f \
-  -M "$SCRIPT_DIR/AndroidManifest.xml" \
-  -I "$ANDROID_JAR" \
-  -F "$UNSIGNED_APK"
-
+echo "[4/5] Adding bytecode, aligning, and signing..."
 UNSIGNED_ABS=$(CDPATH= cd -- "$(dirname -- "$UNSIGNED_APK")" && pwd)/$(basename -- "$UNSIGNED_APK")
 (
   cd "$DEX_DIR"
   aapt add "$UNSIGNED_ABS" classes.dex >/dev/null
 )
 
-echo "[4/5] Aligning and signing APK..."
 if command -v zipalign >/dev/null 2>&1; then
   zipalign -f 4 "$UNSIGNED_APK" "$ALIGNED_APK"
 else
@@ -112,7 +118,25 @@ echo
 echo "PHONE_BUILD_OK"
 echo "APK: $SIGNED_APK"
 
-if [ "${1:-}" = "--install" ]; then
+if [ "${1:-}" = "--deploy" ]; then
+  if ! command -v adb >/dev/null 2>&1; then
+    echo "Missing adb. Run: sh termux/setup-android-build.sh" >&2
+    exit 1
+  fi
+  if [ "$(adb get-state 2>/dev/null || true)" != "device" ]; then
+    echo "No paired Android debugging device is connected." >&2
+    echo "Open Android Settings > Developer options > Wireless debugging," >&2
+    echo "then run: sh termux/connect-adb.sh" >&2
+    exit 1
+  fi
+
+  echo "Installing updated APK through on-phone ADB..."
+  adb install -r -t "$SIGNED_APK"
+  echo "Relaunching $APP_PACKAGE..."
+  adb shell am force-stop "$APP_PACKAGE"
+  adb shell am start -W -n "$APP_ACTIVITY"
+  echo "PHONE_DEPLOY_OK"
+elif [ "${1:-}" = "--install" ]; then
   TERMUX_PROPERTIES="$HOME/.termux/termux.properties"
   if ! grep -Eq '^[[:space:]]*allow-external-apps[[:space:]]*=[[:space:]]*true[[:space:]]*$' "$TERMUX_PROPERTIES" 2>/dev/null; then
     echo >&2

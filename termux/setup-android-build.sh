@@ -7,10 +7,13 @@ if [ -z "${PREFIX:-}" ] || [ ! -x "${PREFIX}/bin/pkg" ]; then
 fi
 
 echo "Installing the on-phone Android build toolchain..."
-pkg install -y openjdk-21 aapt aapt2 d8 apksigner unzip
+echo "Termux uses rolling packages, so completing the package upgrade first..."
+apt update
+apt full-upgrade -y
+apt install -y openjdk-21 aapt aapt2 d8 apksigner android-tools unzip
 
 missing=""
-for command_name in node java javac jar keytool aapt d8 apksigner; do
+for command_name in node java javac jar keytool aapt d8 apksigner adb; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     missing="$missing $command_name"
   fi
@@ -53,3 +56,4 @@ fi
 echo "Android build toolchain ready."
 echo "Framework: $ANDROID_JAR"
 echo "Build the smoke app with: sh android-smoke/build-termux.sh --install"
+echo "For automatic deploys, pair ADB with: sh termux/connect-adb.sh"
