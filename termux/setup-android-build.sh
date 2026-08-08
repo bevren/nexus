@@ -7,10 +7,10 @@ if [ -z "${PREFIX:-}" ] || [ ! -x "${PREFIX}/bin/pkg" ]; then
 fi
 
 echo "Installing the on-phone Android build toolchain..."
-pkg install -y openjdk-21 aapt aapt2 d8 apksigner curl unzip
+pkg install -y openjdk-21 aapt aapt2 d8 apksigner unzip
 
 missing=""
-for command_name in java javac jar keytool aapt d8 apksigner; do
+for command_name in node java javac jar keytool aapt d8 apksigner; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     missing="$missing $command_name"
   fi
@@ -33,7 +33,7 @@ if [ ! -f "$ANDROID_JAR" ]; then
   mkdir -p "$DOWNLOAD_DIR" "$SDK_ROOT/platforms"
 
   echo "Downloading Android SDK Platform 34 (about 63 MB)..."
-  curl -fL --retry 3 --progress-bar "$PLATFORM_URL" -o "$PLATFORM_ZIP"
+  node "$(dirname "$0")/download-file.mjs" "$PLATFORM_URL" "$PLATFORM_ZIP"
   if ! echo "$PLATFORM_SHA1  $PLATFORM_ZIP" | sha1sum -c -; then
     rm -f "$PLATFORM_ZIP"
     echo "Android platform checksum verification failed." >&2
