@@ -31,6 +31,7 @@ MAX_HISTORY_EXCLUDE_MATCHES = 5000
 EDIT_EVENT_LOG: list[str] = []
 EDIT_SUMMARY_LOG: list[str] = []
 HISTORY_ACTION_LOG: list[dict[str, object]] = []
+PLAN_UI_EVENT_LOG: list[dict[str, object]] = []
 
 
 def _resolve_workspace_path(path: str) -> Path:
@@ -113,6 +114,29 @@ def drain_history_actions() -> list[dict[str, object]]:
     actions = list(HISTORY_ACTION_LOG)
     HISTORY_ACTION_LOG.clear()
     return actions
+
+
+def drain_plan_ui_events() -> list[dict[str, object]]:
+    events = list(PLAN_UI_EVENT_LOG)
+    PLAN_UI_EVENT_LOG.clear()
+    return events
+
+
+def _record_plan_ui_event(entries: list[dict[str, object]]) -> None:
+    PLAN_UI_EVENT_LOG.append(
+        {
+            "type": "plan",
+            "title": "Plan",
+            "entries": [
+                {
+                    "text": str(entry.get("text", "")).strip(),
+                    "completed": bool(entry.get("completed")),
+                }
+                for entry in entries
+                if str(entry.get("text", "")).strip()
+            ],
+        }
+    )
 
 
 def _ensure_memory_store_ready() -> None:
@@ -754,6 +778,7 @@ def create_plan(entries: str | list[str]) -> dict[str, object]:
 
     plan_entries = [{"text": text, "completed": False} for text in plan_texts]
     _save_plan_entries(plan_entries)
+    _record_plan_ui_event(plan_entries)
 
     return {
         "created_count": len(plan_entries),
@@ -809,6 +834,7 @@ def update_plan(
             unmatched.append(identifier)
 
     _save_plan_entries(entries)
+    _record_plan_ui_event(entries)
     updated_entries = [entries[idx] for idx in sorted(updated_indexes)]
 
     return {

@@ -1744,6 +1744,12 @@ async function rewriteSessionWithCurrentMessages() {
       if (typeof entry?.toolOk === "boolean") {
         payload.toolOk = entry.toolOk;
       }
+      if (entry?.uiKind === "plan") {
+        payload.uiKind = "plan";
+      }
+      if (typeof entry?.uiContent === "string") {
+        payload.uiContent = entry.uiContent;
+      }
       if (entry?.hidden === true) {
         payload.hidden = true;
       }
@@ -2257,6 +2263,12 @@ function appendHistoryEntry(role, content, extra = null) {
     }
     if (typeof extra.toolCode === "string") {
       payload.toolCode = extra.toolCode;
+    }
+    if (extra.uiKind === "plan") {
+      payload.uiKind = "plan";
+    }
+    if (typeof extra.uiContent === "string") {
+      payload.uiContent = extra.uiContent;
     }
     if (extra.hidden === true) {
       payload.hidden = true;
@@ -4655,7 +4667,7 @@ def _compile_generated_async(user_code: str):
     return compile(module, "<generated>", "exec")
 
 buf = io.StringIO()
-result = {"ok": True, "output": "", "edit_events": [], "edit_summaries": [], "history_actions": []}
+result = {"ok": True, "output": "", "edit_events": [], "edit_summaries": [], "history_actions": [], "plan_ui_events": []}
 try:
     sys.settrace(tracer)
     compiled = _compile_generated_async(code)
@@ -4676,6 +4688,10 @@ try:
             actions = tools.drain_history_actions()
             if isinstance(actions, list):
                 result["history_actions"] = [item for item in actions if isinstance(item, dict)]
+        if hasattr(tools, "drain_plan_ui_events"):
+            plan_events = tools.drain_plan_ui_events()
+            if isinstance(plan_events, list):
+                result["plan_ui_events"] = [item for item in plan_events if isinstance(item, dict)]
     sys.settrace(None)
     result["output"] = buf.getvalue()
 except Exception as exc:
@@ -4714,6 +4730,9 @@ print(json.dumps(result))
       historyActions: Array.isArray(parsed?.history_actions)
         ? parsed.history_actions.filter((item) => item && typeof item === "object")
         : [],
+      planUiEvents: Array.isArray(parsed?.plan_ui_events)
+        ? parsed.plan_ui_events.filter((item) => item && typeof item === "object")
+        : [],
     };
   } catch (error) {
     if (error?.killed || error?.signal || error?.code === "ETIMEDOUT") {
@@ -4725,6 +4744,7 @@ print(json.dumps(result))
         editEvents: [],
         editSummaries: [],
         historyActions: [],
+        planUiEvents: [],
       };
     }
 
@@ -4736,6 +4756,7 @@ print(json.dumps(result))
       editEvents: [],
       editSummaries: [],
       historyActions: [],
+      planUiEvents: [],
     };
   } finally {
     if (tempDir) {
@@ -4760,6 +4781,24 @@ function capToolHistoryText(text, limit) {
 ${source.slice(-tail)}`;
 }
 
+function formatPlanUiMarkdown(event) {
+  if (!event || event.type !== "plan" || !Array.isArray(event.entries)) {
+    return "";
+  }
+  const title = typeof event.title === "string" && event.title.trim()
+    ? event.title.trim().replace(/[\r\n]+/g, " ")
+    : "Plan";
+  const lines = [`## ${title}`, ""];
+  for (const entry of event.entries) {
+    if (!entry || typeof entry.text !== "string" || !entry.text.trim()) {
+      continue;
+    }
+    const text = entry.text.trim().replace(/[\r\n]+/g, " ");
+    lines.push(`- [${entry.completed === true ? "x" : " "}] ${text}`);
+  }
+  return lines.length > 2 ? lines.join("\n") : "";
+}
+
 function buildToolResultPayload(result) {
   const output = typeof result?.output === "string" ? result.output.trimEnd() : "";
   const error = typeof result?.error === "string" ? result.error.trimEnd() : "";
@@ -4770,6 +4809,12 @@ function buildToolResultPayload(result) {
   const editSummaries = Array.isArray(result?.editSummaries)
     ? result.editSummaries.filter((item) => typeof item === "string" && item.trim().length > 0)
     : [];
+  const planUiEvents = Array.isArray(result?.planUiEvents)
+    ? result.planUiEvents.filter((item) => item && typeof item === "object")
+    : [];
+  const planUiMarkdown = planUiEvents.length > 0
+    ? formatPlanUiMarkdown(planUiEvents[planUiEvents.length - 1])
+    : "";
 
   if (result?.ok) {
     const outputText = output.trim();
@@ -4786,7 +4831,8 @@ function buildToolResultPayload(result) {
     if (editEvents.length > 0) {
       displayParts.push(editEvents.join("\n"));
     }
-    const displayText = displayParts.length > 0 ? displayParts.join("\n") : "(no output)";
+    const displayText = planUiMarkdown ||
+      (displayParts.length > 0 ? displayParts.join("\n") : "(no output)");
 
     const historyParts = [];
     if (output.trim().length > 0) {
@@ -4797,7 +4843,7 @@ function buildToolResultPayload(result) {
     }
     const joinedHistory = historyParts.length > 0 ? historyParts.join("\n") : "(no output)";
     const historyText = capToolHistoryText(joinedHistory, getToolOutputTokenLimit());
-    return { displayText, historyText };
+    return { displayText, historyText, uiKind: planUiMarkdown ? "plan" : "" };
   }
 
   const displayParts = [];
@@ -5059,6 +5105,23 @@ function removePendingAssistantMessage(index, generation) {
   return true;
 }
 
+function hideSupersededPlanUiEntries(entries) {
+  let latestPlanIndex = -1;
+  for (let index = 0; index < entries.length; index += 1) {
+    if (entries[index]?.uiKind !== "plan") {
+      continue;
+    }
+    if (latestPlanIndex >= 0) {
+      entries[latestPlanIndex].hidden = true;
+    }
+    latestPlanIndex = index;
+  }
+  if (latestPlanIndex >= 0) {
+    entries[latestPlanIndex].hidden = false;
+  }
+  return latestPlanIndex;
+}
+
 function appendToolMessages(
   toolName,
   assistantToolInput,
@@ -5067,7 +5130,8 @@ function appendToolMessages(
   historyResultText,
   toolCallId,
   toolOk,
-  generation
+  generation,
+  uiKind = ""
 ) {
   if (generation !== chatGeneration) {
     return;
@@ -5081,6 +5145,7 @@ function appendToolMessages(
   const safeResult = normalizedResult.trim().length > 0 ? normalizedResult : "(no output)";
   const safeHistoryResult =
     normalizedHistoryResult.trim().length > 0 ? normalizedHistoryResult : "(no output)";
+  const normalizedUiKind = uiKind === "plan" ? "plan" : "";
   messages.push({
     role: "tool",
     name: normalizedToolName,
@@ -5090,13 +5155,18 @@ function appendToolMessages(
     toolOk: Boolean(toolOk),
     content: safeHistoryResult,
     uiContent: safeResult,
+    ...(normalizedUiKind ? { uiKind: normalizedUiKind } : {}),
   });
+  if (normalizedUiKind === "plan") {
+    hideSupersededPlanUiEntries(messages);
+  }
   appendHistoryEntry("tool", safeHistoryResult, {
     name: normalizedToolName,
     toolCallId: typeof toolCallId === "string" ? toolCallId : "",
     toolInput: normalizedInput,
     toolCode: normalizedCode,
     toolOk: Boolean(toolOk),
+    ...(normalizedUiKind ? { uiKind: normalizedUiKind, uiContent: safeResult } : {}),
   });
   scrollChatToBottom();
   if (!APPEND_CHAT_TO_SCROLLBACK) {
@@ -5357,6 +5427,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
             editEvents: [],
             editSummaries: [],
             historyActions: [],
+            planUiEvents: [],
           };
         } else {
           const preToolRun = await runHooks({
@@ -5443,7 +5514,8 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
           toolResultPayload.historyText,
           undefined,
           Boolean(execResult?.ok),
-          generation
+          generation,
+          toolResultPayload.uiKind
         );
 
         if (generation !== chatGeneration) {
@@ -7271,6 +7343,8 @@ function parseSessionHistory(raw) {
             ...(typeof parsed?.toolInput === "string" ? { toolInput: parsed.toolInput } : {}),
             ...(typeof parsed?.toolCode === "string" ? { toolCode: parsed.toolCode } : {}),
             ...(typeof parsed?.toolOk === "boolean" ? { toolOk: parsed.toolOk } : {}),
+            ...(parsed?.uiKind === "plan" ? { uiKind: "plan" } : {}),
+            ...(typeof parsed?.uiContent === "string" ? { uiContent: parsed.uiContent } : {}),
             ...(parsed?.hidden === true ? { hidden: true } : {}),
             ...(parsed?.excludeFromRequest === true ? { excludeFromRequest: true } : {}),
           });
@@ -7334,6 +7408,8 @@ function parseSessionHistory(raw) {
   if (pendingToolMessage) {
     loadedMessages.push({ role: "tool", content: pendingToolMessage });
   }
+
+  hideSupersededPlanUiEntries(loadedMessages);
 
   return { loadedMessages, sessionModel, sessionWorkspace, sessionReasoningByModel };
 }
@@ -9110,6 +9186,8 @@ function styleCompactDiffContinuation(
 
 function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80) {
   const role = typeof entry?.role === "string" ? entry.role : "assistant";
+  const isPlanUi = role === "tool" && entry?.uiKind === "plan";
+  const displayRole = isPlanUi ? "assistant" : role;
   const rawMessage =
     role === "tool" && typeof entry?.uiContent === "string"
       ? entry.uiContent
@@ -9122,6 +9200,7 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
   let logicalLineMeta = logicalLines.map((line) => ({ text: line, python: false, fence: false }));
   const hasStructuredToolMeta =
     role === "tool" &&
+    !isPlanUi &&
     (typeof entry?.toolInput === "string" ||
       typeof entry?.toolCode === "string" ||
       typeof entry?.name === "string" ||
@@ -9173,23 +9252,23 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
     }
   }
 
-  if (role === "tool" && !hasStructuredToolMeta && isUnifiedDiffText(message)) {
+  if (role === "tool" && !isPlanUi && !hasStructuredToolMeta && isUnifiedDiffText(message)) {
     logicalLines = getToolResultLinesForDisplay(message);
     logicalLineMeta = logicalLines.map((line) => ({ text: line, python: false, fence: false }));
   }
 
-  if (role === "assistant" && !hasStructuredToolMeta) {
+  if (displayRole === "assistant" && !hasStructuredToolMeta) {
     logicalLineMeta = annotateAssistantCodeBlocks(message);
     logicalLines = logicalLineMeta.map((item) => item.text);
   }
 
   const isToolCall =
-    role === "tool" || (logicalLines.length > 0 && logicalLines[0].trim().startsWith("\u2022 Ran "));
+    displayRole === "tool" || (logicalLines.length > 0 && logicalLines[0].trim().startsWith("\u2022 Ran "));
   // Unified-diff detection for the whole tool payload; +/- lines only get
   // the diff background when the output genuinely contains a patch.
   const looksLikeDiff = isToolCall && isUnifiedDiffText(message);
   const diffTargetPath = looksLikeDiff ? getUnifiedDiffTargetPath(message) : "";
-  const isErrorMessage = role === "error";
+  const isErrorMessage = displayRole === "error";
   const toolColor = isToolCall
     ? (structuredToolOk === true
         ? GREEN_COLOR
@@ -9197,14 +9276,16 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
           ? RED_COLOR
           : detectToolStatusColorFromLines(logicalLines))
     : null;
-  const assistantPrefix = role === "assistant" ? "• " : "";
-  const isMultilineUser = role === "user" && logicalLines.length > 1;
-  const userPrefix = role === "user" ? PROMPT_PREFIX : "";
+  const assistantPrefix = displayRole === "assistant" && !isPlanUi ? "• " : "";
+  const isMultilineUser = displayRole === "user" && logicalLines.length > 1;
+  const userPrefix = displayRole === "user" ? PROMPT_PREFIX : "";
   const continuationPrefix = isMultilineUser
     ? ""
-    : role === "user" || (role === "assistant" && !isToolCall)
-      ? CONTINUATION_PREFIX
-      : "";
+    : isPlanUi
+      ? ""
+      : displayRole === "user" || (displayRole === "assistant" && !isToolCall)
+        ? CONTINUATION_PREFIX
+        : "";
   const output = [];
 
   for (let i = 0; i < logicalLines.length; i += 1) {
@@ -9270,9 +9351,9 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
             line = `${color}${visibleText}${RESET_COLOR}`;
           }
         }
-      } else if (role === "assistant" && lineMeta.python) {
+      } else if (displayRole === "assistant" && lineMeta.python) {
         line = highlightPythonCodeLine(visibleText.padEnd(contentWidth, " "), lineMeta.fence);
-      } else if (role === "assistant") {
+      } else if (displayRole === "assistant") {
         const styledMarkdown = highlightMarkdownText(wrappedLine.body, w === 0);
         if (styledMarkdown) {
           line = `${wrappedLine.prefix}${styledMarkdown}`;
@@ -9285,7 +9366,7 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
     }
   }
 
-  if (role === "tool" && !looksLikeDiff) {
+  if (role === "tool" && !isPlanUi && !looksLikeDiff) {
     const divider = "\u2500".repeat(Math.max(3, contentWidth));
     output.push("");
     output.push(`${PLACEHOLDER_COLOR}${divider}${RESET_COLOR}`);
@@ -12110,6 +12191,97 @@ function runFormatSelfTest() {
     const plainToolJoined = plainToolLines.join("\n");
     if (plainToolJoined.includes(DIFF_REMOVE_BG_COLOR) || plainToolJoined.includes(DIFF_ADD_BG_COLOR)) {
       out("FORMAT_FAIL: plain tool text should not get diff background");
+      return 1;
+    }
+
+    const planMarkdown = formatPlanUiMarkdown({
+      type: "plan",
+      title: "Plan",
+      entries: [
+        { text: "Inspect project", completed: true },
+        { text: "Implement change", completed: false },
+      ],
+    });
+    if (
+      planMarkdown !== "## Plan\n\n- [x] Inspect project\n- [ ] Implement change"
+    ) {
+      out(`FORMAT_FAIL: plan markdown is incorrect: ${JSON.stringify(planMarkdown)}\n`);
+      return 1;
+    }
+    const planPayload = buildToolResultPayload({
+      ok: true,
+      output: "{\"created_count\": 2}",
+      planUiEvents: [{
+        type: "plan",
+        title: "Plan",
+        entries: [
+          { text: "Inspect project", completed: true },
+          { text: "Implement change", completed: false },
+        ],
+      }],
+    });
+    if (
+      planPayload.uiKind !== "plan" ||
+      planPayload.displayText !== planMarkdown ||
+      !planPayload.historyText.includes("created_count")
+    ) {
+      out("FORMAT_FAIL: plan UI must preserve raw JSON only in tool history\n");
+      return 1;
+    }
+    const renderedPlan = buildTranscriptLinesForEntry(
+      {
+        role: "tool",
+        name: "code_execution",
+        content: "{'entries': []}",
+        uiContent: planMarkdown,
+        uiKind: "plan",
+        toolOk: true,
+      },
+      80
+    ).map(stripAnsiSgr);
+    const renderedPlanText = renderedPlan.join("\n");
+    if (
+      !renderedPlanText.includes("## Plan") ||
+      !renderedPlanText.includes("- [x] Inspect project") ||
+      renderedPlanText.includes("Ran code_execution") ||
+      renderedPlanText.includes("\u2500\u2500\u2500")
+    ) {
+      out(`FORMAT_FAIL: plan should render as markdown without tool chrome\n${renderedPlanText}\n`);
+      return 1;
+    }
+    const planVersions = [
+      { role: "tool", uiKind: "plan", content: "old" },
+      { role: "assistant", content: "working" },
+      { role: "tool", uiKind: "plan", content: "new" },
+    ];
+    hideSupersededPlanUiEntries(planVersions);
+    if (planVersions[0].hidden !== true || planVersions[2].hidden === true) {
+      out("FORMAT_FAIL: updated plan should supersede the previous plan UI\n");
+      return 1;
+    }
+    const resumedPlanHistory = parseSessionHistory([
+      JSON.stringify({
+        role: "tool",
+        content: "old raw result",
+        name: "code_execution",
+        uiKind: "plan",
+        uiContent: "## Plan\n\n- [ ] Old task",
+      }),
+      JSON.stringify({
+        role: "tool",
+        content: "new raw result",
+        name: "code_execution",
+        uiKind: "plan",
+        uiContent: "## Plan\n\n- [x] Old task",
+      }),
+    ].join("\n")).loadedMessages;
+    if (
+      resumedPlanHistory.length !== 2 ||
+      resumedPlanHistory[0].hidden !== true ||
+      resumedPlanHistory[1].hidden === true ||
+      resumedPlanHistory[1].uiContent !== "## Plan\n\n- [x] Old task"
+    ) {
+      out("FORMAT_FAIL: resumed session should show only the newest plan UI\n");
       return 1;
     }
 
