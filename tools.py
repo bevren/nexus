@@ -1970,6 +1970,8 @@ from pathlib import Path
 
 SKILLS_DIRS = [
     Path.home() / ".nexus" / "skills",
+    WORKSPACE_ROOT / "skills",
+    Path(__file__).resolve().parent / "skills",
 ]
 
 
