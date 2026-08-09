@@ -29,6 +29,9 @@ sh termux/run.sh
 
 On the first launch, open `/providers` and configure the provider, API key,
 and model. Phone-local Nexus state is stored under `$HOME/.nexus`.
+New installations default to a 1,000,000-token context window. Override
+`model_context_window_override` in `$HOME/.nexus/config.json` when the selected
+model has a different limit.
 
 To keep a long kernel run alive while the screen is off, install Termux:API
 from the same source as Termux, install its command package, and opt into the

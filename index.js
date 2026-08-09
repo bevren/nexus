@@ -91,6 +91,7 @@ const COMPACTION_DEFAULT_CUSTOM_INSTRUCTION =
 const MAX_REASONING_DISPLAY_CHARS = 4000;
 const MAX_INPUT_HISTORY_ITEMS = 500;
 const DEFAULT_LLM_REQUEST_TIMEOUT_MS = 120000;
+const DEFAULT_MODEL_CONTEXT_WINDOW = 1000000;
 const MIN_LLM_REQUEST_TIMEOUT_MS = 10000;
 const MAX_LLM_REQUEST_TIMEOUT_MS = 600000;
 const THINKING_ANIMATION_INTERVAL_MS = 320;
@@ -1967,6 +1968,14 @@ function normalizeLlmRequestTimeoutMs(value) {
   return Math.max(MIN_LLM_REQUEST_TIMEOUT_MS, Math.min(MAX_LLM_REQUEST_TIMEOUT_MS, rounded));
 }
 
+function normalizeModelContextWindow(value) {
+  const raw = Number(value);
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return DEFAULT_MODEL_CONTEXT_WINDOW;
+  }
+  return Math.floor(raw);
+}
+
 function getLlmRequestTimeoutMs() {
   return normalizeLlmRequestTimeoutMs(nexusConfig?.llm_request_timeout_ms);
 }
@@ -1976,6 +1985,7 @@ async function ensureNexusConfigFileReady() {
     version: 1,
     createdAt: new Date().toISOString(),
     provider: DEFAULT_PROVIDERS[0].name,
+    model_context_window_override: DEFAULT_MODEL_CONTEXT_WINDOW,
     llm_request_timeout_ms: DEFAULT_LLM_REQUEST_TIMEOUT_MS,
   };
   const content = `${JSON.stringify(initialConfig, null, 2)}\n`;
@@ -2072,6 +2082,9 @@ async function loadNexusConfig() {
 
   nexusConfig = {
     ...parsed,
+    model_context_window_override: normalizeModelContextWindow(
+      parsed?.model_context_window_override
+    ),
     llm_request_timeout_ms: normalizeLlmRequestTimeoutMs(parsed?.llm_request_timeout_ms),
   };
   const providerName = typeof parsed.provider === "string" ? parsed.provider.trim() : "";
@@ -12578,6 +12591,18 @@ function runCompactionSelfTest() {
     }
 
     // Threshold math (without touching live config)
+    if (DEFAULT_MODEL_CONTEXT_WINDOW !== 1000000) {
+      out("COMPACT_FAIL: first-launch context window must default to 1M tokens\n");
+      return 1;
+    }
+    if (normalizeModelContextWindow(undefined) !== 1000000) {
+      out("COMPACT_FAIL: missing context setting must normalize to 1M tokens\n");
+      return 1;
+    }
+    if (normalizeModelContextWindow(200000) !== 200000) {
+      out("COMPACT_FAIL: explicit context setting must be preserved\n");
+      return 1;
+    }
     if (getCompactionThreshold() < 1) {
       out("COMPACT_FAIL: compaction threshold must be positive\n");
       return 1;
