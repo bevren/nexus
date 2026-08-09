@@ -1,0 +1,4 @@
+interface:
+  display_name: "Create Android App"
+  short_description: "Scaffold phone-native Android app projects"
+  default_prompt: "Use $create-android-app to create and deploy a new Android application."

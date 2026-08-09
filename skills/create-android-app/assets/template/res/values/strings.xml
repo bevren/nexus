@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">__APP_NAME__</string>
+    <string name="title">__APP_NAME__</string>
+    <string name="message">Created entirely on this phone</string>
+    <string name="action">Tap me</string>
+    <string name="tap_status">It works - tap %1$d</string>
+</resources>
