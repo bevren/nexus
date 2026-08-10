@@ -41,6 +41,8 @@ const DIFF_REMOVE_MARKER_COLOR = "\u001b[38;5;210m";
 const DIFF_DEFAULT_TEXT_COLOR = "\u001b[38;5;250m";
 const DIFF_DIM_TEXT = "\u001b[2m";
 const DIFF_NORMAL_INTENSITY = "\u001b[22m";
+const STRIKETHROUGH_TEXT = "\u001b[9m";
+const NORMAL_TEXT_DECORATION = "\u001b[29m";
 const DIFF_LEFT_PADDING = "  ";
 const MARKDOWN_HEADER_COLOR = "\u001b[96m";
 const MARKDOWN_LIST_MARKER_COLOR = "\u001b[96m";
@@ -150,6 +152,7 @@ const FALLBACK_MODELS = [
   "o4-mini",
 ];
 const COMMANDS = [
+  { name: "/plan", description: "toggle read-only plan mode: /plan [on|off|status]" },
   { name: "/providers", description: "manage provider list and credentials" },
   { name: "/set", description: "set runtime values: /set model <name> | /set thinking <on|off>" },
   { name: "/resume", description: "show session list and resume selected chat" },
@@ -165,14 +168,35 @@ const COMMANDS = [
   { name: "/review", description: "review my current changes and find issues" },
   { name: "/rename", description: "rename the current thread" },
   { name: "/new", description: "start a new chat with a new uid" },
-  { name: "/mcp", description: "show MCP server status and available tools (/mcp reload to restart servers)" },
+  { name: "/mcp", description: "manage MCP servers: start, stop, and reload configuration" },
   { name: "/compact", description: "manually compact context: /compact [optional instruction]" },
-  { name: "/loop", description: "run a prompt on an interval: /loop [interval] [prompt]" },
+  { name: "/loop", description: "usage: /loop <interval> <prompt>" },
   { name: "/loops", description: "list or cancel scheduled loops: /loops | /loops cancel <id>" },
   { name: "/hooks", description: "show configured lifecycle hooks (read-only)" },
   { name: "/solve", description: "run an autonomous solve loop in an isolated workspace: /solve <directory>" },
   { name: "/kernels", description: "view, resume, restart, or delete sessions created by /solve" },
 ];
+const PLAN_MODE_ALLOWED_TOOL_NAMES = new Set([
+  "create_plan",
+  "update_plan",
+  "get_current_plan",
+  "get_current_working_directory",
+  "get_file_list",
+  "get_file_content",
+  "find_files",
+  "list_directory",
+  "path_exists",
+  "find_in_file",
+  "get_git_status",
+  "get_git_diff",
+  "get_git_log",
+  "read_file_summary",
+  "fetch_url",
+  "list_skills",
+  "web_search",
+  "mcp_list",
+  "list_subagents",
+]);
 const FALLBACK_TOOL_DESCRIPTIONS = {
   insert_memory:
     "insert_memory(memory: str, keyword: str|list[str]) -> dict: Save persistent memory with one or more keywords. Preference statements (like/dislike/prefer/love/hate) are auto-upserted by topic to prevent conflicting duplicates.",
@@ -296,6 +320,7 @@ let lastSessionsRenderedHeight = 0;
 let providers = [];
 let selectedProviderName = DEFAULT_PROVIDERS[0].name;
 let nexusConfig = {};
+let collaborationMode = "build";
 let providersSelected = 0;
 let providersScroll = 0;
 let isProvidersLoading = false;
@@ -316,6 +341,13 @@ let loopsMessage = "";
 let lastLoopsRenderedRows = [];
 let lastLoopsRenderedCols = 0;
 let lastLoopsRenderedHeight = 0;
+let mcpSelected = 0;
+let mcpScroll = 0;
+let mcpManagerMessage = "";
+let lastMcpRenderedRows = [];
+let lastMcpRenderedCols = 0;
+let lastMcpRenderedHeight = 0;
+const mcpBusyNames = new Set();
 let commandBufferQuery = "";
 let lastCommandRenderedRows = [];
 let lastCommandRenderedCols = 0;
@@ -820,7 +852,10 @@ async function runPythonCommand(args, options = {}) {
 }
 
 function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
-  const entries = Object.entries(descriptions || {});
+  const planModeActive = (runtime?.collaborationMode || collaborationMode) === "plan";
+  const entries = Object.entries(descriptions || {}).filter(
+    ([name]) => !planModeActive || PLAN_MODE_ALLOWED_TOOL_NAMES.has(name)
+  );
   const lines = entries
     .sort((a, b) => a[0].localeCompare(b[0]))
     .map(([name, description]) => `- ${name}: ${description}`);
@@ -833,6 +868,51 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     ? Math.max(0, Math.min(100, Math.round(rawContextLeft)))
     : 100;
 
+  if (planModeActive) {
+    return [
+      "Your name is Nexus developed by duxx.",
+      "You are a terminal coding assistant operating in read-only Plan mode.",
+      "",
+      "RUNTIME CONTEXT STATUS (MUST FOLLOW):",
+      `- Current model: ${modelLabel}`,
+      `- Context remaining: ${safeContextLeft}%`,
+      "- Avoid repetition and re-reading unchanged files; inspect targeted context.",
+      "",
+      "PLAN MODE (MANDATORY):",
+      "- Explore the repository, analyze the request, resolve important ambiguities, and produce an implementation-ready plan only.",
+      "- The workspace is read-only. Do not create, edit, move, copy, or delete project files.",
+      "- Do not run shell commands, builds, deployments, kernels, MCP calls, reminders, or subagents.",
+      "- Use only the read-only helpers listed below plus create_plan, update_plan, and get_current_plan.",
+      "- Ask a concise clarifying question only when the answer materially changes the plan. Otherwise state reasonable assumptions in the plan.",
+      "- Before finishing, call create_plan or update_plan with ordered, concrete tasks. Do not implement until the user exits with /plan or /plan off.",
+      "",
+      "TOOL USAGE FORMAT (MANDATORY):",
+      "- If inspection or plan updates are needed, output exactly one fenced ```execute code block and no surrounding prose.",
+      "- Call the provided helpers directly. Imports, raw file access, arbitrary functions, and unlisted helpers are blocked.",
+      "- Keep each execute block compact; if truncated, retry with a smaller complete block.",
+      "",
+      "EXAMPLE:",
+      "```execute",
+      "print(get_file_list('.'))",
+      "print(get_file_content('package.json', start_line=1, end_line=120))",
+      "```",
+      "",
+      "PLAN EXAMPLE:",
+      "```execute",
+      "print(create_plan([",
+      "    'Inspect the relevant architecture and constraints',",
+      "    'Implement the scoped changes',",
+      "    'Add focused regression tests and verify the result',",
+      "]))",
+      "```",
+      "",
+      "Allowed Python helper functions:",
+      ...(lines.length > 0 ? lines : ["- (none)"]),
+      "",
+      "If no tool use is needed, reply normally with analysis or a clarifying question.",
+    ].join("\n");
+  }
+
   return [
     "Your name is Nexus developed by duxx.",
     "You are a terminal coding assistant. You can spawn agents and orchestrate them.",
@@ -840,6 +920,20 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "RUNTIME CONTEXT STATUS (MUST FOLLOW):",
     `- Current model: ${modelLabel}`,
     "- Use context effectively: avoid unnecessary repetition, avoid re-reading unchanged large files, and prefer targeted edits/tool calls.",
+    "",
+    "COLLABORATION MODE (MUST FOLLOW):",
+    ...(planModeActive
+      ? [
+          "- PLAN MODE is active. Explore, analyze, clarify, and design a concrete implementation plan only.",
+          "- The workspace is read-only in this mode. Do not create, edit, move, copy, or delete project files; do not run shell commands, builds, deployments, kernels, MCP calls, reminders, or subagents.",
+          "- Use only the read-only tools listed below plus create_plan, update_plan, and get_current_plan.",
+          "- Ask concise clarifying questions only when an answer materially changes the plan; otherwise make explicit reasonable assumptions.",
+          "- Before finishing, create or update the visible plan with ordered, implementation-ready tasks. Do not begin implementation until the user leaves Plan mode with /plan or /plan off.",
+        ]
+      : [
+          "- BUILD MODE is active. You may inspect, edit, execute, and verify within the user's requested scope.",
+          "- Use /plan to switch the session into read-only planning when requested.",
+        ]),
     "",
     "TOOL USAGE FORMAT (MANDATORY):",
     "- If tool use is needed, output exactly one fenced ```execute code block.",
@@ -1054,9 +1148,9 @@ async function loadSkillsCatalog() {
 // ---------------------------------------------------------------------------
 // MCP (Model Context Protocol) client support
 //
-// Launches configured MCP stdio servers at startup, exposes their tools to
-// the LLM via the system prompt, and bridges tool calls from the Python
-// execution environment (tools.py) through a localhost HTTP endpoint.
+// Connects configured MCP stdio and Streamable HTTP servers at startup,
+// exposes their tools to the LLM via the system prompt, and bridges tool
+// calls from tools.py through a localhost HTTP endpoint.
 // ---------------------------------------------------------------------------
 
 const MCP_CONFIG_PATH = path.join(os.homedir(), ".nexus", "mcp_config.json");
@@ -1128,6 +1222,7 @@ class McpStdioClientReal {
     this.toolsCache = null;
     this.toolsCacheError = "";
     this.closed = false;
+    this.transport = "stdio";
   }
 
   async start() {
@@ -1302,13 +1397,276 @@ class McpStdioClientReal {
   }
 }
 
+function expandMcpConfigEnv(value) {
+  return String(value ?? "").replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_match, name) => {
+    const resolved = process.env[name];
+    if (typeof resolved !== "string" || resolved.length === 0) {
+      throw new Error(`MCP configuration references missing environment variable ${name}`);
+    }
+    return resolved;
+  });
+}
+
+function parseMcpHttpMessages(text, contentType = "") {
+  const source = String(text || "").trim();
+  if (!source) return [];
+  const values = [];
+  if (String(contentType).toLowerCase().includes("text/event-stream")) {
+    for (const event of source.split(/\r?\n\r?\n/)) {
+      const data = event
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trimStart())
+        .join("\n")
+        .trim();
+      if (!data || data === "[DONE]") continue;
+      try {
+        const parsed = JSON.parse(data);
+        values.push(...(Array.isArray(parsed) ? parsed : [parsed]));
+      } catch {
+        // Ignore comments and non-JSON SSE events.
+      }
+    }
+    return values;
+  }
+  const parsed = JSON.parse(source);
+  return Array.isArray(parsed) ? parsed : [parsed];
+}
+
+class McpStreamableHttpClientReal {
+  constructor(name, config) {
+    this.name = name;
+    this.config = config;
+    this.url = "";
+    this.requestId = 0;
+    this.initialized = false;
+    this.closed = false;
+    this.sessionId = "";
+    this.toolsCache = null;
+    this.toolsCacheError = "";
+    this.stderrTail = "";
+    this.transport = "http";
+    this.protocolVersion = String(config?.protocolVersion || "2025-03-26");
+    this.headers = {};
+  }
+
+  _buildHeaders(method, params = {}) {
+    const headers = {
+      ...this.headers,
+      "Content-Type": "application/json",
+      Accept: "application/json, text/event-stream",
+      "MCP-Protocol-Version": this.protocolVersion,
+      "Mcp-Method": method,
+    };
+    const routedName = typeof params?.name === "string"
+      ? params.name
+      : typeof params?.uri === "string"
+        ? params.uri
+        : "";
+    if (routedName) headers["Mcp-Name"] = routedName;
+    if (this.sessionId) headers["Mcp-Session-Id"] = this.sessionId;
+    return headers;
+  }
+
+  _paramsWithClientMeta(params = {}) {
+    if (!this.protocolVersion.startsWith("2026-")) return params;
+    return {
+      ...params,
+      _meta: {
+        ...(params?._meta && typeof params._meta === "object" ? params._meta : {}),
+        "io.modelcontextprotocol/clientInfo": { name: "nexus-tui", version: "1.0.0" },
+      },
+    };
+  }
+
+  async _post(payload, method, params = {}) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30000);
+    let response;
+    try {
+      response = await fetch(this.url, {
+        method: "POST",
+        headers: this._buildHeaders(method, params),
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+    } catch (error) {
+      const message = error?.name === "AbortError"
+        ? `MCP server ${this.name}: HTTP request timed out (${method})`
+        : `MCP server ${this.name}: HTTP request failed (${error?.message || error})`;
+      throw new Error(message);
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const sessionId = response.headers.get("mcp-session-id");
+    if (sessionId) this.sessionId = sessionId;
+    const body = await response.text();
+    if (!response.ok) {
+      const authHint = response.status === 401 || response.status === 403
+        ? " Authentication required; configure an Authorization header (environment variables are supported)."
+        : "";
+      const detail = body.replace(/\s+/g, " ").trim().slice(0, 500);
+      const error = new Error(
+        `MCP server ${this.name}: HTTP ${response.status}${detail ? ` - ${detail}` : ""}.${authHint}`
+      );
+      error.statusCode = response.status;
+      throw error;
+    }
+    if (response.status === 202 || !body.trim()) return null;
+    let messages;
+    try {
+      messages = parseMcpHttpMessages(body, response.headers.get("content-type") || "");
+    } catch (error) {
+      throw new Error(`MCP server ${this.name}: invalid HTTP response (${error?.message || error})`);
+    }
+    if (payload.id === undefined || payload.id === null) return null;
+    const message = messages.find((item) => String(item?.id) === String(payload.id));
+    if (!message) {
+      throw new Error(`MCP server ${this.name}: HTTP response missing JSON-RPC id ${payload.id}`);
+    }
+    if (message.error) {
+      throw new Error(message.error.message || JSON.stringify(message.error));
+    }
+    return message.result;
+  }
+
+  async _request(method, params = {}, retrySession = true) {
+    const effectiveParams = this._paramsWithClientMeta(params);
+    const id = ++this.requestId;
+    try {
+      return await this._post({ jsonrpc: "2.0", id, method, params: effectiveParams }, method, effectiveParams);
+    } catch (error) {
+      if (retrySession && error?.statusCode === 404 && this.sessionId) {
+        this.sessionId = "";
+        await this._initialize();
+        return this._request(method, params, false);
+      }
+      throw error;
+    }
+  }
+
+  async _notify(method, params = {}) {
+    const effectiveParams = this._paramsWithClientMeta(params);
+    return this._post({ jsonrpc: "2.0", method, params: effectiveParams }, method, effectiveParams);
+  }
+
+  async _initialize() {
+    if (this.protocolVersion.startsWith("2026-")) {
+      this.initialized = true;
+      return;
+    }
+    const result = await this._request("initialize", {
+      protocolVersion: this.protocolVersion,
+      capabilities: {},
+      clientInfo: { name: "nexus-tui", version: "1.0.0" },
+    }, false);
+    if (typeof result?.protocolVersion === "string" && result.protocolVersion) {
+      this.protocolVersion = result.protocolVersion;
+    }
+    await this._notify("notifications/initialized", {});
+    this.initialized = true;
+  }
+
+  async start() {
+    if (typeof fetch !== "function") {
+      throw new Error("Streamable HTTP MCP requires a Node.js runtime with fetch support");
+    }
+    const rawUrl = expandMcpConfigEnv(this.config?.url || "");
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(rawUrl);
+    } catch {
+      throw new Error(`MCP server ${this.name}: invalid HTTP url`);
+    }
+    if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+      throw new Error(`MCP server ${this.name}: url must use http or https`);
+    }
+    this.url = parsedUrl.toString();
+    const configuredHeaders = this.config?.headers && typeof this.config.headers === "object"
+      ? this.config.headers
+      : {};
+    this.headers = {};
+    for (const [key, value] of Object.entries(configuredHeaders)) {
+      if (typeof value === "string") this.headers[key] = expandMcpConfigEnv(value);
+    }
+    if (typeof this.config?.bearerTokenEnv === "string" && this.config.bearerTokenEnv.trim()) {
+      const envName = this.config.bearerTokenEnv.trim();
+      const token = process.env[envName];
+      if (!token) throw new Error(`MCP configuration references missing environment variable ${envName}`);
+      this.headers.Authorization = `Bearer ${token}`;
+    }
+    await this._initialize();
+  }
+
+  async listTools() {
+    if (this.toolsCache) return this.toolsCache;
+    try {
+      const result = await this._request("tools/list", {});
+      const tools = Array.isArray(result?.tools) ? result.tools : [];
+      this.toolsCache = tools
+        .filter((tool) => tool && typeof tool.name === "string" && tool.name.trim())
+        .map((tool) => ({
+          name: tool.name.trim(),
+          description: typeof tool.description === "string" ? tool.description : "",
+          inputSchema: tool.inputSchema && typeof tool.inputSchema === "object" ? tool.inputSchema : {},
+        }));
+      this.toolsCacheError = "";
+      return this.toolsCache;
+    } catch (error) {
+      this.toolsCacheError = error?.message || String(error);
+      throw error;
+    }
+  }
+
+  async callTool(name, args = {}) {
+    return this._request("tools/call", {
+      name,
+      arguments: args && typeof args === "object" ? args : {},
+    });
+  }
+
+  async close() {
+    this.closed = true;
+    if (this.sessionId && this.url) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      try {
+        await fetch(this.url, {
+          method: "DELETE",
+          headers: this._buildHeaders("session/delete", {}),
+          signal: controller.signal,
+        });
+      } catch {
+        // Session deletion is optional and many stateless servers reject it.
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    this.sessionId = "";
+    this.initialized = false;
+  }
+}
+
+function createMcpClient(name, config) {
+  const type = String(config?.type || config?.transport || "").trim().toLowerCase();
+  if (type === "http" || type === "streamable-http" || (!type && config?.url)) {
+    return new McpStreamableHttpClientReal(name, config);
+  }
+  return new McpStdioClientReal(name, config);
+}
+
+function getMcpServerTarget(config) {
+  return String(config?.url || config?.command || "");
+}
+
 async function startMcpServers() {
   const config = loadMcpConfig();
   const entries = Object.entries(config.mcpServers || {});
   const running = [];
 
   for (const [name, serverConfig] of entries) {
-    const client = new McpStdioClientReal(name, serverConfig);
+    const client = createMcpClient(name, serverConfig);
     try {
       await client.start();
       const tools = await client.listTools();
@@ -1327,8 +1685,120 @@ async function startMcpServers() {
     client: entry.client,
     tools: entry.tools || [],
     error: entry.error || "",
-    command: String(config.mcpServers?.[entry.name]?.command || ""),
+    command: getMcpServerTarget(config.mcpServers?.[entry.name]),
   }));
+}
+
+function rebuildSystemPromptAfterMcpChange() {
+  if (!systemPromptText) {
+    return;
+  }
+  systemPromptText = buildSystemPromptFromDescriptions(toolDescriptions, {
+    modelId: selectedModel,
+    contextLeftPercent: getContextLeftPercent(selectedModel),
+    collaborationMode,
+  });
+  ensureSystemMessageAtTop();
+}
+
+async function startMcpServerByName(name) {
+  const serverName = String(name || "").trim();
+  const config = loadMcpConfig();
+  const serverConfig = config.mcpServers?.[serverName];
+  if (!serverName || !serverConfig || typeof serverConfig !== "object") {
+    return { ok: false, error: `MCP server "${serverName}" is not configured` };
+  }
+
+  mcpBusyNames.add(serverName);
+  const existingIndex = mcpServers.findIndex((entry) => entry.name === serverName);
+  const existing = existingIndex >= 0 ? mcpServers[existingIndex] : null;
+  if (existing?.client) {
+    await existing.client.close().catch(() => {});
+  }
+
+  const client = createMcpClient(serverName, serverConfig);
+  let nextEntry;
+  try {
+    await client.start();
+    const tools = await client.listTools();
+    nextEntry = {
+      name: serverName,
+      client,
+      tools,
+      error: "",
+      command: getMcpServerTarget(serverConfig),
+    };
+  } catch (error) {
+    const detail = error?.message || String(error);
+    const stderrTail = String(client.stderrTail || "").trim();
+    await client.close().catch(() => {});
+    nextEntry = {
+      name: serverName,
+      client: null,
+      tools: [],
+      error: stderrTail ? `${detail}; ${stderrTail}` : detail,
+      command: getMcpServerTarget(serverConfig),
+    };
+  } finally {
+    mcpBusyNames.delete(serverName);
+  }
+
+  if (existingIndex >= 0) {
+    mcpServers[existingIndex] = nextEntry;
+  } else {
+    mcpServers.push(nextEntry);
+  }
+  await refreshMcpDescriptions();
+  rebuildSystemPromptAfterMcpChange();
+  return nextEntry.error
+    ? { ok: false, error: nextEntry.error }
+    : { ok: true, tools: nextEntry.tools.length };
+}
+
+async function stopMcpServerByName(name) {
+  const serverName = String(name || "").trim();
+  const index = mcpServers.findIndex((entry) => entry.name === serverName);
+  if (index < 0) {
+    return { ok: false, error: `Unknown MCP server "${serverName}"` };
+  }
+
+  mcpBusyNames.add(serverName);
+  const entry = mcpServers[index];
+  try {
+    if (entry.client) {
+      await entry.client.close();
+    }
+    mcpServers[index] = { ...entry, client: null, tools: [], error: "" };
+  } catch (error) {
+    mcpServers[index] = {
+      ...entry,
+      client: null,
+      tools: [],
+      error: error?.message || String(error),
+    };
+    return { ok: false, error: mcpServers[index].error };
+  } finally {
+    mcpBusyNames.delete(serverName);
+    await refreshMcpDescriptions();
+    rebuildSystemPromptAfterMcpChange();
+  }
+  return { ok: true };
+}
+
+async function reloadMcpServers() {
+  await stopMcpServers();
+  await startMcpServers();
+  await refreshMcpDescriptions();
+  if (!mcpBridgeServer) {
+    try {
+      await startMcpBridgeServer();
+    } catch (error) {
+      mcpBridgeState = "error";
+      mcpBridgeError = error?.message || String(error);
+    }
+  }
+  rebuildSystemPromptAfterMcpChange();
+  return mcpServers;
 }
 
 async function startMcpBridgeServer() {
@@ -1487,7 +1957,7 @@ async function handleMcpBridgeRequest(parsed) {
     const result = {};
     for (const entry of mcpServers) {
       result[entry.name] = {
-        status: entry.error ? "error" : entry.client ? "running" : "stopped",
+        status: entry.error ? "error" : isMcpServerEntryRunning(entry) ? "running" : "stopped",
         error: entry.error || "",
         tools: entry.tools.map((t) => t.name),
       };
@@ -1502,7 +1972,7 @@ async function handleMcpBridgeRequest(parsed) {
   if (!serverEntry) {
     return { ok: false, error: `unknown MCP server "${serverName}"` };
   }
-  if (!serverEntry.client) {
+  if (!isMcpServerEntryRunning(serverEntry)) {
     return { ok: false, error: serverEntry.error || `MCP server "${serverName}" not running` };
   }
 
@@ -1548,7 +2018,7 @@ function buildMcpDescriptionLine(toolName, tool, serverName) {
 async function refreshMcpDescriptions() {
   mcpDescriptions = {};
   for (const entry of mcpServers) {
-    if (!entry.client || entry.error) {
+    if (!isMcpServerEntryRunning(entry)) {
       continue;
     }
     for (const tool of entry.tools) {
@@ -1628,13 +2098,28 @@ function getMcpBridgePort() {
   return mcpBridgePort;
 }
 
+function isMcpServerEntryRunning(entry) {
+  if (!entry?.client || entry.error || entry.client.closed) {
+    return false;
+  }
+  if (entry.client.transport === "http") {
+    return entry.client.initialized === true;
+  }
+  const child = entry.client.child;
+  return Boolean(child && child.exitCode === null && !child.killed);
+}
+
 function getMcpStatusText() {
   if (mcpServers.length === 0) {
     return "no MCP servers configured";
   }
   const parts = [];
   for (const entry of mcpServers) {
-    const status = entry.error ? `error (${entry.error})` : entry.client ? `running (${entry.tools.length} tools)` : "stopped";
+    const status = entry.error
+      ? `error (${entry.error})`
+      : isMcpServerEntryRunning(entry)
+        ? `running (${entry.tools.length} tools)`
+        : "stopped";
     parts.push(`${entry.name}: ${status}`);
   }
   return parts.join("; ");
@@ -1666,6 +2151,7 @@ function ensureSystemMessageAtTop(modelId = selectedModel) {
   systemPromptText = buildSystemPromptFromDescriptions(toolDescriptions, {
     modelId: runtimeModelId,
     contextLeftPercent: getContextLeftPercent(runtimeModelId),
+    collaborationMode,
   });
 
   if (messages.length === 0) {
@@ -1725,6 +2211,7 @@ async function rewriteSessionWithCurrentMessages() {
       }
       payload.sessionWorkspace = WORKSPACE_ROOT;
       payload.sessionReasoningByModel = getSessionReasoningConfig();
+      payload.sessionMode = collaborationMode;
       payload.excludeFromRequest = entry?.excludeFromRequest === true;
       if (Array.isArray(entry?.reasoningDetails) && entry.reasoningDetails.length > 0) {
         payload.reasoning_details = entry.reasoningDetails;
@@ -2247,6 +2734,7 @@ function appendHistoryEntry(role, content, extra = null) {
   }
   payload.sessionWorkspace = WORKSPACE_ROOT;
   payload.sessionReasoningByModel = getSessionReasoningConfig();
+  payload.sessionMode = collaborationMode;
   payload.excludeFromRequest = false;
   if (extra && typeof extra === "object") {
     if (Array.isArray(extra.reasoningDetails) && extra.reasoningDetails.length > 0) {
@@ -4608,12 +5096,15 @@ import json
 import textwrap
 import traceback
 import ast
+import builtins
 from contextlib import redirect_stdout
 from pathlib import Path
 import sys
 import tools
 
 MAX_STEPS = ${TOOL_EXEC_MAX_STEPS}
+PLAN_MODE = ${collaborationMode === "plan" ? "True" : "False"}
+PLAN_ALLOWED_TOOLS = set(${JSON.stringify([...PLAN_MODE_ALLOWED_TOOL_NAMES])})
 _steps = 0
 
 def tracer(frame, event, arg):
@@ -4636,10 +5127,42 @@ if hasattr(tools, "get_functions"):
     maybe = tools.get_functions()
     if isinstance(maybe, dict):
         scope.update(maybe)
+if PLAN_MODE:
+    scope = {name: value for name, value in scope.items() if name in PLAN_ALLOWED_TOOLS}
+    scope["__builtins__"] = {
+        name: getattr(builtins, name)
+        for name in (
+            "print", "len", "range", "enumerate", "sorted", "reversed", "zip",
+            "str", "int", "float", "bool", "list", "dict", "set", "tuple",
+            "min", "max", "sum", "any", "all", "abs", "round", "isinstance"
+        )
+    }
 scope["__name__"] = "__main__"
 
 def _compile_generated_async(user_code: str):
     parsed = ast.parse(user_code, mode="exec")
+    if PLAN_MODE:
+        local_callables = {
+            node.name
+            for node in ast.walk(parsed)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        safe_names = set(scope) | local_callables | set(scope["__builtins__"])
+        safe_methods = {
+            "append", "casefold", "count", "endswith", "get", "index", "items",
+            "join", "keys", "lower", "replace", "split", "startswith", "strip",
+            "upper", "values"
+        }
+        for node in ast.walk(parsed):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                raise PermissionError("Plan mode blocks imports; use the provided read-only tools")
+            if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
+                raise PermissionError("Plan mode blocks private runtime access")
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name) and node.func.id not in safe_names:
+                    raise PermissionError(f"Plan mode blocks call: {node.func.id}")
+                if isinstance(node.func, ast.Attribute) and node.func.attr not in safe_methods:
+                    raise PermissionError(f"Plan mode blocks method call: {node.func.attr}")
     body = list(parsed.body)
     if body and isinstance(body[-1], ast.Expr):
         body[-1] = ast.Assign(
@@ -4794,7 +5317,7 @@ function formatPlanUiMarkdown(event) {
       continue;
     }
     const text = entry.text.trim().replace(/[\r\n]+/g, " ");
-    lines.push(`- [${entry.completed === true ? "x" : " "}] ${text}`);
+    lines.push(`${entry.completed === true ? "🗹" : "☐"} ${text}`);
   }
   return lines.length > 2 ? lines.join("\n") : "";
 }
@@ -7003,10 +7526,17 @@ function getFilteredCommandBufferCommands() {
     return COMMANDS;
   }
 
+  const commandToken = query.split(/\s+/, 1)[0].replace(/^\/+/, "");
+  const exactName = `/${commandToken}`;
+  const exactCommand = COMMANDS.find((command) => command.name.toLowerCase() === exactName);
+  if (exactCommand) {
+    return [exactCommand];
+  }
+
   return COMMANDS.filter(
     (command) =>
-      command.name.toLowerCase().includes(query) ||
-      command.description.toLowerCase().includes(query)
+      command.name.toLowerCase().includes(commandToken) ||
+      command.description.toLowerCase().includes(commandToken)
   );
 }
 
@@ -7036,6 +7566,25 @@ function updateCommandBufferSelectionState() {
   if (commandMenuScroll > maxScroll) {
     commandMenuScroll = maxScroll;
   }
+}
+
+function moveCommandBufferSelection(delta) {
+  const commands = getFilteredCommandBufferCommands();
+  if (commands.length === 0) {
+    return false;
+  }
+  const previous = commandMenuSelected;
+  commandMenuSelected = Math.max(
+    0,
+    Math.min(commands.length - 1, commandMenuSelected + (delta < 0 ? -1 : 1))
+  );
+  const visibleCount = getCommandBufferVisibleCount();
+  if (commandMenuSelected < commandMenuScroll) {
+    commandMenuScroll = commandMenuSelected;
+  } else if (commandMenuSelected >= commandMenuScroll + visibleCount) {
+    commandMenuScroll = commandMenuSelected - visibleCount + 1;
+  }
+  return commandMenuSelected !== previous;
 }
 
 function getFilteredModels() {
@@ -7141,7 +7690,8 @@ function getMainFooterText() {
   const contextLeft = Math.round(getContextLeftPercent(selectedModel));
   const safeContextLeft = Math.max(0, Math.min(100, contextLeft));
   const thinkingState = getReasoningEnabledForModel(selectedModel) ? "thinking on" : "thinking off";
-  let text = `Current model: ${modelLabel} | ${safeContextLeft}% context left | ${thinkingState}`;
+  const modeState = collaborationMode === "plan" ? "PLAN" : "BUILD";
+  let text = `${modeState} | Current model: ${modelLabel} | ${safeContextLeft}% context left | ${thinkingState}`;
   if (loopTasks.length > 0) {
     text += ` | ${loopTasks.length} loop${loopTasks.length === 1 ? "" : "s"} active`;
   }
@@ -7274,6 +7824,7 @@ function parseSessionHistory(raw) {
   let sessionModel = "";
   let sessionWorkspace = "";
   let sessionReasoningByModel = {};
+  let sessionMode = "build";
 
   const isSetFeedbackEntry = (entry) => {
     if (!entry || entry.role !== "assistant" || entry.excludeFromRequest !== true) {
@@ -7301,6 +7852,9 @@ function parseSessionHistory(raw) {
       }
       if (parsed?.sessionReasoningByModel && typeof parsed.sessionReasoningByModel === "object") {
         sessionReasoningByModel = normalizeReasoningConfigMap(parsed.sessionReasoningByModel);
+      }
+      if (parsed?.sessionMode === "plan" || parsed?.sessionMode === "build") {
+        sessionMode = parsed.sessionMode;
       }
 
       const role = typeof parsed?.role === "string" ? parsed.role : "assistant";
@@ -7411,7 +7965,7 @@ function parseSessionHistory(raw) {
 
   hideSupersededPlanUiEntries(loadedMessages);
 
-  return { loadedMessages, sessionModel, sessionWorkspace, sessionReasoningByModel };
+  return { loadedMessages, sessionModel, sessionWorkspace, sessionReasoningByModel, sessionMode };
 }
 
 async function loadSessionFileIntoChat(filePath, options = {}) {
@@ -7445,6 +7999,7 @@ async function loadSessionFileIntoChat(filePath, options = {}) {
     loadedSessionReasoningByModel,
     loadedMessages
   );
+  collaborationMode = parsedSession?.sessionMode === "plan" ? "plan" : "build";
   messages.length = 0;
   printedMessageCount = 0;
   forceTranscriptReplay = true;
@@ -7504,6 +8059,7 @@ async function startNewChat() {
   loopTasks = [];
   stopLoopScheduler();
   stopKernelProcess();
+  collaborationMode = "build";
   resetMessagesToSystemPrompt();
   resetComposerState();
   await rewriteSessionWithCurrentMessages();
@@ -7739,6 +8295,42 @@ async function loadModelsFromProvider(force = false) {
 }
 
 async function runSlashCommand(commandName, commandArgs = "") {
+  if (commandName === "/plan") {
+    if (pendingAssistantRequests > 0) {
+      appendTuiErrorMessage("/plan");
+      return true;
+    }
+
+    const arg = String(commandArgs ?? "").trim().toLowerCase();
+    if (arg === "status") {
+      appendAssistantMessage(
+        collaborationMode === "plan"
+          ? "Plan mode is active. The workspace is read-only; use /plan off to return to Build mode."
+          : "Build mode is active; use /plan to enter read-only Plan mode.",
+        { excludeFromRequest: true, persistHistory: false }
+      );
+      refreshMainBufferAfterCommand();
+      return true;
+    }
+    if (arg && !["on", "off", "plan", "build"].includes(arg)) {
+      appendTuiErrorMessage("/plan", "invalid usage. Use '/plan', '/plan on', '/plan off', or '/plan status'");
+      return true;
+    }
+
+    const enable = arg === "on" || arg === "plan" || (!arg && collaborationMode !== "plan");
+    collaborationMode = enable ? "plan" : "build";
+    ensureSystemMessageAtTop();
+    appendAssistantMessage(
+      enable
+        ? "Plan mode enabled. I can inspect and design a plan, but workspace changes and executable actions are blocked. Use /plan again to return to Build mode."
+        : "Build mode enabled. I can now implement and verify the plan.",
+      { excludeFromRequest: true, persistHistory: false }
+    );
+    await rewriteSessionWithCurrentMessages();
+    refreshMainBufferAfterCommand();
+    return true;
+  }
+
   if (commandName === "/model") {
     openProvidersBuffer();
     return true;
@@ -7899,59 +8491,39 @@ async function runSlashCommand(commandName, commandArgs = "") {
 
   if (commandName === "/mcp") {
     const args = String(commandArgs ?? "").trim();
-    if (args.toLowerCase() === "reload") {
-      try {
-        await stopMcpServers();
-      } catch {
-        // ignore
-      }
-      mcpBridgeError = "";
-      try {
-        await startMcpServers();
-        await refreshMcpDescriptions();
-      } catch (error) {
-        mcpBridgeError = error?.message || String(error);
-      }
-      if (systemPromptText) {
-        systemPromptText = buildSystemPromptFromDescriptions(toolDescriptions, {
-          modelId: selectedModel,
-          contextLeftPercent: getContextLeftPercent(selectedModel),
-        });
-        ensureSystemMessageAtTop();
-      }
-      appendAssistantMessage(`MCP servers reloaded. ${getMcpStatusText()}`, {
-        excludeFromRequest: true,
-        persistHistory: false,
-      });
-      await rewriteSessionWithCurrentMessages();
-      refreshMainBufferAfterCommand();
+    openMcpBuffer();
+    if (args && args.toLowerCase() !== "reload") {
+      mcpManagerMessage = "Unknown option. Use /mcp or /mcp reload.";
+      markDirty();
+      renderFrame(true);
       return true;
     }
-
-    let text = "";
-    if (mcpServers.length === 0) {
-      text = getMcpStatusText() || "No MCP servers configured. Add servers to ~/.nexus/mcp_config.json";
-    } else {
-      text = getMcpStatusText();
-    }
-    for (const entry of mcpServers) {
-      if (!entry.tools || entry.tools.length === 0) {
-        continue;
+    if (args.toLowerCase() === "reload") {
+      mcpManagerMessage = "Reloading MCP configuration...";
+      markDirty();
+      renderFrame(true);
+      try {
+        await reloadMcpServers();
+        mcpBridgeError = "";
+        mcpManagerMessage = `Reloaded. ${getMcpStatusText()}`;
+      } catch (error) {
+        mcpBridgeError = error?.message || String(error);
+        mcpManagerMessage = `Reload failed: ${mcpBridgeError}`;
       }
-      const toolNames = entry.tools.map((t) => t.name).join(", ");
-      text += `\n  ${entry.name} tools: ${toolNames}`;
+      updateMcpSelectionState();
+      markDirty();
+      renderFrame(true);
     }
-    appendAssistantMessage(text, {
-      excludeFromRequest: true,
-      persistHistory: false,
-    });
-    await rewriteSessionWithCurrentMessages();
-    refreshMainBufferAfterCommand();
     return true;
   }
 
   if (commandName === "/loop" || commandName === "/loops") {
     const args = String(commandArgs ?? "").trim();
+
+    if (commandName === "/loop" && !args) {
+      appendTuiErrorMessage("/loop", "invalid usage. Use '/loop <interval> <prompt>'");
+      return true;
+    }
 
     if (commandName === "/loops" && !args.toLowerCase().startsWith("cancel")) {
       openLoopsBuffer();
@@ -8254,12 +8826,15 @@ function closeCommandBuffer(options = {}) {
   renderFrame(false);
 }
 
-function shouldTransitionCommandDirectlyToAltBuffer(commandName) {
+function shouldTransitionCommandDirectlyToAltBuffer(commandName, commandArgs = "") {
   const normalized = String(commandName || "").toLowerCase();
+  const args = String(commandArgs || "").trim();
   if (
     normalized === "/kernels" ||
     normalized === "/providers" ||
-    normalized === "/model"
+    normalized === "/mcp" ||
+    normalized === "/model" ||
+    (normalized === "/loops" && !args)
   ) {
     return true;
   }
@@ -8421,6 +8996,156 @@ function closeProvidersBuffer() {
   burstMode = false;
   markDirty();
   renderFrame(false);
+}
+
+function getMcpVisibleCount() {
+  const rows = process.stdout.rows || 24;
+  return Math.max(1, Math.min(20, rows - 5));
+}
+
+function updateMcpSelectionState() {
+  if (mcpServers.length === 0) {
+    mcpSelected = 0;
+    mcpScroll = 0;
+    return;
+  }
+  mcpSelected = Math.max(0, Math.min(mcpSelected, mcpServers.length - 1));
+  if (mcpSelected < mcpScroll) {
+    mcpScroll = mcpSelected;
+  }
+  const visibleCount = getMcpVisibleCount();
+  if (mcpSelected >= mcpScroll + visibleCount) {
+    mcpScroll = mcpSelected - visibleCount + 1;
+  }
+  mcpScroll = Math.min(mcpScroll, Math.max(0, mcpServers.length - visibleCount));
+}
+
+function openMcpBuffer() {
+  const reuseAltScreen = altScreenActive;
+  commandBufferQuery = "";
+  lastCommandRenderedRows = [];
+  lastCommandRenderedCols = 0;
+  lastCommandRenderedHeight = 0;
+  input = "";
+  inputCursorIndex = 0;
+  pendingPastedPayloads = [];
+  commandMenuDismissed = false;
+  commandMenuSelected = 0;
+  commandMenuScroll = 0;
+  activeBuffer = "mcp";
+  enterAltScreenIfNeeded();
+  isBracketedPasteActive = false;
+  bracketedPasteBuffer = "";
+  pasteParserBuffer = "";
+  mcpSelected = 0;
+  mcpScroll = 0;
+  mcpManagerMessage = mcpBridgeError || "";
+  lastMcpRenderedRows = [];
+  lastMcpRenderedCols = 0;
+  lastMcpRenderedHeight = 0;
+  forceFullClearOnNextRender = !reuseAltScreen;
+  cancelIdleFlush();
+  burstMode = false;
+  markDirty();
+  renderFrame(true);
+}
+
+function closeMcpBuffer() {
+  exitAltScreenIfNeeded({ preserveRestoredScreen: true });
+  activeBuffer = "main";
+  lastMcpRenderedRows = [];
+  lastMcpRenderedCols = 0;
+  lastMcpRenderedHeight = 0;
+  cancelIdleFlush();
+  burstMode = false;
+  markDirty();
+  renderFrame(false);
+}
+
+function renderMcpBuffer() {
+  process.stdout.write(HIDE_CURSOR);
+  const rows = process.stdout.rows || 24;
+  const cols = process.stdout.columns || 80;
+  const panelWidth = Math.min(Math.max(60, Math.floor(cols * 0.85)), cols);
+  const panelLeft = Math.max(0, Math.floor((cols - panelWidth) / 2));
+  const visibleCount = getMcpVisibleCount();
+  updateMcpSelectionState();
+
+  if (!hasInitializedScreen || forceFullClearOnNextRender) {
+    readline.cursorTo(process.stdout, 0, 0);
+    readline.clearScreenDown(process.stdout);
+    hasInitializedScreen = true;
+    forceFullClearOnNextRender = false;
+    lastMcpRenderedRows = [];
+  }
+  if (lastMcpRenderedCols !== cols || lastMcpRenderedHeight !== rows) {
+    lastMcpRenderedRows = [];
+    lastMcpRenderedCols = cols;
+    lastMcpRenderedHeight = rows;
+  }
+
+  const frameRows = Array.from({ length: rows }, () => ({ text: " ".repeat(cols), color: null }));
+  const setPanelRow = (y, content, color = null) => {
+    if (y < 0 || y >= rows) return;
+    const clipped = String(content || "").slice(0, panelWidth).padEnd(panelWidth, " ");
+    const left = " ".repeat(panelLeft);
+    const right = " ".repeat(Math.max(0, cols - panelLeft - panelWidth));
+    frameRows[y] = { text: `${left}${clipped}${right}`.slice(0, cols), color };
+  };
+
+  setPanelRow(0, `MCP Servers (${mcpServers.length} configured)`);
+  if (mcpManagerMessage) {
+    setPanelRow(1, mcpManagerMessage, PLACEHOLDER_COLOR);
+  }
+
+  if (mcpServers.length === 0) {
+    const configPath = formatWorkspacePathForFooter(getMcpConfigPath());
+    setPanelRow(2, `No servers configured in ${configPath}`, PLACEHOLDER_COLOR);
+  } else {
+    const end = Math.min(mcpServers.length, mcpScroll + visibleCount);
+    for (let i = mcpScroll; i < end; i += 1) {
+      const entry = mcpServers[i];
+      const row = 2 + (i - mcpScroll);
+      const selected = i === mcpSelected;
+      const busy = mcpBusyNames.has(entry.name);
+      const status = busy
+        ? "working"
+        : entry.error
+          ? "error"
+          : isMcpServerEntryRunning(entry)
+            ? "running"
+            : "stopped";
+      const toolText = isMcpServerEntryRunning(entry) ? ` · ${entry.tools.length} tool${entry.tools.length === 1 ? "" : "s"}` : "";
+      const errorText = entry.error ? ` · ${String(entry.error).replace(/\s+/g, " ").slice(0, 42)}` : "";
+      const transportText = entry.client?.transport === "http" || /^https?:\/\//i.test(entry.command || "")
+        ? "http"
+        : "stdio";
+      const marker = selected ? "●" : "○";
+      const text = `  ${marker} ${entry.name}  [${transportText}] ${status}${toolText}${errorText}`;
+      const color = selected
+        ? BLUE_COLOR
+        : entry.error
+          ? RED_COLOR
+          : isMcpServerEntryRunning(entry)
+            ? GREEN_COLOR
+            : null;
+      setPanelRow(row, text, color);
+    }
+  }
+
+  setPanelRow(rows - 1, "Enter: start/stop  R: reload config  Esc: return", PLACEHOLDER_COLOR);
+  for (let y = 0; y < rows; y += 1) {
+    const nextRow = frameRows[y];
+    const prevRow = lastMcpRenderedRows[y];
+    if (prevRow && prevRow.text === nextRow.text && prevRow.color === nextRow.color) continue;
+    if (nextRow.color) {
+      writeColoredLine(y, nextRow.text, cols, nextRow.color);
+    } else {
+      writeLine(y, nextRow.text, cols);
+    }
+  }
+  lastMcpRenderedRows = frameRows;
+  dirty = false;
 }
 
 function getLoopsVisibleCount() {
@@ -9351,6 +10076,13 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
             line = `${color}${visibleText}${RESET_COLOR}`;
           }
         }
+      } else if (isPlanUi && /^🗹\s/.test(body)) {
+        line = `${PLACEHOLDER_COLOR}${DIFF_DIM_TEXT}${STRIKETHROUGH_TEXT}${visibleText}${NORMAL_TEXT_DECORATION}${DIFF_NORMAL_INTENSITY}${RESET_COLOR}`;
+      } else if (isPlanUi && /^☐\s/.test(body)) {
+        const pendingMarker = visibleText.indexOf("☐");
+        line = pendingMarker >= 0
+          ? `${visibleText.slice(0, pendingMarker)}${MARKDOWN_LIST_MARKER_COLOR}☐${RESET_COLOR}${visibleText.slice(pendingMarker + 1)}`
+          : visibleText;
       } else if (displayRole === "assistant" && lineMeta.python) {
         line = highlightPythonCodeLine(visibleText.padEnd(contentWidth, " "), lineMeta.fence);
       } else if (displayRole === "assistant") {
@@ -11088,6 +11820,10 @@ function renderFrame(forceChatRefresh = false) {
     renderProvidersBuffer();
     return;
   }
+  if (activeBuffer === "mcp") {
+    renderMcpBuffer();
+    return;
+  }
   if (activeBuffer === "provider_editor") {
     renderProviderEditorBuffer();
     return;
@@ -12082,11 +12818,38 @@ function runAppendSelfTest() {
 
 async function runExecuteTransportSelfTest() {
   const out = process.stdout.write.bind(process.stdout);
+  const previousMode = collaborationMode;
   const largeCode = `${"# large execute transport\n".repeat(2500)}print("LARGE_EXEC_OK")`;
   const result = await executeCodeWithPythonTool(largeCode);
   if (!result?.ok || !String(result.output || "").includes("LARGE_EXEC_OK")) {
     out(`EXECUTE_FAIL: ${JSON.stringify(result)}\n`);
     return 1;
+  }
+  try {
+    collaborationMode = "plan";
+    const readResult = await executeCodeWithPythonTool(
+      "print(get_file_content('package.json', start_line=1, end_line=1))"
+    );
+    if (!readResult?.ok || !String(readResult.output || "").includes("{")) {
+      out(`EXECUTE_FAIL: plan mode blocked read-only inspection: ${JSON.stringify(readResult)}\n`);
+      return 1;
+    }
+    const writeResult = await executeCodeWithPythonTool(
+      "print(write_file('plan-mode-should-not-exist.txt', 'blocked'))"
+    );
+    if (writeResult?.ok || !String(writeResult?.error || "").includes("Plan mode blocks call")) {
+      out(`EXECUTE_FAIL: plan mode allowed write_file: ${JSON.stringify(writeResult)}\n`);
+      return 1;
+    }
+    const rawWriteResult = await executeCodeWithPythonTool(
+      "open('plan-mode-should-not-exist.txt', 'w').write('blocked')"
+    );
+    if (rawWriteResult?.ok || !String(rawWriteResult?.error || "").includes("Plan mode blocks")) {
+      out(`EXECUTE_FAIL: plan mode allowed raw file access: ${JSON.stringify(rawWriteResult)}\n`);
+      return 1;
+    }
+  } finally {
+    collaborationMode = previousMode;
   }
   out("EXECUTE_OK\n");
   return 0;
@@ -12095,6 +12858,36 @@ async function runExecuteTransportSelfTest() {
 function runFormatSelfTest() {
   const out = process.stdout.write.bind(process.stdout);
   try {
+    if (
+      shouldTransitionCommandDirectlyToAltBuffer("/loop", "") ||
+      !shouldTransitionCommandDirectlyToAltBuffer("/loops", "")
+    ) {
+      out("FORMAT_FAIL: /loop usage and /loops navigation transitions are incorrect\n");
+      return 1;
+    }
+    const previousCommandQuery = commandBufferQuery;
+    commandBufferQuery = "loop every 5 minutes check tests";
+    const exactLoopCommands = getFilteredCommandBufferCommands();
+    commandBufferQuery = previousCommandQuery;
+    if (exactLoopCommands.length !== 1 || exactLoopCommands[0]?.name !== "/loop") {
+      out("FORMAT_FAIL: command arguments should preserve the matching command usage row\n");
+      return 1;
+    }
+    const previousCommandSelected = commandMenuSelected;
+    const previousCommandScroll = commandMenuScroll;
+    commandBufferQuery = "";
+    commandMenuSelected = 0;
+    commandMenuScroll = 0;
+    moveCommandBufferSelection(1);
+    const arrowQueryPreserved = commandBufferQuery === "";
+    const arrowSelectionMoved = commandMenuSelected === 1;
+    commandBufferQuery = previousCommandQuery;
+    commandMenuSelected = previousCommandSelected;
+    commandMenuScroll = previousCommandScroll;
+    if (!arrowQueryPreserved || !arrowSelectionMoved) {
+      out("FORMAT_FAIL: command arrow navigation must move selection without replacing input\n");
+      return 1;
+    }
     const multilineUser = buildTranscriptLinesForEntry(
       { role: "user", content: "first line\nsecond line" },
       80
@@ -12203,9 +12996,24 @@ function runFormatSelfTest() {
       ],
     });
     if (
-      planMarkdown !== "## Plan\n\n- [x] Inspect project\n- [ ] Implement change"
+      planMarkdown !== "## Plan\n\n🗹 Inspect project\n☐ Implement change"
     ) {
       out(`FORMAT_FAIL: plan markdown is incorrect: ${JSON.stringify(planMarkdown)}\n`);
+      return 1;
+    }
+    const planModePrompt = buildSystemPromptFromDescriptions(
+      {
+        get_file_content: FALLBACK_TOOL_DESCRIPTIONS.get_file_content,
+        write_file: FALLBACK_TOOL_DESCRIPTIONS.write_file,
+      },
+      { modelId: "self-test", contextLeftPercent: 75, collaborationMode: "plan" }
+    );
+    if (
+      !planModePrompt.includes("PLAN MODE (MANDATORY)") ||
+      !planModePrompt.includes("get_file_content") ||
+      planModePrompt.includes("write_file")
+    ) {
+      out("FORMAT_FAIL: plan-mode prompt did not filter mutating tools\n");
       return 1;
     }
     const planPayload = buildToolResultPayload({
@@ -12228,7 +13036,7 @@ function runFormatSelfTest() {
       out("FORMAT_FAIL: plan UI must preserve raw JSON only in tool history\n");
       return 1;
     }
-    const renderedPlan = buildTranscriptLinesForEntry(
+    const styledRenderedPlan = buildTranscriptLinesForEntry(
       {
         role: "tool",
         name: "code_execution",
@@ -12238,11 +13046,16 @@ function runFormatSelfTest() {
         toolOk: true,
       },
       80
-    ).map(stripAnsiSgr);
+    );
+    const renderedPlan = styledRenderedPlan.map(stripAnsiSgr);
     const renderedPlanText = renderedPlan.join("\n");
     if (
       !renderedPlanText.includes("## Plan") ||
-      !renderedPlanText.includes("- [x] Inspect project") ||
+      !renderedPlanText.includes("🗹 Inspect project") ||
+      !renderedPlanText.includes("☐ Implement change") ||
+      !styledRenderedPlan.some((line) =>
+        line.includes(DIFF_DIM_TEXT) && line.includes(STRIKETHROUGH_TEXT)
+      ) ||
       renderedPlanText.includes("Ran code_execution") ||
       renderedPlanText.includes("\u2500\u2500\u2500")
     ) {
@@ -12259,27 +13072,30 @@ function runFormatSelfTest() {
       out("FORMAT_FAIL: updated plan should supersede the previous plan UI\n");
       return 1;
     }
-    const resumedPlanHistory = parseSessionHistory([
+    const resumedPlanSession = parseSessionHistory([
       JSON.stringify({
         role: "tool",
         content: "old raw result",
         name: "code_execution",
         uiKind: "plan",
-        uiContent: "## Plan\n\n- [ ] Old task",
+        uiContent: "## Plan\n\n☐ Old task",
       }),
       JSON.stringify({
         role: "tool",
         content: "new raw result",
         name: "code_execution",
+        sessionMode: "plan",
         uiKind: "plan",
-        uiContent: "## Plan\n\n- [x] Old task",
+        uiContent: "## Plan\n\n🗹 Old task",
       }),
-    ].join("\n")).loadedMessages;
+    ].join("\n"));
+    const resumedPlanHistory = resumedPlanSession.loadedMessages;
     if (
       resumedPlanHistory.length !== 2 ||
       resumedPlanHistory[0].hidden !== true ||
       resumedPlanHistory[1].hidden === true ||
-      resumedPlanHistory[1].uiContent !== "## Plan\n\n- [x] Old task"
+      resumedPlanHistory[1].uiContent !== "## Plan\n\n🗹 Old task" ||
+      resumedPlanSession.sessionMode !== "plan"
     ) {
       out("FORMAT_FAIL: resumed session should show only the newest plan UI\n");
       return 1;
@@ -13287,9 +14103,55 @@ async function runMcpSelfTest() {
     const origConfig = fsSync.existsSync(configPath)
       ? fsSync.readFileSync(configPath, "utf8")
       : null;
+    const http = require("node:http");
+    const mockHttpServer = http.createServer((req, res) => {
+      if (req.method === "DELETE") {
+        res.writeHead(204).end();
+        return;
+      }
+      let body = "";
+      req.on("data", (chunk) => { body += String(chunk); });
+      req.on("end", () => {
+        let msg = {};
+        try { msg = JSON.parse(body || "{}"); } catch { /* invalid input stays empty */ }
+        if (msg.method === "notifications/initialized") {
+          res.writeHead(202).end();
+          return;
+        }
+        let result = {};
+        if (msg.method === "initialize") {
+          result = {
+            protocolVersion: "2025-03-26",
+            capabilities: { tools: {} },
+            serverInfo: { name: "remote-mock", version: "1.0.0" },
+          };
+        } else if (msg.method === "tools/list") {
+          result = {
+            tools: [{
+              name: "remote_ping",
+              description: "Remote ping test tool",
+              inputSchema: { type: "object", properties: { value: { type: "string" } } },
+            }],
+          };
+        } else if (msg.method === "tools/call") {
+          result = { content: [{ type: "text", text: `remote-pong:${msg.params?.arguments?.value || ""}` }] };
+        }
+        const payload = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result });
+        const headers = { "Content-Type": "application/json" };
+        if (msg.method === "initialize") headers["Mcp-Session-Id"] = "remote-mock-session";
+        res.writeHead(200, headers).end(payload);
+      });
+    });
+    await new Promise((resolve, reject) => {
+      mockHttpServer.once("error", reject);
+      mockHttpServer.listen(0, "127.0.0.1", resolve);
+    });
+    const mockHttpAddress = mockHttpServer.address();
+    const mockHttpUrl = `http://127.0.0.1:${mockHttpAddress.port}/mcp`;
     const mockConfig = {
       mcpServers: {
         mock: { command: mockNode, args: [scriptPath] },
+        remoteMock: { type: "http", url: mockHttpUrl },
       },
     };
     fsSync.writeFileSync(configPath, JSON.stringify(mockConfig, null, 2), "utf8");
@@ -13316,6 +14178,21 @@ async function runMcpSelfTest() {
 `);
         return 1;
       }
+      const remoteEntry = mcpServers.find((entry) => entry.name === "remoteMock");
+      if (
+        !remoteEntry ||
+        !isMcpServerEntryRunning(remoteEntry) ||
+        remoteEntry.client?.transport !== "http" ||
+        remoteEntry.client?.sessionId !== "remote-mock-session" ||
+        remoteEntry.tools[0]?.name !== "remote_ping"
+      ) {
+        out(`MCP_FAIL: Streamable HTTP server not discovered: ${JSON.stringify({
+          error: remoteEntry?.error,
+          tools: remoteEntry?.tools,
+          sessionId: remoteEntry?.client?.sessionId,
+        })}\n`);
+        return 1;
+      }
 
       const bridgeResp = await handleMcpBridgeRequest({
         method: "call",
@@ -13328,11 +14205,34 @@ async function runMcpSelfTest() {
 `);
         return 1;
       }
+      const remoteBridgeResp = await handleMcpBridgeRequest({
+        method: "call",
+        server: "remoteMock",
+        tool: "remote_ping",
+        arguments: { value: "hello" },
+      });
+      if (!remoteBridgeResp.ok || remoteBridgeResp.text !== "remote-pong:hello") {
+        out(`MCP_FAIL: HTTP bridge call returned ${JSON.stringify(remoteBridgeResp)}\n`);
+        return 1;
+      }
 
       const descKeys = Object.keys(mcpDescriptions);
-      if (descKeys.length !== 1 || !descKeys[0].includes("ping")) {
-        out(`MCP_FAIL: expected 1 description with "ping", got ${JSON.stringify(descKeys)}
+      if (descKeys.length !== 2 || !descKeys.some((key) => key.includes("remote_ping"))) {
+        out(`MCP_FAIL: expected stdio and HTTP tool descriptions, got ${JSON.stringify(descKeys)}
 `);
+        return 1;
+      }
+
+      const stopped = await stopMcpServerByName("mock");
+      const stoppedEntry = mcpServers.find((entry) => entry.name === "mock");
+      if (!stopped.ok || isMcpServerEntryRunning(stoppedEntry) || stoppedEntry?.tools.length !== 0) {
+        out(`MCP_FAIL: individual stop failed: ${JSON.stringify(stopped)}\n`);
+        return 1;
+      }
+      const restarted = await startMcpServerByName("mock");
+      const restartedEntry = mcpServers.find((entry) => entry.name === "mock");
+      if (!restarted.ok || !isMcpServerEntryRunning(restartedEntry) || restartedEntry?.tools.length !== 1) {
+        out(`MCP_FAIL: individual restart failed: ${JSON.stringify(restarted)}\n`);
         return 1;
       }
 
@@ -13390,6 +14290,7 @@ async function runMcpSelfTest() {
       } else {
         fsSync.rmSync(configPath, { force: true });
       }
+      await new Promise((resolve) => mockHttpServer.close(resolve));
     }
   } catch (error) {
     out(`MCP_FAIL: ${String(error?.message || error)}\n`);
@@ -13444,6 +14345,8 @@ process.stdin.on("data", (rawChunk) => {
     closeSessionsBuffer();
   } else if (activeBuffer === "providers" && chunk === "\u001b") {
     closeProvidersBuffer();
+  } else if (activeBuffer === "mcp" && chunk === "\u001b") {
+    closeMcpBuffer();
   } else if (activeBuffer === "loops" && chunk === "\u001b") {
     closeLoopsBuffer();
   } else if (activeBuffer === "solve" && chunk === "\u001b") {
@@ -13909,6 +14812,68 @@ process.stdin.on("keypress", async (str, key) => {
     return;
   }
 
+  if (activeBuffer === "mcp") {
+    if (key?.ctrl) {
+      return;
+    }
+    if (key?.name === "escape" || key?.sequence === "\u001b" || str === "\u001b") {
+      closeMcpBuffer();
+      return;
+    }
+    if (key?.name === "up" || key?.name === "down") {
+      if (mcpServers.length > 0) {
+        mcpSelected = key.name === "up"
+          ? Math.max(0, mcpSelected - 1)
+          : Math.min(mcpServers.length - 1, mcpSelected + 1);
+        updateMcpSelectionState();
+      }
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+    if (key?.name === "r" || str === "r" || str === "R") {
+      if (mcpBusyNames.size > 0) return;
+      for (const entry of mcpServers) mcpBusyNames.add(entry.name);
+      mcpManagerMessage = "Reloading MCP configuration...";
+      markDirty();
+      renderFrame(true);
+      try {
+        await reloadMcpServers();
+        mcpBridgeError = "";
+        mcpManagerMessage = `Reloaded. ${getMcpStatusText()}`;
+      } catch (error) {
+        mcpBridgeError = error?.message || String(error);
+        mcpManagerMessage = `Reload failed: ${mcpBridgeError}`;
+      } finally {
+        mcpBusyNames.clear();
+      }
+      updateMcpSelectionState();
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+    if (key?.sequence === "\r" || key?.name === "return" || key?.name === "enter") {
+      const entry = mcpServers[mcpSelected];
+      if (!entry || mcpBusyNames.has(entry.name)) return;
+      const wasRunning = isMcpServerEntryRunning(entry);
+      mcpBusyNames.add(entry.name);
+      mcpManagerMessage = `${wasRunning ? "Stopping" : "Starting"} ${entry.name}...`;
+      markDirty();
+      renderFrame(true);
+      const result = wasRunning
+        ? await stopMcpServerByName(entry.name)
+        : await startMcpServerByName(entry.name);
+      mcpManagerMessage = result.ok
+        ? `${entry.name} ${wasRunning ? "stopped" : `running (${result.tools || 0} tools)`}.`
+        : `${entry.name}: ${result.error || "operation failed"}`;
+      updateMcpSelectionState();
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+    return;
+  }
+
   if (activeBuffer === "providers") {
     if (key?.ctrl) {
       return;
@@ -14076,26 +15041,7 @@ process.stdin.on("keypress", async (str, key) => {
     }
 
     if (key?.name === "up" || key?.name === "down") {
-      const commands = getFilteredCommandBufferCommands();
-      const visibleCount = getCommandBufferVisibleCount();
-      if (commands.length > 0) {
-        if (key.name === "up") {
-          commandMenuSelected = Math.max(0, commandMenuSelected - 1);
-        } else {
-          commandMenuSelected = Math.min(commands.length - 1, commandMenuSelected + 1);
-        }
-
-        if (commandMenuSelected < commandMenuScroll) {
-          commandMenuScroll = commandMenuSelected;
-        } else if (commandMenuSelected >= commandMenuScroll + visibleCount) {
-          commandMenuScroll = commandMenuSelected - visibleCount + 1;
-        }
-
-        const selectedCommand = commands[commandMenuSelected];
-        if (selectedCommand?.name) {
-          commandBufferQuery = selectedCommand.name.replace(/^\/+/, "");
-        }
-      }
+      moveCommandBufferSelection(key.name === "up" ? -1 : 1);
 
       markDirty();
       renderFrame(true);
@@ -14124,7 +15070,7 @@ process.stdin.on("keypress", async (str, key) => {
           COMMANDS.some((command) => command.name === typedCommand);
         if (isKnownTypedCommand) {
           closeCommandBuffer({
-            transitionToAltBuffer: shouldTransitionCommandDirectlyToAltBuffer(typedCommand),
+            transitionToAltBuffer: shouldTransitionCommandDirectlyToAltBuffer(typedCommand, typedArgs),
           });
           const handled = await runSlashCommand(typedCommand, typedArgs);
           if (!handled) {
@@ -14145,7 +15091,7 @@ process.stdin.on("keypress", async (str, key) => {
       }
 
       closeCommandBuffer({
-        transitionToAltBuffer: shouldTransitionCommandDirectlyToAltBuffer(selectedCommand.name),
+        transitionToAltBuffer: shouldTransitionCommandDirectlyToAltBuffer(selectedCommand.name, ""),
       });
       const handled = await runSlashCommand(selectedCommand.name);
       if (!handled) {
