@@ -2433,6 +2433,54 @@ def mcp_call(server: str, tool: str, args: dict | None = None) -> dict:
         return {"ok": False, "error": f"MCP bridge request failed: {exc}"}
 
 
+def mcp_search(
+    query: str = "",
+    action: str = "search",
+    server: str = "",
+    tool: str = "",
+    args: dict | None = None,
+    limit: int = 5,
+) -> dict:
+    """Search, describe, list, or call tools in the TUI's deferred MCP catalog."""
+    import urllib.request
+
+    info = _read_mcp_bridge_info()
+    if not info:
+        return {
+            "ok": False,
+            "error": "MCP bridge not available. Is the TUI running with MCP enabled, and are servers configured in ~/.nexus/mcp_config.json?",
+        }
+    action = str(action or "search").strip().lower()
+    if action not in {"list", "search", "describe", "call"}:
+        return {"ok": False, "error": "mcp_search: action must be list, search, describe, or call"}
+    if action == "search" and not str(query or "").strip():
+        return {"ok": False, "error": "mcp_search: query must be non-empty for search"}
+    if action in {"describe", "call"} and (not str(server or "").strip() or not str(tool or "").strip()):
+        return {"ok": False, "error": f"mcp_search: server and tool are required for {action}"}
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        return {"ok": False, "error": "mcp_search: args must be a dict"}
+
+    payload = json.dumps({
+        "method": "search",
+        "action": action,
+        "query": str(query or ""),
+        "server": str(server or ""),
+        "tool": str(tool or ""),
+        "arguments": args,
+        "limit": limit,
+    }).encode("utf-8")
+    url = f"http://127.0.0.1:{info['port']}/"
+    try:
+        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+        timeout = 60 if action == "call" else 15
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        return {"ok": False, "error": f"MCP bridge request failed: {exc}"}
+
+
 FUNCTIONS = {
     "create_plan": create_plan,
     "update_plan": update_plan,
@@ -2473,6 +2521,7 @@ FUNCTIONS = {
     "web_search": web_search,
     "mcp_list": mcp_list,
     "mcp_call": mcp_call,
+    "mcp_search": mcp_search,
     "set_reminder": set_reminder,
     "kernel_exec": kernel_exec,
     "kernel_reset": kernel_reset,
@@ -2518,6 +2567,7 @@ FUNCTION_DESCRIPTIONS = {
     "refine_reflection": "refine_reflection(auto: bool = True) -> dict: Auto-synthesize a refinement from recent subagent results and prompt notes.",
     "mcp_list": "mcp_list() -> dict: List all configured MCP servers and the tool names each exposes. Returns {ok: bool, servers?: {name: {status, error?, tools: [name]}}, error?: str}.",
     "mcp_call": "mcp_call(server: str, tool: str, args: dict | None = None) -> dict: Call a tool exposed by an MCP server (configured in ~/.nexus/mcp_config.json). Returns the server's result as {ok: bool, result?: object, text?: str, error?: str}.",
+    "mcp_search": "mcp_search(query: str = '', action: str = 'search', server: str = '', tool: str = '', args: dict | None = None, limit: int = 5) -> dict: Search the deferred MCP catalog without loading every schema into context. Actions: list returns server counts; search returns matching schemas; describe returns one exact schema; call invokes an exact discovered tool.",
     "set_reminder": "set_reminder(when: str, prompt: str) -> dict: Schedule a one-shot session reminder via the TUI bridge. when is a human phrase like 'in 5 minutes', 'in 2 hours', 'at 3pm', 'tomorrow 9am'. prompt is the exact action/message to run when it fires. Fires once as a normal user turn. Use whenever the user asks to be reminded or to remember something later.",
     "kernel_exec": "kernel_exec(code: str) -> dict: Execute Python in the session's persistent kernel. State persists across calls (variables/functions defined here are usable in later kernel_exec calls). Returns {ok, output, error, traceback}; print() surfaces results. Use for iterative/stateful computation where recomputing from scratch would be wasteful.",
     "kernel_reset": "kernel_reset() -> dict: Kill the persistent kernel so the next kernel_exec starts with a clean scope. Returns {ok, error}.",

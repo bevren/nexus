@@ -260,6 +260,8 @@ const FALLBACK_TOOL_DESCRIPTIONS = {
     "kernel_exec(code: str) -> dict: Execute Python in the session's persistent kernel. State persists across calls (variables/functions defined here are usable in later kernel_exec calls). Returns {ok, output, error, traceback}; print() surfaces results. Use for iterative/stateful computation where recomputing from scratch would be wasteful.",
   kernel_reset:
     "kernel_reset() -> dict: Kill the persistent kernel so the next kernel_exec starts with a clean scope. Returns {ok, error}.",
+  mcp_search:
+    "mcp_search(query: str = '', action: str = 'search', server: str = '', tool: str = '', args: dict | None = None, limit: int = 5) -> dict: Search deferred MCP tools, describe an exact match, or call it without loading the full MCP catalog into the prompt.",
 };
 
 let input = "";
@@ -389,7 +391,9 @@ let systemPromptLoadPromise = null;
 let mcpBridgeServer = null;
 let mcpBridgePort = 0;
 let mcpServers = [];
-let mcpDescriptions = {};
+let mcpCatalog = [];
+let mcpCatalogDocumentFrequency = new Map();
+let mcpCatalogAverageDocumentLength = 0;
 let mcpBridgeReadyResolve = null;
 let mcpBridgeReadyPromise = null;
 let mcpBridgeState = "";
@@ -859,23 +863,12 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
   const lines = entries
     .sort((a, b) => a[0].localeCompare(b[0]))
     .map(([name, description]) => `- ${name}: ${description}`);
-  const modelLabel =
-    typeof runtime?.modelId === "string" && runtime.modelId.trim().length > 0
-      ? runtime.modelId.trim()
-      : "no model";
-  const rawContextLeft = Number(runtime?.contextLeftPercent);
-  const safeContextLeft = Number.isFinite(rawContextLeft)
-    ? Math.max(0, Math.min(100, Math.round(rawContextLeft)))
-    : 100;
-
   if (planModeActive) {
     return [
       "Your name is Nexus developed by duxx.",
       "You are a terminal coding assistant operating in read-only Plan mode.",
       "",
-      "RUNTIME CONTEXT STATUS (MUST FOLLOW):",
-      `- Current model: ${modelLabel}`,
-      `- Context remaining: ${safeContextLeft}%`,
+      "CONTEXT USE (MUST FOLLOW):",
       "- Avoid repetition and re-reading unchanged files; inspect targeted context.",
       "",
       "PLAN MODE (MANDATORY):",
@@ -917,8 +910,7 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "Your name is Nexus developed by duxx.",
     "You are a terminal coding assistant. You can spawn agents and orchestrate them.",
     "",
-    "RUNTIME CONTEXT STATUS (MUST FOLLOW):",
-    `- Current model: ${modelLabel}`,
+    "CONTEXT USE (MUST FOLLOW):",
     "- Use context effectively: avoid unnecessary repetition, avoid re-reading unchanged large files, and prefer targeted edits/tool calls.",
     "",
     "COLLABORATION MODE (MUST FOLLOW):",
@@ -1056,10 +1048,7 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "- Skills are packaged instructions you can load when the task matches.",
     "- Call list_skills() to see available skills, then get_skill(name) to load the instructions.",
     "- Load a skill only when it is relevant to the current task; otherwise ignore.",
-    "- Available skills:",
-    ...(skillsCatalog.length > 0
-      ? skillsCatalog.map((s) => `  - ${s.name}${s.description ? ": " + s.description : ""}`)
-      : ["  (none)"]),
+    "- Skill names and descriptions are intentionally deferred. Call list_skills() when discovery is needed.",
     "",
     "Predefined Python helper functions available in the execution environment:",
     ...(lines.length > 0 ? lines : ["- (none)"]),
@@ -1086,13 +1075,11 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "",
     "MCP TOOLS (Model Context Protocol servers, optional):",
     "- MCP servers are separate processes exposing extra capabilities as tools.",
-    "- Call them from within an execute block using: mcp_call(server, tool, args) -> dict",
-    "- List available servers/tools with: mcp_list() -> dict",
-    ...(Object.keys(mcpDescriptions).length > 0
-      ? Object.entries(mcpDescriptions)
-          .sort((a, b) => a[0].localeCompare(b[0]))
-          .map(([toolKey, desc]) => `- ${toolKey}: ${desc}`)
-      : ["- (no MCP servers/tools available)"]),
+    "- MCP tool schemas stay outside this prompt. Discover only relevant tools with mcp_search().",
+    "- Search: mcp_search(query='what capability is needed', limit=5) -> matching tools with schemas.",
+    "- Describe an exact tool: mcp_search(action='describe', server='server', tool='tool').",
+    "- Call a discovered tool: mcp_search(action='call', server='server', tool='tool', args={...}).",
+    "- List connected servers and tool counts with mcp_search(action='list'); do not assume a server is configured.",
     "",
     "If no tool use is needed, reply in normal plain text.",
   ].join("\n");
@@ -1149,13 +1136,13 @@ async function loadSkillsCatalog() {
 // MCP (Model Context Protocol) client support
 //
 // Connects configured MCP stdio and Streamable HTTP servers at startup,
-// exposes their tools to the LLM via the system prompt, and bridges tool
-// calls from tools.py through a localhost HTTP endpoint.
+// keeps their schemas in a process-local searchable catalog, and bridges
+// discovery/calls from tools.py through a localhost HTTP endpoint.
 // ---------------------------------------------------------------------------
 
 const MCP_CONFIG_PATH = path.join(os.homedir(), ".nexus", "mcp_config.json");
 
-// mcpBridgeServer, mcpBridgePort, mcpServers, mcpDescriptions, mcpBridgeReady*
+// mcpBridgeServer, mcpBridgePort, mcpServers, mcpCatalog, mcpBridgeReady*
 // and mcpBridgeState/Error are declared at the top of the file.
 
 function getMcpConfigPath() {
@@ -1689,18 +1676,6 @@ async function startMcpServers() {
   }));
 }
 
-function rebuildSystemPromptAfterMcpChange() {
-  if (!systemPromptText) {
-    return;
-  }
-  systemPromptText = buildSystemPromptFromDescriptions(toolDescriptions, {
-    modelId: selectedModel,
-    contextLeftPercent: getContextLeftPercent(selectedModel),
-    collaborationMode,
-  });
-  ensureSystemMessageAtTop();
-}
-
 async function startMcpServerByName(name) {
   const serverName = String(name || "").trim();
   const config = loadMcpConfig();
@@ -1749,7 +1724,6 @@ async function startMcpServerByName(name) {
     mcpServers.push(nextEntry);
   }
   await refreshMcpDescriptions();
-  rebuildSystemPromptAfterMcpChange();
   return nextEntry.error
     ? { ok: false, error: nextEntry.error }
     : { ok: true, tools: nextEntry.tools.length };
@@ -1780,7 +1754,6 @@ async function stopMcpServerByName(name) {
   } finally {
     mcpBusyNames.delete(serverName);
     await refreshMcpDescriptions();
-    rebuildSystemPromptAfterMcpChange();
   }
   return { ok: true };
 }
@@ -1797,7 +1770,6 @@ async function reloadMcpServers() {
       mcpBridgeError = error?.message || String(error);
     }
   }
-  rebuildSystemPromptAfterMcpChange();
   return mcpServers;
 }
 
@@ -1965,6 +1937,44 @@ async function handleMcpBridgeRequest(parsed) {
     return { ok: true, servers: result };
   }
 
+  if (parsed.method === "search") {
+    const action = typeof parsed.action === "string" ? parsed.action.trim().toLowerCase() : "search";
+    if (action === "list") {
+      return { ok: true, servers: buildMcpCatalogServerSummary() };
+    }
+    if (action === "search") {
+      const query = typeof parsed.query === "string" ? parsed.query.trim() : "";
+      if (!query) {
+        return { ok: false, error: "mcp_search requires a non-empty query" };
+      }
+      const server = typeof parsed.server === "string" ? parsed.server.trim() : "";
+      const limit = Number.isFinite(Number(parsed.limit))
+        ? Math.max(1, Math.min(20, Math.trunc(Number(parsed.limit))))
+        : 5;
+      const matches = searchMcpCatalog(query, { server, limit });
+      return {
+        ok: true,
+        query,
+        matches: matches.map(formatMcpCatalogTool),
+        totalCatalogTools: mcpCatalog.length,
+      };
+    }
+    if (action === "describe") {
+      if (!serverName || !toolName) {
+        return { ok: false, error: "mcp_search describe requires server and tool" };
+      }
+      const found = findMcpCatalogTool(serverName, toolName);
+      return found
+        ? { ok: true, tool: formatMcpCatalogTool(found) }
+        : { ok: false, error: `unknown MCP tool "${serverName}.${toolName}"` };
+    }
+    if (action !== "call") {
+      return { ok: false, error: `unknown mcp_search action "${action}" (expected list, search, describe, or call)` };
+    }
+    // The call action falls through to the existing call path below so result
+    // content, transport errors, and backwards-compatible semantics stay shared.
+  }
+
   if (!serverName) {
     return { ok: false, error: "missing server" };
   }
@@ -2005,30 +2015,117 @@ function extractMcpResultText(result) {
   }
 }
 
-function buildMcpDescriptionLine(toolName, tool, serverName) {
-  const schema = tool.inputSchema || {};
-  const props = schema.properties && typeof schema.properties === "object" ? Object.keys(schema.properties) : [];
-  const params = props.length > 0 ? props.join(", ") : "...";
-  const required = Array.isArray(schema.required) ? schema.required : [];
-  const requiredMark = required.length > 0 ? ` (required: ${required.join(", ")})` : "";
-  const schemaHint = JSON.stringify(schema).slice(0, 240);
-  return `mcp_call(server="${serverName}", tool="${tool.name}", args={${params}}) -> dict: MCP tool "${toolName}" from server "${serverName}".${tool.description ? ` ${tool.description}` : ""}${requiredMark} Accepts JSON args matching the inputSchema. Schema: ${schemaHint}`;
+function tokenizeMcpCatalogText(value) {
+  return String(value || "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
 }
 
 async function refreshMcpDescriptions() {
-  mcpDescriptions = {};
+  const catalog = [];
   for (const entry of mcpServers) {
     if (!isMcpServerEntryRunning(entry)) {
       continue;
     }
     for (const tool of entry.tools) {
-      mcpDescriptions[`mcp:[${entry.name}] ${tool.name}`] = buildMcpDescriptionLine(
-        `${entry.name}_${tool.name}`,
-        tool,
-        entry.name
-      );
+      const server = String(entry.name || "");
+      const name = String(tool.name || "");
+      const description = typeof tool.description === "string" ? tool.description : "";
+      const searchText = `${server} ${name} ${description}`.toLowerCase();
+      const tokens = tokenizeMcpCatalogText(searchText);
+      catalog.push({
+        server,
+        name,
+        normalizedName: `${server}_${name}`.replace(/[^a-zA-Z0-9_-]/g, "_").toLowerCase(),
+        description,
+        inputSchema: tool.inputSchema && typeof tool.inputSchema === "object" ? tool.inputSchema : {},
+        outputSchema: tool.outputSchema && typeof tool.outputSchema === "object" ? tool.outputSchema : undefined,
+        annotations: tool.annotations && typeof tool.annotations === "object" ? tool.annotations : undefined,
+        searchText,
+        tokens,
+        tokenSet: new Set(tokens),
+      });
     }
   }
+  mcpCatalog = catalog;
+  mcpCatalogDocumentFrequency = new Map();
+  let totalLength = 0;
+  for (const item of catalog) {
+    totalLength += item.tokens.length;
+    for (const token of item.tokenSet) {
+      mcpCatalogDocumentFrequency.set(token, (mcpCatalogDocumentFrequency.get(token) || 0) + 1);
+    }
+  }
+  mcpCatalogAverageDocumentLength = catalog.length > 0 ? totalLength / catalog.length : 0;
+}
+
+function buildMcpCatalogServerSummary() {
+  const result = {};
+  for (const entry of mcpServers) {
+    result[entry.name] = {
+      status: entry.error ? "error" : isMcpServerEntryRunning(entry) ? "running" : "stopped",
+      error: entry.error || "",
+      toolCount: mcpCatalog.filter((tool) => tool.server === entry.name).length,
+    };
+  }
+  return result;
+}
+
+function formatMcpCatalogTool(item) {
+  const result = {
+    server: item.server,
+    tool: item.name,
+    name: `${item.server}.${item.name}`,
+    description: item.description,
+    inputSchema: item.inputSchema,
+  };
+  if (item.outputSchema) result.outputSchema = item.outputSchema;
+  if (item.annotations) result.annotations = item.annotations;
+  return result;
+}
+
+function findMcpCatalogTool(server, tool) {
+  const wantedServer = String(server || "").toLowerCase();
+  const wantedTool = String(tool || "").toLowerCase();
+  return mcpCatalog.find(
+    (item) => item.server.toLowerCase() === wantedServer && item.name.toLowerCase() === wantedTool
+  );
+}
+
+function searchMcpCatalog(query, options = {}) {
+  const queryText = String(query || "").trim().toLowerCase();
+  const queryTokens = [...new Set(tokenizeMcpCatalogText(queryText))];
+  const serverFilter = String(options.server || "").trim().toLowerCase();
+  const limit = Math.max(1, Math.min(20, Number(options.limit) || 5));
+  const count = Math.max(1, mcpCatalog.length);
+  const averageLength = Math.max(1, mcpCatalogAverageDocumentLength);
+
+  return mcpCatalog
+    .filter((item) => !serverFilter || item.server.toLowerCase() === serverFilter)
+    .map((item) => {
+      const rawName = item.name.toLowerCase();
+      const qualified = `${item.server}.${item.name}`.toLowerCase();
+      let score = 0;
+      if (queryText === qualified || queryText === item.normalizedName) score += 1000;
+      if (queryText === rawName) score += 900;
+      if (qualified.includes(queryText) || rawName.includes(queryText)) score += 120;
+      for (const token of queryTokens) {
+        const frequency = item.tokens.reduce((sum, value) => sum + (value === token ? 1 : 0), 0);
+        if (!frequency) continue;
+        const documentFrequency = mcpCatalogDocumentFrequency.get(token) || 0;
+        const inverseFrequency = Math.log(1 + (count - documentFrequency + 0.5) / (documentFrequency + 0.5));
+        const normalizedLength = 1 - 0.4 + 0.4 * (item.tokens.length / averageLength);
+        score += inverseFrequency * ((frequency * 1.9) / (frequency + 0.9 * normalizedLength));
+        if (rawName.includes(token)) score += 20;
+      }
+      return { item, score };
+    })
+    .filter(({ score }) => score > 0)
+    .sort((a, b) => b.score - a.score || a.item.server.localeCompare(b.item.server) || a.item.name.localeCompare(b.item.name))
+    .slice(0, limit)
+    .map(({ item }) => item);
 }
 
 async function stopMcpServers() {
@@ -2061,20 +2158,6 @@ async function initMcp() {
     mcpBridgeState = "error";
     mcpBridgeError = (mcpBridgeError ? mcpBridgeError + "; " : "") + (error?.message || String(error));
   }
-  // Refresh the system message so freshly-discovered MCP tools show up for
-  // the current chat (and any new one).
-  if (systemPromptText) {
-    try {
-      systemPromptText = buildSystemPromptFromDescriptions(toolDescriptions, {
-        modelId: selectedModel,
-        contextLeftPercent: getContextLeftPercent(selectedModel),
-      });
-      ensureSystemMessageAtTop();
-    } catch {
-      // non-fatal: keep the previous prompt if a rebuild fails
-    }
-  }
-
   if (mcpBridgeReadyResolve) {
     mcpBridgeReadyResolve();
     mcpBridgeReadyResolve = null;
@@ -2137,20 +2220,14 @@ async function ensureSystemPromptReady(forceReload = false) {
 
   systemPromptLoadPromise = (async () => {
     toolDescriptions = await loadToolDescriptionsFromPython();
-    systemPromptText = buildSystemPromptFromDescriptions(toolDescriptions, {
-      modelId: selectedModel,
-      contextLeftPercent: getContextLeftPercent(selectedModel),
-    });
+    systemPromptText = buildSystemPromptFromDescriptions(toolDescriptions, { collaborationMode });
   })();
 
   await systemPromptLoadPromise;
 }
 
-function ensureSystemMessageAtTop(modelId = selectedModel) {
-  const runtimeModelId = typeof modelId === "string" ? modelId : selectedModel;
+function ensureSystemMessageAtTop() {
   systemPromptText = buildSystemPromptFromDescriptions(toolDescriptions, {
-    modelId: runtimeModelId,
-    contextLeftPercent: getContextLeftPercent(runtimeModelId),
     collaborationMode,
   });
 
@@ -13001,17 +13078,43 @@ function runFormatSelfTest() {
       out(`FORMAT_FAIL: plan markdown is incorrect: ${JSON.stringify(planMarkdown)}\n`);
       return 1;
     }
+    const deterministicDescriptions = {
+      get_file_content: FALLBACK_TOOL_DESCRIPTIONS.get_file_content,
+      mcp_search: FALLBACK_TOOL_DESCRIPTIONS.mcp_search,
+    };
+    const promptBeforeRuntimeDiscovery = buildSystemPromptFromDescriptions(
+      deterministicDescriptions,
+      { collaborationMode: "build", modelId: "provider-a/model-a" }
+    );
+    const savedSkillsCatalog = skillsCatalog;
+    const savedMcpCatalog = mcpCatalog;
+    const savedMcpServers = mcpServers;
+    skillsCatalog = [{ name: "dynamic-skill", description: "must not enter the system prompt" }];
+    mcpCatalog = [{ server: "dynamic-server", name: "dynamic-tool" }];
+    mcpServers = [{ name: "dynamic-server", tools: [], error: "" }];
+    const promptAfterRuntimeDiscovery = buildSystemPromptFromDescriptions(
+      deterministicDescriptions,
+      { collaborationMode: "build", modelId: "provider-b/model-b" }
+    );
+    skillsCatalog = savedSkillsCatalog;
+    mcpCatalog = savedMcpCatalog;
+    mcpServers = savedMcpServers;
+    if (promptBeforeRuntimeDiscovery !== promptAfterRuntimeDiscovery) {
+      out("FORMAT_FAIL: build system prompt must not depend on model, skills, or MCP runtime state\n");
+      return 1;
+    }
     const planModePrompt = buildSystemPromptFromDescriptions(
       {
         get_file_content: FALLBACK_TOOL_DESCRIPTIONS.get_file_content,
         write_file: FALLBACK_TOOL_DESCRIPTIONS.write_file,
       },
-      { modelId: "self-test", contextLeftPercent: 75, collaborationMode: "plan" }
+      { collaborationMode: "plan" }
     );
     if (
       !planModePrompt.includes("PLAN MODE (MANDATORY)") ||
       !planModePrompt.includes("get_file_content") ||
-      planModePrompt.includes("write_file")
+      planModePrompt.includes("write_file") ||
+      /context (?:remaining|left)/i.test(planModePrompt)
     ) {
       out("FORMAT_FAIL: plan-mode prompt did not filter mutating tools\n");
       return 1;
@@ -14216,10 +14319,45 @@ async function runMcpSelfTest() {
         return 1;
       }
 
-      const descKeys = Object.keys(mcpDescriptions);
-      if (descKeys.length !== 2 || !descKeys.some((key) => key.includes("remote_ping"))) {
-        out(`MCP_FAIL: expected stdio and HTTP tool descriptions, got ${JSON.stringify(descKeys)}
-`);
+      if (mcpCatalog.length !== 2 || !mcpCatalog.some((item) => item.name === "remote_ping")) {
+        out(`MCP_FAIL: expected stdio and HTTP catalog entries, got ${JSON.stringify(mcpCatalog.map((item) => item.name))}\n`);
+        return 1;
+      }
+      const searchResp = await handleMcpBridgeRequest({
+        method: "search",
+        action: "search",
+        query: "remote ping",
+        limit: 1,
+      });
+      if (
+        !searchResp.ok ||
+        searchResp.matches?.length !== 1 ||
+        searchResp.matches[0]?.server !== "remoteMock" ||
+        searchResp.matches[0]?.tool !== "remote_ping" ||
+        searchResp.matches[0]?.inputSchema?.properties?.value?.type !== "string"
+      ) {
+        out(`MCP_FAIL: catalog search returned ${JSON.stringify(searchResp)}\n`);
+        return 1;
+      }
+      const describeResp = await handleMcpBridgeRequest({
+        method: "search",
+        action: "describe",
+        server: "mock",
+        tool: "ping",
+      });
+      if (!describeResp.ok || describeResp.tool?.description !== "Ping test tool") {
+        out(`MCP_FAIL: catalog describe returned ${JSON.stringify(describeResp)}\n`);
+        return 1;
+      }
+      const promptWithCatalog = buildSystemPromptFromDescriptions(toolDescriptions, { collaborationMode: "build" });
+      if (
+        !promptWithCatalog.includes("schemas stay outside this prompt") ||
+        promptWithCatalog.includes("Ping test tool") ||
+        promptWithCatalog.includes('"properties":{"value"') ||
+        promptWithCatalog.includes("remoteMock") ||
+        promptWithCatalog.includes("Connected catalog")
+      ) {
+        out("MCP_FAIL: system prompt leaked deferred MCP catalog details\n");
         return 1;
       }
 
@@ -14241,7 +14379,7 @@ async function runMcpSelfTest() {
         "import json, sys",
         "sys.path.insert(0, " + JSON.stringify(process.cwd()) + ")",
         "import tools",
-        "res = tools.mcp_call('mock', 'ping', {'value': 'py'})",
+        "res = tools.mcp_search(action='call', server='mock', tool='ping', args={'value': 'py'})",
         "print(json.dumps(res))",
       ].join(String.fromCharCode(10));
       let pythonOut = "";
