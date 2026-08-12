@@ -30,6 +30,9 @@ const WHITE_COLOR = "\u001b[97m";
 const BOLD_WHITE = "\u001b[1m\u001b[97m";
 const VSCODE_BLUE_COLOR = "\u001b[38;2;86;156;214m";
 const CODE_BLOCK_BG_COLOR = "\u001b[48;5;236m";
+const SESSION_EVEN_BG_COLOR = "\u001b[48;2;24;24;24m";
+const SESSION_SELECTED_FG_COLOR = "\u001b[38;2;184;134;11m";
+const SESSION_MARKER_FG_COLOR = "\u001b[1m\u001b[38;2;218;165;32m";
 const CODE_BLOCK_FG_COLOR = "\u001b[38;5;252m";
 const CODE_BLOCK_KEYWORD_COLOR = "\u001b[38;5;81m";
 const CODE_BLOCK_STRING_COLOR = "\u001b[38;5;151m";
@@ -59,6 +62,7 @@ const INPUT_BOTTOM_PADDING_NO_MENU = 1;
 const CHAT_INPUT_GAP = 0;
 const CHAT_INPUT_GAP_NO_STATUS = 2;
 const MESSAGE_SPACING_ROWS = 2;
+const TOOL_TO_ASSISTANT_SPACING_ROWS = 1;
 const STATUS_BAR_ROWS = 1;
 const STATUS_CHAT_GAP = 1;
 const STATUS_INPUT_GAP = 2;
@@ -120,6 +124,8 @@ const BRACKETED_PASTE_START = "\u001b[200~";
 const BRACKETED_PASTE_END = "\u001b[201~";
 const ENABLE_BRACKETED_PASTE = "\u001b[?2004h";
 const DISABLE_BRACKETED_PASTE = "\u001b[?2004l";
+const ENABLE_FOCUS_REPORTING = "\u001b[?1004h";
+const DISABLE_FOCUS_REPORTING = "\u001b[?1004l";
 const ENABLE_MOUSE_TRACKING = "\u001b[?1000h\u001b[?1006h";
 const DISABLE_MOUSE_TRACKING = "\u001b[?1000l\u001b[?1006l";
 const ENTER_ALT_SCREEN = "\u001b[?1049h";
@@ -358,6 +364,7 @@ let lastModelRenderedHeight = 0;
 let sessionFiles = [];
 let sessionsSelected = 0;
 let sessionsScroll = 0;
+let sessionsSearch = "";
 let isSessionsLoading = false;
 let sessionsLoadError = "";
 let lastSessionsRenderedRows = [];
@@ -463,6 +470,10 @@ let shineFrameIndex = 0;
 let shineAnimationTimer = null;
 let spinnerFrameIndex = 0;
 let spinnerAnimationTimer = null;
+let terminalTitleSpinnerFrameIndex = 0;
+let terminalTitleSpinnerTimer = null;
+let terminalHasFocus = true;
+let focusReportingEnabled = false;
 let thinkingStartedAt = 0;
 let activeToolRun = null; // { label, startedAt, done, ok }
 let stopRequested = false;
@@ -1134,24 +1145,25 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
       "- Before finishing, call create_plan or update_plan with ordered, concrete tasks. Do not implement until the user exits with /plan or /plan off.",
       "",
       "TOOL USAGE FORMAT (MANDATORY):",
-      "- If inspection or plan updates are needed, output exactly one fenced ```execute code block and no surrounding prose.",
+      "- If inspection or plan updates are needed, output exactly one fenced ````execute code block and no surrounding prose.",
+      "- Use four backticks by default. If the Python contains four consecutive backticks, use an outer fence longer than any backtick run inside the code.",
       "- Call the provided helpers directly. Imports, raw file access, arbitrary functions, and unlisted helpers are blocked.",
       "- Keep each execute block compact; if truncated, retry with a smaller complete block.",
       "",
       "EXAMPLE:",
-      "```execute",
+      "````execute",
       "print(get_file_list('.'))",
       "print(get_file_content('package.json', start_line=1, end_line=120))",
-      "```",
+      "````",
       "",
       "PLAN EXAMPLE:",
-      "```execute",
+      "````execute",
       "print(create_plan([",
       "    'Inspect the relevant architecture and constraints',",
       "    'Implement the scoped changes',",
       "    'Add focused regression tests and verify the result',",
       "]))",
-      "```",
+      "````",
       "",
       "Allowed Python helper functions:",
       ...(lines.length > 0 ? lines : ["- (none)"]),
@@ -1194,8 +1206,10 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
         ]),
     "",
     "TOOL USAGE FORMAT (MANDATORY):",
-    "- If tool use is needed, output exactly one fenced ```execute code block.",
-    "- Only ```execute blocks are executed by the app.",
+    "- If tool use is needed, output exactly one fenced ````execute code block.",
+    "- Execute fences may use three or more backticks; use four by default.",
+    "- The outer fence must be longer than every consecutive backtick run inside the Python code.",
+    "- Only execute-labeled fences are executed by the app.",
     "- Never use ```python blocks for executable tool calls (those are treated as plain text/demo).",
     "- Do not output JSON like {\"tool\": \"...\", \"arguments\": {...}}.",
     "- Do not output tool_call payloads, XML, YAML, or pseudo function-call objects.",
@@ -1211,14 +1225,14 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "- If the relevant code is already present in recent conversation/tool output, do not call read tools again.",
     "",
     "VALID TOOL-USE RESPONSE EXAMPLE 1:",
-    "```execute",
+    "````execute",
     "cwd = get_current_working_directory()",
     "print(cwd)",
     "print(get_file_list(\".\"))",
-    "```",
+    "````",
     "",
     "VALID SEARCH RESPONSE EXAMPLE:",
-    "```execute",
+    "````execute",
     "matches = find_in_file(",
     "    path=\"index.js\",",
     "    query=\"buildSystemPromptFromDescriptions\",",
@@ -1226,15 +1240,15 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "    max_results=5,",
     ")",
     "print(matches)",
-    "```",
+    "````",
     "",
     "VALID FILE-EDIT RESPONSE EXAMPLE:",
-    "```execute",
+    "````execute",
     "snippet = get_file_content(\"index.js\", start_line=120, end_line=170)",
     "old = \"const RETRY_COUNT = 2\"",
     "new = \"const RETRY_COUNT = 3\"",
     "print(replace_in_file(\"index.js\", old, new, count=1))",
-    "```",
+    "````",
     "",
     "INVALID RESPONSE EXAMPLE (NEVER DO THIS):",
     "{\"tool\": \"get_file_list\", \"arguments\": {\"path\": \".\"}}",
@@ -2944,6 +2958,10 @@ function cleanupTerminal(options = {}) {
     clearInterval(spinnerAnimationTimer);
     spinnerAnimationTimer = null;
   }
+  if (terminalTitleSpinnerTimer) {
+    clearInterval(terminalTitleSpinnerTimer);
+    terminalTitleSpinnerTimer = null;
+  }
   if (answerRevealTimer) {
     clearInterval(answerRevealTimer);
     answerRevealTimer = null;
@@ -2979,6 +2997,11 @@ function cleanupTerminal(options = {}) {
     bracketedPasteModeEnabled = false;
   }
 
+  if (focusReportingEnabled) {
+    process.stdout.write(DISABLE_FOCUS_REPORTING);
+    focusReportingEnabled = false;
+  }
+
   if (mouseTrackingEnabled) {
     process.stdout.write(DISABLE_MOUSE_TRACKING);
     mouseTrackingEnabled = false;
@@ -2998,6 +3021,147 @@ function cleanupTerminal(options = {}) {
   if (APPEND_CHAT_TO_SCROLLBACK) {
     process.stdout.write("\r\n");
   }
+}
+
+function setTerminalTitle(spinnerFrame = "") {
+  const safeWorkspaceName = String(path.basename(WORKSPACE_ROOT) || WORKSPACE_ROOT)
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .trim();
+  const prefix = spinnerFrame ? `${spinnerFrame} ` : "";
+  const title = `${prefix}Nexus - ${safeWorkspaceName || "."}`;
+
+  try {
+    process.title = title;
+  } catch {
+    // Some hosts do not allow changing the process title.
+  }
+
+  if (process.stdout.isTTY) {
+    process.stdout.write(`\u001b]0;${title}\u0007`);
+  }
+}
+
+function updateTerminalTitleAnimationState() {
+  if (!isAssistantThinking()) {
+    if (terminalTitleSpinnerTimer) {
+      clearInterval(terminalTitleSpinnerTimer);
+      terminalTitleSpinnerTimer = null;
+    }
+    terminalTitleSpinnerFrameIndex = 0;
+    setTerminalTitle();
+    return;
+  }
+
+  if (terminalTitleSpinnerTimer) {
+    return;
+  }
+
+  setTerminalTitle(SPINNER_FRAMES[terminalTitleSpinnerFrameIndex]);
+  terminalTitleSpinnerTimer = setInterval(() => {
+    if (!isAssistantThinking()) {
+      updateTerminalTitleAnimationState();
+      return;
+    }
+    terminalTitleSpinnerFrameIndex =
+      (terminalTitleSpinnerFrameIndex + 1) % SPINNER_FRAMES.length;
+    setTerminalTitle(SPINNER_FRAMES[terminalTitleSpinnerFrameIndex]);
+  }, 100);
+}
+
+function consumeTerminalFocusSequences(value) {
+  return String(value ?? "").replace(/\u001b\[([IO])/g, (_match, state) => {
+    terminalHasFocus = state === "I";
+    return "";
+  });
+}
+
+function responseShouldRingBell(content) {
+  const text = String(content ?? "");
+  return text.trim().length > 0 && !containsExecuteFence(text);
+}
+
+function formatWorkedDuration(durationMs) {
+  let totalSeconds = Math.max(1, Math.floor((Number(durationMs) || 0) / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  totalSeconds %= 3600;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  const parts = [];
+  if (hours > 0) parts.push(`${hours}h`);
+  if (minutes > 0) parts.push(`${minutes}m`);
+  if (seconds > 0 || parts.length === 0) parts.push(`${seconds}s`);
+  return parts.join(" ");
+}
+
+function formatWorkedDivider(durationMs, width) {
+  const safeWidth = Math.max(1, Math.floor(Number(width) || 1));
+  const label = `─ Worked for ${formatWorkedDuration(durationMs)} `;
+  if (label.length >= safeWidth) {
+    return label.slice(0, safeWidth);
+  }
+  return `${label}${"─".repeat(safeWidth - label.length)}`;
+}
+
+function turnHasExecuteBlock(startIndex, endIndex = messages.length, sourceEntries = messages) {
+  const entries = Array.isArray(sourceEntries) ? sourceEntries : messages;
+  const firstIndex = Math.max(0, Number(startIndex) || 0);
+  const lastIndex = Math.max(firstIndex, Math.min(entries.length, Number(endIndex) || 0));
+  for (let i = firstIndex; i < lastIndex; i += 1) {
+    const entry = entries[i];
+    if (
+      entry?.role === "assistant" &&
+      containsExecuteFence(entry.content)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function attachWorkedSummaryForTurn(startIndex, durationMs) {
+  const firstIndex = Math.max(0, Number(startIndex) || 0);
+  for (let i = messages.length - 1; i >= firstIndex; i -= 1) {
+    const entry = messages[i];
+    if (!entry || entry.ephemeral === true || entry.role !== "assistant") {
+      continue;
+    }
+    if (
+      typeof entry.revealUntil !== "number" ||
+      !responseShouldRingBell(entry.content) ||
+      !turnHasExecuteBlock(firstIndex, i)
+    ) {
+      return false;
+    }
+    entry.workedDurationMs = Math.max(0, Number(durationMs) || 0);
+    cachedChatLines = null;
+    forceChatRefreshFlag = true;
+    return true;
+  }
+  return false;
+}
+
+function ringBellForCompletedTurn(startIndex) {
+  if (!process.stdout.isTTY || terminalHasFocus) {
+    return false;
+  }
+
+  const firstIndex = Math.max(0, Number(startIndex) || 0);
+  for (let i = messages.length - 1; i >= firstIndex; i -= 1) {
+    const entry = messages[i];
+    if (
+      !entry ||
+      entry.ephemeral === true ||
+      (entry.role !== "assistant" && entry.role !== "error")
+    ) {
+      continue;
+    }
+    if (!responseShouldRingBell(entry.content)) {
+      return false;
+    }
+    process.stdout.write("\u0007");
+    return true;
+  }
+  return false;
 }
 
 function setMouseTrackingEnabled(enabled) {
@@ -5438,7 +5602,7 @@ function triggerAnswerReveal(entry) {
     return;
   }
   const isExecuteBlock =
-    entry.role === "assistant" && /```execute(?:\s|$)/i.test(String(entry.content || ""));
+    entry.role === "assistant" && containsExecuteFence(entry.content);
   if (isAssistantThinking() && !isExecuteBlock) {
     // Hold the initial black reveal frame until the Thinking status actually
     // collapses. Starting the clock here can consume the whole fade while a
@@ -5635,25 +5799,76 @@ function extractAllPythonCodeBlocks(text) {
   return extractAllPythonCodeBlockEntries(text).map((entry) => entry.code);
 }
 
+function matchExecutableFenceOpening(line) {
+  const match = String(line ?? "").match(/^ {0,3}(`{3,}|~{3,})execute[ \t]*$/i);
+  if (!match) {
+    return null;
+  }
+  return { character: match[1][0], length: match[1].length };
+}
+
+function isMatchingFenceClosing(line, fence) {
+  const match = String(line ?? "").match(/^ {0,3}(`{3,}|~{3,})[ \t]*$/);
+  return Boolean(
+    match &&
+    match[1][0] === fence.character &&
+    match[1].length >= fence.length
+  );
+}
+
+function containsExecuteFence(text) {
+  return String(text ?? "")
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .some((line) => matchExecutableFenceOpening(line) !== null);
+}
+
 function extractAllPythonCodeBlockEntries(text) {
   if (typeof text !== "string" || text.length === 0) {
     return [];
   }
 
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
   const blocks = [];
-  const re = /```execute\s*\n([\s\S]*?)```/gi;
-  let match = null;
-  while ((match = re.exec(text)) !== null) {
-    const body = (match[1] || "").trim();
-    if (!body) {
+  for (let openingIndex = 0; openingIndex < lines.length; openingIndex += 1) {
+    const fence = matchExecutableFenceOpening(lines[openingIndex]);
+    if (!fence) {
       continue;
     }
-    blocks.push({ code: body, complete: true });
-  }
 
-  const truncatedTail = extractUnterminatedExecuteTail(text);
-  if (truncatedTail) {
-    blocks.push({ code: truncatedTail, complete: false });
+    let closingIndex = -1;
+    if (fence.length === 3) {
+      // Legacy triple fences are ambiguous when their Python payload contains
+      // Markdown fences. Because tool-use responses must contain one block and
+      // no surrounding prose, the final non-empty matching fence is the outer
+      // closer; any shorter-lived candidates belong to the payload.
+      let lastNonEmptyIndex = lines.length - 1;
+      while (lastNonEmptyIndex > openingIndex && !lines[lastNonEmptyIndex].trim()) {
+        lastNonEmptyIndex -= 1;
+      }
+      if (isMatchingFenceClosing(lines[lastNonEmptyIndex], fence)) {
+        closingIndex = lastNonEmptyIndex;
+      }
+    } else {
+      // Variable-length fences are unambiguous: shorter runs remain payload.
+      for (let i = openingIndex + 1; i < lines.length; i += 1) {
+        if (isMatchingFenceClosing(lines[i], fence)) {
+          closingIndex = i;
+          break;
+        }
+      }
+    }
+
+    const bodyEnd = closingIndex >= 0 ? closingIndex : lines.length;
+    const body = lines.slice(openingIndex + 1, bodyEnd).join("\n").trim();
+    if (body) {
+      blocks.push({ code: body, complete: closingIndex >= 0 });
+    }
+
+    if (closingIndex < 0) {
+      break;
+    }
+    openingIndex = closingIndex;
   }
   return blocks;
 }
@@ -5686,40 +5901,6 @@ function compactToolDiscoveryContent(entry) {
   }
   const selected = names.length > 0 ? ` Matches: ${names.join(", ")}.` : "";
   return `[${kind} discovery schema compacted after use.${selected} Rerun discovery if a full signature is needed.]`;
-}
-
-// Recovers code from an execute fence that was cut off before the closing
-// fence (truncated model output). Fence characters are built via code points
-// so this source stays free of literal fence runs.
-function extractUnterminatedExecuteTail(text) {
-  const source = String(text ?? "");
-  const BT = String.fromCharCode(96, 96, 96);
-  const marker = BT + "execute";
-  let pos = 0;
-  let lastBodyStart = -1;
-  while (true) {
-    const start = source.indexOf(marker, pos);
-    if (start === -1) {
-      break;
-    }
-    const lineStart = source.indexOf(String.fromCharCode(10), start);
-    if (lineStart === -1) {
-      break;
-    }
-    lastBodyStart = lineStart + 1;
-    pos = lineStart + 1;
-  }
-  if (lastBodyStart === -1) {
-    return "";
-  }
-  const tail = source.slice(lastBodyStart);
-  if (!tail.trim()) {
-    return "";
-  }
-  if (tail.indexOf(BT) !== -1) {
-    return "";
-  }
-  return tail.trim();
 }
 
 function getToolRunLabel(pythonCode) {
@@ -7057,8 +7238,11 @@ function queueAssistantReply(modelId, options = {}) {
   updateThinkingAnimationState();
   const generation = chatGeneration;
   let pendingIndex = deferredUserMessage ? -1 : createPendingAssistantMessage(generation);
+  let turnStartMessageIndex = pendingIndex >= 0 ? pendingIndex : messages.length;
+  let turnStartedAt = 0;
   assistantRequestChain = assistantRequestChain
     .then(() => {
+      turnStartedAt = Date.now();
       if (queuedPromptEntry) {
         removeQueuedBusyPrompt(queuedPromptEntry);
       }
@@ -7068,6 +7252,7 @@ function queueAssistantReply(modelId, options = {}) {
           pendingHookContext = options.deferredHookContext;
         }
         pendingIndex = createPendingAssistantMessage(generation);
+        turnStartMessageIndex = pendingIndex >= 0 ? pendingIndex : messages.length;
         markDirty();
         renderFrame(true);
       } else if (queuedPromptEntry) {
@@ -7086,11 +7271,16 @@ function queueAssistantReply(modelId, options = {}) {
       );
     })
     .finally(() => {
+      attachWorkedSummaryForTurn(
+        turnStartMessageIndex,
+        Math.max(0, Date.now() - (turnStartedAt || Date.now()))
+      );
       const { hadPending, becameIdle } = completeAssistantRequestLifecycle();
       updateThinkingAnimationState();
       if (becameIdle) {
         markDirty();
         renderFrame(false);
+        ringBellForCompletedTurn(turnStartMessageIndex);
         // Turn completed: fire Notification then Stop hooks. Stop hooks run
         // with a block cap (8) and receive stop_hook_active after a prior
         // block so they don't loop forever.
@@ -8646,25 +8836,57 @@ function getMainFooterText() {
 
 function getSessionsVisibleCount() {
   const rows = process.stdout.rows || 24;
-  return Math.max(1, Math.min(20, rows - 4));
+  return Math.max(1, Math.min(20, rows - 3));
 }
 
-function formatUpdatedTime(date) {
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(
-    date.getHours()
-  )}:${pad(date.getMinutes())}`;
+function formatSessionRelativeTime(value, now = Date.now()) {
+  const updatedAt = value instanceof Date ? value.getTime() : Number(value) || 0;
+  const elapsedMs = Math.max(0, Number(now) - updatedAt);
+  const seconds = Math.floor(elapsedMs / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  const months = Math.floor(days / 30);
+  if (months < 12) return `${months}mo ago`;
+  return `${Math.floor(days / 365)}y ago`;
+}
+
+function getFilteredSessionFiles() {
+  const query = sessionsSearch.trim().toLowerCase();
+  if (!query) return sessionFiles;
+  return sessionFiles.filter((entry) =>
+    String(entry.firstUserMessage || "").toLowerCase().includes(query)
+  );
+}
+
+function formatSessionListRow(entry, selected, panelWidth, now = Date.now()) {
+  const width = Math.max(1, Math.floor(Number(panelWidth) || 1));
+  const marker = selected ? "› " : "  ";
+  const relativeTime = formatSessionRelativeTime(entry?.updatedAt, now).padEnd(12, " ");
+  const titleWidth = Math.max(0, width - marker.length - relativeTime.length);
+  const titleCharacters = Array.from(String(entry?.firstUserMessage || "Untitled session"));
+  const title = titleCharacters.length <= titleWidth
+    ? titleCharacters.join("")
+    : titleWidth <= 3
+      ? ".".repeat(titleWidth)
+      : `${titleCharacters.slice(0, titleWidth - 3).join("")}...`;
+  return `${marker}${relativeTime}${title}`.slice(0, width);
 }
 
 function updateSessionsSelectionState() {
-  if (sessionFiles.length === 0) {
+  const visibleSessions = getFilteredSessionFiles();
+  if (visibleSessions.length === 0) {
     sessionsSelected = 0;
     sessionsScroll = 0;
     return;
   }
 
-  if (sessionsSelected >= sessionFiles.length) {
-    sessionsSelected = sessionFiles.length - 1;
+  if (sessionsSelected >= visibleSessions.length) {
+    sessionsSelected = visibleSessions.length - 1;
   }
 
   if (sessionsSelected < sessionsScroll) {
@@ -8672,7 +8894,7 @@ function updateSessionsSelectionState() {
   }
 
   const visibleCount = getSessionsVisibleCount();
-  const maxScroll = Math.max(0, sessionFiles.length - visibleCount);
+  const maxScroll = Math.max(0, visibleSessions.length - visibleCount);
   if (sessionsScroll > maxScroll) {
     sessionsScroll = maxScroll;
   }
@@ -8702,7 +8924,8 @@ async function loadSessionFiles() {
         continue;
       }
 
-      const sessionWorkspace = await readSessionWorkspaceFromFile(fullPath);
+      const sessionMetadata = await readSessionListMetadataFromFile(fullPath);
+      const sessionWorkspace = sessionMetadata.sessionWorkspace;
       if (sessionWorkspace && !isCurrentWorkspace(sessionWorkspace)) {
         continue;
       }
@@ -8713,6 +8936,7 @@ async function loadSessionFiles() {
         mtimeMs: stat.mtimeMs,
         updatedAt: stat.mtime,
         sessionWorkspace,
+        firstUserMessage: sessionMetadata.firstUserMessage || "Untitled session",
       });
     }
 
@@ -8728,32 +8952,42 @@ async function loadSessionFiles() {
   }
 }
 
-async function readSessionWorkspaceFromFile(filePath) {
+async function readSessionListMetadataFromFile(filePath) {
   let raw = "";
   try {
     raw = await fs.readFile(filePath, "utf8");
   } catch {
-    return "";
+    return { sessionWorkspace: "", firstUserMessage: "" };
   }
 
-  const lines = raw.split(/\r?\n/);
-  for (let i = lines.length - 1; i >= 0; i -= 1) {
-    const line = lines[i].trim();
-    if (!line) {
-      continue;
-    }
+  return parseSessionListMetadata(raw);
+}
+
+function parseSessionListMetadata(raw) {
+  let sessionWorkspace = "";
+  let firstUserMessage = "";
+  for (const line of String(raw ?? "").split(/\r?\n/)) {
+    if (!line.trim()) continue;
     try {
       const parsed = JSON.parse(line);
-      const normalized = normalizeWorkspacePath(parsed?.sessionWorkspace);
-      if (normalized) {
-        return normalized;
+      if (!sessionWorkspace && typeof parsed?.sessionWorkspace === "string") {
+        sessionWorkspace = normalizeWorkspacePath(parsed.sessionWorkspace);
       }
+      if (
+        !firstUserMessage &&
+        parsed?.role === "user" &&
+        typeof parsed?.content === "string" &&
+        parsed.content.trim() &&
+        !isCompactionSummaryEntry(parsed)
+      ) {
+        firstUserMessage = parsed.content.replace(/\s+/g, " ").trim();
+      }
+      if (sessionWorkspace && firstUserMessage) break;
     } catch {
-      // Keep scanning older lines when malformed.
+      // Ignore malformed history lines and keep scanning.
     }
   }
-
-  return "";
+  return { sessionWorkspace, firstUserMessage };
 }
 
 function parseSessionHistory(raw) {
@@ -8954,7 +9188,7 @@ async function loadSessionFileIntoChat(filePath, options = {}) {
 }
 
 async function loadSelectedSessionIntoChat() {
-  const selected = sessionFiles[sessionsSelected];
+  const selected = getFilteredSessionFiles()[sessionsSelected];
   if (!selected) {
     return;
   }
@@ -9833,6 +10067,7 @@ function openSessionsBuffer() {
   pasteParserBuffer = "";
   sessionsSelected = 0;
   sessionsScroll = 0;
+  sessionsSearch = "";
   lastSessionsRenderedRows = [];
   lastSessionsRenderedCols = 0;
   lastSessionsRenderedHeight = 0;
@@ -10016,7 +10251,7 @@ function renderMcpBuffer() {
   }
 
   const frameRows = Array.from({ length: rows }, () => ({ text: " ".repeat(cols), color: null }));
-  const setPanelRow = (y, content, color = null) => {
+  const setPanelRow = (y, content, color = null, styledContent = "") => {
     if (y < 0 || y >= rows) return;
     const clipped = String(content || "").slice(0, panelWidth).padEnd(panelWidth, " ");
     const left = " ".repeat(panelLeft);
@@ -10254,11 +10489,18 @@ function renderLoopsBuffer() {
   for (let y = 0; y < rows; y += 1) {
     const nextRow = frameRows[y];
     const prevRow = lastLoopsRenderedRows[y];
-    if (prevRow && prevRow.text === nextRow.text && prevRow.color === nextRow.color) {
+    if (
+      prevRow &&
+      prevRow.text === nextRow.text &&
+      prevRow.color === nextRow.color &&
+      prevRow.styledText === nextRow.styledText
+    ) {
       continue;
     }
 
-    if (nextRow.color === BLUE_COLOR) {
+    if (nextRow.styledText) {
+      writeStyledLine(y, nextRow.text, nextRow.styledText, cols);
+    } else if (nextRow.color === BLUE_COLOR) {
       writeColoredLine(y, nextRow.text, cols, BLUE_COLOR);
     } else if (nextRow.color === GREEN_COLOR) {
       writeColoredLine(y, nextRow.text, cols, GREEN_COLOR);
@@ -10556,21 +10798,40 @@ const PYTHON_BUILTINS = new Set([
 function annotateAssistantCodeBlocks(message) {
   const sourceLines = String(message ?? "").replace(/\r/g, "\n").split("\n");
   const annotated = [];
-  let insidePythonBlock = false;
+  let activeFence = null;
 
-  for (const line of sourceLines) {
+  for (let lineIndex = 0; lineIndex < sourceLines.length; lineIndex += 1) {
+    const line = sourceLines[lineIndex];
     const trimmed = line.trim();
-    if (!insidePythonBlock && /^```(?:python|py|execute)\s*$/i.test(trimmed)) {
-      insidePythonBlock = true;
+    if (!activeFence) {
+      const opening = trimmed.match(/^(`{3,}|~{3,})(python|py|execute)\s*$/i);
+      if (opening) {
+        activeFence = {
+          character: opening[1][0],
+          length: opening[1].length,
+          closeIndex: -1,
+          useFinalClose: opening[2].toLowerCase() === "execute" && opening[1].length === 3,
+        };
+        if (activeFence.useFinalClose) {
+          for (let i = sourceLines.length - 1; i > lineIndex; i -= 1) {
+            if (!sourceLines[i].trim()) continue;
+            if (isMatchingFenceClosing(sourceLines[i], activeFence)) {
+              activeFence.closeIndex = i;
+            }
+            break;
+          }
+        }
+        continue;
+      }
+    } else if (
+      isMatchingFenceClosing(trimmed, activeFence) &&
+      (!activeFence.useFinalClose || activeFence.closeIndex === lineIndex)
+    ) {
+      activeFence = null;
       continue;
     }
 
-    if (insidePythonBlock && /^```\s*$/.test(trimmed)) {
-      insidePythonBlock = false;
-      continue;
-    }
-
-    annotated.push({ text: line, python: insidePythonBlock, fence: false });
+    annotated.push({ text: line, python: activeFence !== null, fence: false });
   }
 
   return annotated;
@@ -11047,6 +11308,19 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
     }
   }
 
+  const workedSummaryReady =
+    displayRole === "assistant" &&
+    Number.isFinite(Number(entry?.workedDurationMs)) &&
+    Number(entry?.workedDurationMs) >= 0 &&
+    typeof entry?.revealUntil === "number" &&
+    entry.revealUntil <= Date.now();
+  if (workedSummaryReady) {
+    output.push("");
+    output.push(
+      `${PLACEHOLDER_COLOR}${formatWorkedDivider(entry.workedDurationMs, contentWidth)}${RESET_COLOR}`
+    );
+  }
+
   if (role === "tool" && !isPlanUi && !looksLikeDiff) {
     const divider = "\u2500".repeat(Math.max(3, contentWidth));
     output.push("");
@@ -11432,6 +11706,7 @@ function renderStatusAnimationTick() {
 }
 
 function updateThinkingAnimationState() {
+  updateTerminalTitleAnimationState();
   const shouldAnimate = isStatusAnimationNeeded();
 
   if (!shouldAnimate) {
@@ -11534,6 +11809,13 @@ function ensureAppendReservedBottomRows(requiredRows, rows, cols = process.stdou
   return appendReservedBottomRows;
 }
 
+function getMessageSpacingRows(previousRole, currentRole) {
+  if (previousRole === "tool" && currentRole === "assistant") {
+    return TOOL_TO_ASSISTANT_SPACING_ROWS;
+  }
+  return MESSAGE_SPACING_ROWS;
+}
+
 function flushAppendedChatMessages(options = {}) {
   if (!APPEND_CHAT_TO_SCROLLBACK || activeBuffer !== "main") {
     return false;
@@ -11570,9 +11852,11 @@ function flushAppendedChatMessages(options = {}) {
     const entryRole = typeof entry?.role === "string" ? entry.role : "";
     const entryLines = [...buildTranscriptLinesForEntry(entry, cols)];
     if (entryLines.length > 0) {
-      const shouldInsertBoundaryGap = previousRole !== null;
-      if (shouldInsertBoundaryGap && MESSAGE_SPACING_ROWS > 0) {
-        for (let i = 0; i < MESSAGE_SPACING_ROWS; i += 1) {
+      const spacingRows = previousRole === null
+        ? 0
+        : getMessageSpacingRows(previousRole, entryRole);
+      if (spacingRows > 0) {
+        for (let i = 0; i < spacingRows; i += 1) {
           outputLines.push("");
         }
       }
@@ -11815,9 +12099,11 @@ function buildChatVisualLines(cols, sourceEntries = messages) {
       continue;
     }
 
-    const shouldInsertBoundaryGap = previousRole !== null;
-    if (shouldInsertBoundaryGap && MESSAGE_SPACING_ROWS > 0) {
-      for (let i = 0; i < MESSAGE_SPACING_ROWS; i += 1) {
+    const spacingRows = previousRole === null
+      ? 0
+      : getMessageSpacingRows(previousRole, role);
+    if (spacingRows > 0) {
+      for (let i = 0; i < spacingRows; i += 1) {
         visualLines.push({ text: "", styledText: "", color: null, assistantBulletMuted: false });
       }
     }
@@ -12599,7 +12885,7 @@ function renderSessionsBuffer() {
     color: null,
   }));
 
-  const setPanelRow = (y, content, color = null) => {
+  const setPanelRow = (y, content, color = null, styledContent = "") => {
     if (y < 0 || y >= rows) {
       return;
     }
@@ -12607,10 +12893,19 @@ function renderSessionsBuffer() {
     const clipped = content.slice(0, panelWidth).padEnd(panelWidth, " ");
     const left = " ".repeat(panelLeft);
     const right = " ".repeat(Math.max(0, cols - panelLeft - panelWidth));
-    frameRows[y] = { text: `${left}${clipped}${right}`.slice(0, cols), color };
+    const text = `${left}${clipped}${right}`.slice(0, cols);
+    frameRows[y] = {
+      text,
+      color,
+      styledText: styledContent ? `${left}${styledContent}${right}` : "",
+    };
   };
 
-  setPanelRow(0, "Sessions (most recent first)");
+  if (sessionsSearch) {
+    setPanelRow(0, sessionsSearch);
+  } else {
+    setPanelRow(0, "Type to search", PLACEHOLDER_COLOR);
+  }
 
   if (isSessionsLoading && sessionFiles.length === 0) {
     setPanelRow(2, "loading sessions...", PLACEHOLDER_COLOR);
@@ -12619,14 +12914,28 @@ function renderSessionsBuffer() {
   } else if (sessionFiles.length === 0) {
     setPanelRow(2, "no session files", PLACEHOLDER_COLOR);
   } else {
-    const end = Math.min(sessionFiles.length, sessionsScroll + visibleCount);
+    const filteredSessions = getFilteredSessionFiles();
+    if (filteredSessions.length === 0) {
+      setPanelRow(2, "no matching sessions", PLACEHOLDER_COLOR);
+    }
+    const end = Math.min(filteredSessions.length, sessionsScroll + visibleCount);
     for (let i = sessionsScroll; i < end; i += 1) {
       const row = 2 + (i - sessionsScroll);
-      const entry = sessionFiles[i];
-      const marker = i === sessionsSelected ? "●" : "○";
-      const text = `  ${marker} ${entry.name}  updated: ${formatUpdatedTime(entry.updatedAt)}`;
-      if (i === sessionsSelected) {
-        setPanelRow(row, text, BLUE_COLOR);
+      const entry = filteredSessions[i];
+      const selected = i === sessionsSelected;
+      const text = formatSessionListRow(entry, selected, panelWidth);
+      const panelText = text.slice(0, panelWidth).padEnd(panelWidth, " ");
+      const rowBackground = i % 2 === 1 ? SESSION_EVEN_BG_COLOR : "";
+      if (selected) {
+        setPanelRow(
+          row,
+          text,
+          null,
+          `${rowBackground}${SESSION_MARKER_FG_COLOR}${panelText.slice(0, 1)}${RESET_COLOR}` +
+            `${rowBackground}${SESSION_SELECTED_FG_COLOR}${panelText.slice(1)}${RESET_COLOR}`
+        );
+      } else if (rowBackground) {
+        setPanelRow(row, text, null, `${rowBackground}${panelText}${RESET_COLOR}`);
       } else {
         setPanelRow(row, text);
       }
@@ -12638,11 +12947,18 @@ function renderSessionsBuffer() {
   for (let y = 0; y < rows; y += 1) {
     const nextRow = frameRows[y];
     const prevRow = lastSessionsRenderedRows[y];
-    if (prevRow && prevRow.text === nextRow.text && prevRow.color === nextRow.color) {
+    if (
+      prevRow &&
+      prevRow.text === nextRow.text &&
+      prevRow.color === nextRow.color &&
+      prevRow.styledText === nextRow.styledText
+    ) {
       continue;
     }
 
-    if (nextRow.color === BLUE_COLOR) {
+    if (nextRow.styledText) {
+      writeStyledLine(y, nextRow.text, nextRow.styledText, cols);
+    } else if (nextRow.color === BLUE_COLOR) {
       writeColoredLine(y, nextRow.text, cols, BLUE_COLOR);
     } else if (nextRow.color === PLACEHOLDER_COLOR) {
       writeColoredLine(y, nextRow.text, cols, PLACEHOLDER_COLOR);
@@ -12653,6 +12969,9 @@ function renderSessionsBuffer() {
 
   lastSessionsRenderedRows = frameRows;
 
+  const cursorX = Math.min(panelLeft + sessionsSearch.length, panelLeft + panelWidth - 1);
+  readline.cursorTo(process.stdout, cursorX, 0);
+  process.stdout.write(SHOW_CURSOR);
   dirty = false;
 }
 
@@ -13817,6 +14136,49 @@ function runAppendSelfTest() {
       out("SELFTEST_FAIL: truncated execute block classification\n");
       return 1;
     }
+    const BT4 = BT + String.fromCharCode(96);
+    const nestedMarkdownCode = [
+      'markdown = """',
+      BT + "python",
+      "print('hello')",
+      BT,
+      '"""',
+      'write_file("README.md", markdown)',
+    ].join(NL);
+    const dynamicNestedEntries = extractAllPythonCodeBlockEntries(
+      BT4 + "execute" + NL + nestedMarkdownCode + NL + BT4
+    );
+    const legacyNestedEntries = extractAllPythonCodeBlockEntries(
+      BT + "execute" + NL + nestedMarkdownCode + NL + BT
+    );
+    const truncatedNestedEntries = extractAllPythonCodeBlockEntries(
+      BT4 + "execute" + NL + nestedMarkdownCode
+    );
+    if (
+      dynamicNestedEntries.length !== 1 ||
+      dynamicNestedEntries[0].complete !== true ||
+      dynamicNestedEntries[0].code !== nestedMarkdownCode ||
+      legacyNestedEntries.length !== 1 ||
+      legacyNestedEntries[0].complete !== true ||
+      legacyNestedEntries[0].code !== nestedMarkdownCode ||
+      truncatedNestedEntries.length !== 1 ||
+      truncatedNestedEntries[0].complete !== false ||
+      truncatedNestedEntries[0].code !== nestedMarkdownCode
+    ) {
+      out("SELFTEST_FAIL: nested Markdown execute-fence extraction\n");
+      return 1;
+    }
+    const annotatedNested = annotateAssistantCodeBlocks(
+      BT4 + "execute" + NL + nestedMarkdownCode + NL + BT4
+    );
+    if (
+      annotatedNested.length !== nestedMarkdownCode.split(NL).length ||
+      !annotatedNested.every((line) => line.python === true) ||
+      !annotatedNested.some((line) => line.text === BT)
+    ) {
+      out("SELFTEST_FAIL: dynamic execute-fence rendering lost nested Markdown fences\n");
+      return 1;
+    }
 
     const hostileTerminalOutput =
       "\u001b[2J\u001b[H\u001b[31mred\u001b[0m\rnext\u0007" +
@@ -14009,6 +14371,88 @@ async function runExecuteTransportSelfTest() {
 function runFormatSelfTest() {
   const out = process.stdout.write.bind(process.stdout);
   try {
+    const sessionNow = Date.UTC(2026, 0, 1, 12, 0, 0);
+    const sessionRow = formatSessionListRow(
+      {
+        updatedAt: sessionNow - 4 * 60 * 1000,
+        firstUserMessage: "hey please check for execute blocks sometimes code is big",
+      },
+      true,
+      34,
+      sessionNow
+    );
+    const sessionMetadata = parseSessionListMetadata([
+      JSON.stringify({ role: "system", content: "hidden", sessionWorkspace: WORKSPACE_ROOT }),
+      JSON.stringify({ role: "user", content: "first user\nmessage" }),
+      JSON.stringify({ role: "user", content: "second user message" }),
+    ].join("\n"));
+    if (
+      !sessionRow.startsWith("› 4m ago") ||
+      !sessionRow.endsWith("...") ||
+      sessionRow.length > 34 ||
+      sessionMetadata.firstUserMessage !== "first user message"
+    ) {
+      out(`FORMAT_FAIL: session list time/title layout is incorrect: ${JSON.stringify(sessionRow)}\n`);
+      return 1;
+    }
+
+    if (
+      !responseShouldRingBell("Finished the task.") ||
+      responseShouldRingBell("```execute\nprint('still working')\n```")
+    ) {
+      out("FORMAT_FAIL: completed-turn bell classification is incorrect\n");
+      return 1;
+    }
+    const workedDivider = formatWorkedDivider(10 * 60 * 1000 + 17 * 1000, 80);
+    const directAnswerTurn = [
+      { role: "user", content: "ok thanks" },
+      { role: "assistant", content: "You're welcome!" },
+    ];
+    const toolAnswerTurn = [
+      { role: "user", content: "check this" },
+      { role: "assistant", content: "```execute\nprint('checking')\n```" },
+      { role: "tool", content: "checked" },
+      { role: "assistant", content: "Everything looks good." },
+    ];
+    const completedAnswerLines = buildTranscriptLinesForEntry({
+      role: "assistant",
+      content: "Finished the task.",
+      revealUntil: Date.now() - 1,
+      workedDurationMs: 10 * 60 * 1000 + 17 * 1000,
+    }, 80).map(stripAnsiSgr);
+    const fadingAnswerLines = buildTranscriptLinesForEntry({
+      role: "assistant",
+      content: "Finishing the task.",
+      revealUntil: Date.now() + ANSWER_REVEAL_MS,
+      workedDurationMs: 10 * 60 * 1000 + 17 * 1000,
+    }, 80).map(stripAnsiSgr);
+    if (
+      !workedDivider.startsWith("─ Worked for 10m 17s ") ||
+      workedDivider.length !== 80 ||
+      turnHasExecuteBlock(0, directAnswerTurn.length - 1, directAnswerTurn) ||
+      !turnHasExecuteBlock(0, toolAnswerTurn.length - 1, toolAnswerTurn) ||
+      !completedAnswerLines.includes(workedDivider) ||
+      fadingAnswerLines.some((line) => line.includes("Worked for"))
+    ) {
+      out("FORMAT_FAIL: worked-duration divider timing or layout is incorrect\n");
+      return 1;
+    }
+    if (
+      getMessageSpacingRows("tool", "assistant") !== 1 ||
+      getMessageSpacingRows("assistant", "user") !== MESSAGE_SPACING_ROWS
+    ) {
+      out("FORMAT_FAIL: tool-to-assistant spacing is incorrect\n");
+      return 1;
+    }
+    const savedTerminalHasFocus = terminalHasFocus;
+    const focusPayload = consumeTerminalFocusSequences("before\u001b[Oafter\u001b[I");
+    const focusTrackingOk = focusPayload === "beforeafter" && terminalHasFocus === true;
+    terminalHasFocus = savedTerminalHasFocus;
+    if (!focusTrackingOk) {
+      out("FORMAT_FAIL: terminal focus sequences were not consumed correctly\n");
+      return 1;
+    }
+
     const savedPendingAssistantRequests = pendingAssistantRequests;
     pendingAssistantRequests = Math.max(1, pendingAssistantRequests);
     const queuedPreview = addQueuedBusyPrompt("queued preview message");
@@ -15762,18 +16206,21 @@ if (process.argv.includes("--self-test-background")) {
   return;
 }
 
+setTerminalTitle();
 readline.emitKeypressEvents(process.stdin);
 
 if (process.stdin.isTTY) {
   process.stdin.setRawMode(true);
-  process.stdout.write(ENABLE_BRACKETED_PASTE);
+  process.stdout.write(`${ENABLE_BRACKETED_PASTE}${ENABLE_FOCUS_REPORTING}`);
   bracketedPasteModeEnabled = true;
+  focusReportingEnabled = true;
   setMouseTrackingEnabled(APP_MOUSE_TRACKING_ENABLED);
 }
 
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (rawChunk) => {
-  const chunk = mouseTrackingEnabled ? stripMouseSequences(rawChunk) : rawChunk;
+  const focusCleanChunk = consumeTerminalFocusSequences(rawChunk);
+  const chunk = mouseTrackingEnabled ? stripMouseSequences(focusCleanChunk) : focusCleanChunk;
   if (!chunk) {
     return;
   }
@@ -15848,6 +16295,11 @@ process.stdin.on("data", (rawChunk) => {
 
 process.stdin.on("keypress", async (str, key) => {
   const seq = typeof key?.sequence === "string" ? key.sequence : "";
+  const focusSequence = seq || (typeof str === "string" ? str : "");
+  if (focusSequence === "\u001b[I" || focusSequence === "\u001b[O") {
+    terminalHasFocus = focusSequence === "\u001b[I";
+    return;
+  }
   const isEscapeKey =
     key?.name === "escape" || key?.sequence === "\u001b" || str === "\u001b";
   if (isEscapeKey && Date.now() < suppressSolveEscapeKeypressUntil) {
@@ -16022,11 +16474,12 @@ process.stdin.on("keypress", async (str, key) => {
     }
 
     if (key?.name === "up" || key?.name === "down") {
-      if (sessionFiles.length > 0) {
+      const filteredSessions = getFilteredSessionFiles();
+      if (filteredSessions.length > 0) {
         if (key.name === "up") {
           sessionsSelected = Math.max(0, sessionsSelected - 1);
         } else {
-          sessionsSelected = Math.min(sessionFiles.length - 1, sessionsSelected + 1);
+          sessionsSelected = Math.min(filteredSessions.length - 1, sessionsSelected + 1);
         }
 
         if (sessionsSelected < sessionsScroll) {
@@ -16044,9 +16497,34 @@ process.stdin.on("keypress", async (str, key) => {
       return;
     }
 
+    if (key?.name === "backspace") {
+      if (sessionsSearch.length > 0) {
+        sessionsSearch = sessionsSearch.slice(0, -1);
+        sessionsSelected = 0;
+        sessionsScroll = 0;
+        updateSessionsSelectionState();
+      }
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+
     if (key?.sequence === "\r" || key?.name === "return" || key?.name === "enter") {
       await loadSelectedSessionIntoChat();
       closeSessionsBuffer({ refreshChat: true });
+      return;
+    }
+
+    if (!key?.ctrl && !key?.meta && str && !str.startsWith("\u001b")) {
+      if (shouldBlockPastedInput(str)) {
+        return;
+      }
+      sessionsSearch += str;
+      sessionsSelected = 0;
+      sessionsScroll = 0;
+      updateSessionsSelectionState();
+      markDirty();
+      renderFrame(true);
       return;
     }
 
