@@ -13,6 +13,7 @@ import statistics
 import subprocess
 import sys
 import threading
+import time
 import difflib
 import textwrap
 import bisect
@@ -2017,9 +2018,24 @@ def manage_skill(
 
 # --- RLM subagents + continual harness (Prime Agent-style interfaces) ---
 
+def configure_subagent_runtime(
+    system_prompt: str,
+    model: str = "",
+    reasoning_enabled: bool = False,
+    reasoning_effort: str = "low",
+    session_id: str = "",
+) -> None:
+    """Internal bridge: make child agents inherit the active Nexus runtime."""
+    harness.configure_agent_runtime(
+        system_prompt=system_prompt,
+        model=model,
+        reasoning_enabled=reasoning_enabled,
+        reasoning_effort=reasoning_effort,
+        session_id=session_id,
+    )
+
 def rlm_spawn(
     prompt: str,
-    model: str = "",
     system: str = "",
     timeout: int = 300,
     max_tokens: int = 2048,
@@ -2033,7 +2049,6 @@ def rlm_spawn(
         else:
             handle = harness.rlm(
                 prompt,
-                model=model or None,
                 system=system or None,
                 timeout=timeout,
                 max_tokens=max_tokens,
@@ -2049,6 +2064,33 @@ def list_subagents() -> list[dict]:
         return harness.rlm.list_subagents()
     except Exception as exc:
         return [{"ok": False, "error": str(exc)}]
+
+
+def wait_subagents(
+    handle_ids: list[str] | None = None,
+    timeout: int | float = 300,
+    poll_interval: int | float = 0.5,
+) -> list[dict]:
+    """Wait for selected child sub-agents to finish and return their final records.
+
+    Workers and status survive across execute blocks. A running status is
+    progress, not a failure.
+    """
+    selected = {str(value) for value in (handle_ids or []) if str(value).strip()}
+    timeout_seconds = max(0.0, min(float(timeout), 3600.0))
+    interval_seconds = max(0.05, min(float(poll_interval), 5.0))
+    deadline = time.monotonic() + timeout_seconds
+
+    while True:
+        records = harness.rlm.list_subagents()
+        if selected:
+            records = [record for record in records if str(record.get("id", "")) in selected]
+        terminal = {"done", "error"}
+        if records and all(str(record.get("status", "")) in terminal for record in records):
+            return records
+        if time.monotonic() >= deadline:
+            return records
+        time.sleep(min(interval_seconds, max(0.0, deadline - time.monotonic())))
 
 
 def delete_subagent(handle_id: str) -> dict:
@@ -2071,11 +2113,13 @@ def harness_overview() -> dict:
 
 
 def harness_memory(key: str, content: str = "", delete: bool = False) -> dict:
-    """Create/update/delete a persistent harness memory by key."""
+    """Read a memory by key, or create/update/delete it when requested."""
     try:
         h = harness.rlm.harness
         if delete:
             return h.delete_memory(key)
+        if content == "":
+            return h.get_memory(key)
         return h.create_memory(key, content)
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
@@ -2451,6 +2495,7 @@ FUNCTIONS = {
     "manage_skill": manage_skill,
     "rlm_spawn": rlm_spawn,
     "list_subagents": list_subagents,
+    "wait_subagents": wait_subagents,
     "delete_subagent": delete_subagent,
     "harness_overview": harness_overview,
     "harness_memory": harness_memory,
@@ -2499,11 +2544,12 @@ FUNCTION_DESCRIPTIONS = {
     "get_skill": "get_skill(name: str) -> dict: Get a skill by name. Returns {name, description, path, body, error}. Load the body only when using the skill.",
     "manage_skill": "manage_skill(name: str, description: str = '', body: str = '', delete: bool = False) -> dict: Create, update, or delete a personal skill under ~/.nexus/skills. Workspace and bundled skills are read-only.",
     "web_search": "web_search(query: str, max_results: int = 5) -> dict: Search the web via DuckDuckGo (Lite HTML with Instant Answer fallback). Returns {query, results: [{title, snippet, url}], error}.",
-    "rlm_spawn": "rlm_spawn(prompt: str, model: str = '', system: str = '', timeout: int = 300, max_tokens: int = 2048, template: str = '') -> dict: Spawn a child sub-agent. Returns an admission handle {id, status, prompt} immediately; poll list_subagents() or delete_subagent(id).",
-    "list_subagents": "list_subagents() -> list[dict]: List spawned child sub-agents with status, prompt, result, error.",
+    "rlm_spawn": "rlm_spawn(prompt: str, system: str = '', timeout: int = 300, max_tokens: int = 2048, template: str = '') -> dict: Non-blocking spawn of a persistent concurrent Nexus child process using the active provider/model, parent system prompt, unlimited tool turns, shared workspace, and tools. timeout is a hard wall-clock limit for each provider request and execute block. Returns an admitted handle immediately; end the current execute block after spawning so the child continues in the background.",
+    "list_subagents": "list_subagents() -> list[dict]: Non-blocking session-scoped snapshot of persistent child agents with status, prompt, result, error, turn, and pid. Results remain available in later execute blocks.",
+    "wait_subagents": "wait_subagents(handle_ids: list[str] | None = None, timeout: int|float = 300, poll_interval: int|float = 0.5) -> list[dict]: Block until selected persistent Nexus child agents finish/error or timeout. Use only in a later execute block, never in the block that calls rlm_spawn.",
     "delete_subagent": "delete_subagent(handle_id: str) -> dict: Delete a spawned child sub-agent by handle id.",
     "harness_overview": "harness_overview() -> dict: Continual harness overview: memories, skills, subagent templates, prompt notes, refinements.",
-    "harness_memory": "harness_memory(key: str, content: str = '', delete: bool = False) -> dict: Create/update/delete a persistent harness memory by key.",
+    "harness_memory": "harness_memory(key: str, content: str = '', delete: bool = False) -> dict: Read a persistent memory when content is omitted; create/update it when content is supplied; delete it with delete=True.",
     "harness_prompt_note": "harness_prompt_note(name: str, content: str = '', delete: bool = False) -> dict: Create/update/delete a persistent harness prompt note by name.",
     "harness_subagent": "harness_subagent(name: str, prompt: str = '', model: str = '', system: str = '', delete: bool = False) -> dict: Persist a reusable subagent template.",
     "record_refinement": "record_refinement(summary: str, evidence: str = '') -> dict: Persist a reusable pattern into the continual harness with evidence.",
@@ -2528,6 +2574,15 @@ def get_descriptions() -> dict[str, str]:
 
 
 def main() -> int:
+    if len(sys.argv) > 2 and sys.argv[1] == "--run-subagent":
+        return harness.run_subagent_job(sys.argv[2])
+    if len(sys.argv) > 2 and sys.argv[1] == "--launch-subagent-test":
+        print(harness.launch_subagent_job(sys.argv[2], self_test=True))
+        return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--self-test-subagents":
+        result = harness.run_subagent_self_test()
+        print("SUBAGENT_OK" if result.get("ok") else "SUBAGENT_FAIL")
+        return 0 if result.get("ok") else 1
     if len(sys.argv) > 1 and sys.argv[1] == "--list-skills-json":
         print(json.dumps(list_skills()))
         return 0

@@ -21,6 +21,23 @@ nexus
 Nexus stores user configuration, sessions, skills, and kernel state under
 `~/.nexus`.
 
+## Agent orchestration
+
+Nexus can launch concurrent child agents for independent work. Child agents
+inherit the active provider/model, parent system prompt, execute-block loop,
+workspace, and tools. They run as persistent child processes and may edit their
+assigned files directly after the spawning execute block ends. Collect them
+immediately or later with `wait_subagents`; the parent then integrates and
+verifies the combined result.
+
+## Phone remote control
+
+Run `/remote-control` inside Nexus, then scan the QR code with a phone on the
+same local network. The mobile page mirrors the current conversation, shows
+thinking and tool status, accepts new or queued messages, and can stop the
+active turn. Pressing Escape returns to the terminal chat while the remote
+server keeps running; reopen `/remote-control` to view or restart it.
+
 ## Development
 
 ```sh

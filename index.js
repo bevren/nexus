@@ -6,8 +6,11 @@ const fs = require("fs/promises");
 const fsSync = require("fs");
 const path = require("path");
 const os = require("os");
+const http = require("node:http");
 const { execFile, spawn, spawnSync } = require("child_process");
-const { createHash, randomUUID } = require("crypto");
+const { createHash, randomBytes, randomUUID } = require("crypto");
+const { WebSocket, WebSocketServer } = require("ws");
+const qrcodeTerminal = require("qrcode-terminal");
 
 const PACKAGE_ROOT = __dirname;
 const TOOLS_SCRIPT_PATH = path.join(PACKAGE_ROOT, "tools.py");
@@ -149,6 +152,400 @@ const EXIT_ALT_SCREEN = "\u001b[?1049l";
 const APP_MOUSE_TRACKING_ENABLED = process.env.TUI_ENABLE_MOUSE !== "0";
 const APPEND_CHAT_TO_SCROLLBACK = false;
 const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+const REMOTE_CONTROL_MAX_PROMPT_CHARS = 32000;
+const REMOTE_CONTROL_MAX_MESSAGE_CHARS = 16000;
+const REMOTE_CONTROL_MAX_MESSAGES = 120;
+const REMOTE_CONTROL_BROADCAST_MS = 120;
+const REMOTE_CONTROL_HTML = String.raw`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
+  <meta name="theme-color" content="#0b0b0b">
+  <title>Nexus Remote</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b0b0b; --panel:#151515; --line:#292929; --text:#e8e8e8; --dim:#8a8a8a; --gold:#daa520; --blue:#569cd6; }
+    * { box-sizing:border-box; }
+    html,body { width:100%; height:100%; margin:0; overflow:hidden; overscroll-behavior:none; background:var(--bg); color:var(--text); font:15px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; }
+    body { position:fixed; inset:0 auto auto 0; display:grid; grid-template-rows:auto minmax(0,1fr) auto auto; width:100%; height:var(--nexus-viewport-height,100dvh); min-height:0; }
+    header { display:flex; align-items:center; gap:10px; padding:12px 14px; border-bottom:1px solid var(--line); background:rgba(11,11,11,.94); }
+    .brand { color:var(--gold); font-weight:700; }
+    #status { min-width:0; overflow:hidden; color:var(--dim); text-overflow:ellipsis; white-space:nowrap; }
+    #dot { width:8px; height:8px; flex:none; border-radius:50%; background:#777; }
+    #dot.online { background:#55c878; box-shadow:0 0 8px #55c87888; }
+    #dot.busy { background:var(--gold); animation:pulse 1s infinite alternate; }
+    @keyframes pulse { to { opacity:.35; } }
+    main { min-height:0; overflow-y:auto; overflow-x:hidden; padding:16px 14px 24px; overscroll-behavior:contain; -webkit-overflow-scrolling:touch; }
+    .empty { color:var(--dim); text-align:center; margin-top:28vh; }
+    .message { margin:0 0 18px; white-space:pre-wrap; overflow-wrap:anywhere; }
+    .message .role { display:block; margin-bottom:4px; color:var(--dim); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+    .message.user { color:#fff; }
+    .message.user .role { color:var(--gold); }
+    .message.assistant { white-space:normal; }
+    .message.assistant p { margin:0 0 10px; white-space:pre-wrap; }
+    .message.assistant p:last-child { margin-bottom:0; }
+    .message.assistant h1,.message.assistant h2,.message.assistant h3,.message.assistant h4,.message.assistant h5,.message.assistant h6 { margin:14px 0 7px; color:#f2f2f2; line-height:1.3; }
+    .message.assistant h1 { font-size:1.35em; }
+    .message.assistant h2 { font-size:1.2em; }
+    .message.assistant h3,.message.assistant h4,.message.assistant h5,.message.assistant h6 { font-size:1.05em; }
+    .message.assistant ul,.message.assistant ol { margin:6px 0 12px; padding-left:24px; }
+    .message.assistant li { margin:3px 0; }
+    .message.assistant blockquote { margin:8px 0; padding:3px 0 3px 12px; border-left:2px solid #555; color:#b8b8b8; }
+    .message.assistant hr { height:1px; margin:14px 0; border:0; background:var(--line); }
+    .message.assistant .table-wrap { max-width:100%; margin:8px 0 12px; overflow-x:auto; }
+    .message.assistant table { width:max-content; min-width:100%; border-collapse:collapse; font-size:.93em; }
+    .message.assistant th,.message.assistant td { padding:6px 9px; border:1px solid #343434; text-align:left; vertical-align:top; }
+    .message.assistant th { color:#f0f0f0; background:#1d1d1d; }
+    .message.assistant a { color:#7ab7e8; text-decoration:none; }
+    .message.assistant a:active,.message.assistant a:hover { text-decoration:underline; }
+    .message.assistant code.inline { padding:1px 5px; border-radius:4px; background:#202020; color:#d7ba7d; font:inherit; }
+    .message.assistant del { color:#888; }
+    .task-marker { display:inline-block; width:20px; color:var(--dim); }
+    .message.tool { color:#bdbdbd; padding:10px 12px; border-left:2px solid var(--blue); background:var(--panel); }
+    .message.reasoning { color:var(--dim); font-style:italic; }
+    .message.reasoning .role { display:none; }
+    .message.reasoning::before { content:'◦ '; color:#666; }
+    .message.error { color:#ff8b8b; }
+    .message pre.code { margin:8px 0 0; padding:10px 12px; overflow-x:auto; border-radius:7px; background:#1e1e1e; color:#d4d4d4; font:14px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace; white-space:pre; }
+    .tok-keyword { color:#569cd6; }
+    .tok-builtin { color:#9cdcfe; }
+    .tok-string { color:#ce9178; }
+    .tok-number { color:#b5cea8; }
+    .tok-comment { color:#6a9955; }
+    #queued { display:none; padding:7px 12px; color:var(--dim); border-top:1px solid var(--line); background:var(--panel); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    footer { position:relative; z-index:2; padding:0 max(10px,env(safe-area-inset-right)) max(10px,env(safe-area-inset-bottom)) max(10px,env(safe-area-inset-left)); background:var(--bg); }
+    .composer { display:grid; grid-template-columns:1fr auto; align-items:end; gap:8px; padding-top:10px; border-top:1px solid var(--line); }
+    textarea { width:100%; min-height:44px; max-height:150px; resize:none; border:1px solid var(--line); border-radius:10px; padding:10px 12px; background:var(--panel); color:var(--text); font:inherit; outline:none; }
+    textarea:focus { border-color:#66531b; }
+    button { min-height:44px; border:0; border-radius:10px; padding:0 16px; background:var(--gold); color:#111; font:700 14px inherit; }
+    button:disabled { opacity:.45; }
+    #stop { display:none; background:#57282b; color:#ffb5b5; }
+  </style>
+</head>
+<body>
+  <header><span class="brand">NEXUS</span><span id="dot"></span><span id="status">Connecting...</span></header>
+  <main id="messages"><div class="empty">Connecting to the terminal session...</div></main>
+  <div id="queued"></div>
+  <footer><div class="composer"><textarea id="input" rows="1" placeholder="Message Nexus"></textarea><button id="send">Send</button><button id="stop">Stop</button></div></footer>
+  <script>
+    (function () {
+      var token = location.hash.slice(1);
+      var messagesEl = document.getElementById('messages');
+      var statusEl = document.getElementById('status');
+      var dotEl = document.getElementById('dot');
+      var queuedEl = document.getElementById('queued');
+      var inputEl = document.getElementById('input');
+      var sendEl = document.getElementById('send');
+      var stopEl = document.getElementById('stop');
+      var socket = null;
+      var reconnectTimer = null;
+      var latestState = null;
+      var lastSession = '';
+      var stickToBottom = true;
+      var programmaticScroll = false;
+
+      function isNearBottom() {
+        return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 96;
+      }
+
+      function scrollToBottom() {
+        if (!stickToBottom) return;
+        programmaticScroll = true;
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        requestAnimationFrame(function () {
+          messagesEl.scrollTop = messagesEl.scrollHeight;
+          requestAnimationFrame(function () {
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+            programmaticScroll = false;
+          });
+        });
+        setTimeout(function () {
+          if (stickToBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
+          programmaticScroll = false;
+        }, 120);
+      }
+
+      function syncVisualViewport() {
+        var viewport = window.visualViewport;
+        var height = viewport ? viewport.height : window.innerHeight;
+        document.documentElement.style.setProperty('--nexus-viewport-height', Math.round(height) + 'px');
+        if (stickToBottom) scrollToBottom();
+      }
+
+      function appendToken(parent, text, className) {
+        var span = document.createElement('span');
+        if (className) span.className = className;
+        span.textContent = text;
+        parent.appendChild(span);
+      }
+
+      function appendHighlightedPython(parent, source) {
+        var keywords = /^(?:False|None|True|and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield)$/;
+        var builtins = /^(?:abs|all|any|bool|dict|enumerate|float|int|len|list|map|max|min|open|print|range|set|sorted|str|sum|tuple|zip)$/;
+        var pattern = /#[^\n]*|(?:[fFrRbBuU]{0,2})(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|\b\d+(?:[._]\d+)*\b|\b[A-Za-z_]\w*\b/g;
+        var index = 0;
+        var match;
+        while ((match = pattern.exec(source)) !== null) {
+          if (match.index > index) appendToken(parent, source.slice(index, match.index), '');
+          var token = match[0];
+          var className = '';
+          if (token[0] === '#') className = 'tok-comment';
+          else if (/^[fFrRbBuU]{0,2}["']/.test(token)) className = 'tok-string';
+          else if (/^\d/.test(token)) className = 'tok-number';
+          else if (keywords.test(token)) className = 'tok-keyword';
+          else if (builtins.test(token)) className = 'tok-builtin';
+          appendToken(parent, token, className);
+          index = pattern.lastIndex;
+        }
+        if (index < source.length) appendToken(parent, source.slice(index), '');
+      }
+
+      function appendInlineText(parent, text) {
+        var lines = String(text || '').split('\n');
+        lines.forEach(function (line, index) {
+          if (index) parent.appendChild(document.createElement('br'));
+          if (line) parent.appendChild(document.createTextNode(line));
+        });
+      }
+
+      function appendInlineMarkdown(parent, source, depth) {
+        var text = String(source || '');
+        var level = Number(depth) || 0;
+        if (!text || level > 8) { appendInlineText(parent, text); return; }
+        var patterns = [
+          { kind:'code', regex:/(\x60+)(.+?)\1/ },
+          { kind:'link', regex:/\[([^\]\n]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/ },
+          { kind:'strong', regex:/(\*\*|__)(.+?)\1/ },
+          { kind:'strike', regex:/~~(.+?)~~/ },
+          { kind:'em', regex:/(\*|_)([^*_\n]+?)\1/ }
+        ];
+        var winner = null;
+        patterns.forEach(function (candidate) {
+          var match = candidate.regex.exec(text);
+          if (match && (!winner || match.index < winner.match.index)) winner = { kind:candidate.kind, match:match };
+        });
+        if (!winner) { appendInlineText(parent, text); return; }
+        var match = winner.match;
+        if (match.index) appendInlineText(parent, text.slice(0, match.index));
+        var node;
+        if (winner.kind === 'code') {
+          node = document.createElement('code'); node.className = 'inline'; node.textContent = match[2];
+        } else if (winner.kind === 'link') {
+          var safeUrl = /^(?:https?:|mailto:)/i.test(match[2]) ? match[2] : '';
+          if (safeUrl) {
+            node = document.createElement('a'); node.href = safeUrl; node.target = '_blank'; node.rel = 'noopener noreferrer';
+            appendInlineMarkdown(node, match[1], level + 1);
+          } else {
+            node = document.createDocumentFragment(); appendInlineText(node, match[0]);
+          }
+        } else {
+          node = document.createElement(winner.kind === 'strong' ? 'strong' : winner.kind === 'strike' ? 'del' : 'em');
+          appendInlineMarkdown(
+            node,
+            winner.kind === 'strong' || winner.kind === 'em' ? match[2] : match[1],
+            level + 1
+          );
+        }
+        parent.appendChild(node);
+        appendInlineMarkdown(parent, text.slice(match.index + match[0].length), level);
+      }
+
+      function isMarkdownBlockStart(line) {
+        return /^\s*$/.test(line) || /^\s{0,3}(?:#{1,6}\s+|>|(?:[-+*]|\d+[.)])\s+|(?:-{3,}|\*{3,}|_{3,})\s*$|(?:\x60{3,}|~{3,}))/.test(line);
+      }
+
+      function splitMarkdownTableRow(line) {
+        var value = String(line || '').trim();
+        if (value[0] === '|') value = value.slice(1);
+        if (value[value.length - 1] === '|') value = value.slice(0, -1);
+        return value.split('|').map(function (cell) { return cell.trim(); });
+      }
+
+      function appendMarkdown(parent, source) {
+        var lines = String(source || '').replace(/\r/g, '').split('\n');
+        var index = 0;
+        while (index < lines.length) {
+          var line = lines[index];
+          if (!line.trim()) { index += 1; continue; }
+
+          var fence = line.match(/^\s{0,3}((?:\x60){3,}|~{3,})\s*([^\s]*)\s*$/);
+          if (fence) {
+            var fenceChar = fence[1][0];
+            var fenceLength = fence[1].length;
+            var language = String(fence[2] || '').toLowerCase();
+            var codeLines = [];
+            index += 1;
+            while (index < lines.length) {
+              var closing = lines[index].trim();
+              if (closing.length >= fenceLength && closing.split('').every(function (character) { return character === fenceChar; })) { index += 1; break; }
+              codeLines.push(lines[index]); index += 1;
+            }
+            var pre = document.createElement('pre'); pre.className = 'code';
+            if (language === 'python' || language === 'py' || language === 'execute') appendHighlightedPython(pre, codeLines.join('\n'));
+            else pre.textContent = codeLines.join('\n');
+            parent.appendChild(pre); continue;
+          }
+
+          if (
+            line.indexOf('|') >= 0 &&
+            index + 1 < lines.length &&
+            /^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(lines[index + 1])
+          ) {
+            var headers = splitMarkdownTableRow(line);
+            var alignments = splitMarkdownTableRow(lines[index + 1]).map(function (separator) {
+              var left = separator[0] === ':';
+              var right = separator[separator.length - 1] === ':';
+              return left && right ? 'center' : right ? 'right' : 'left';
+            });
+            var tableWrap = document.createElement('div'); tableWrap.className = 'table-wrap';
+            var table = document.createElement('table');
+            var tableHead = document.createElement('thead');
+            var headerRow = document.createElement('tr');
+            headers.forEach(function (header, column) {
+              var cell = document.createElement('th'); cell.style.textAlign = alignments[column] || 'left';
+              appendInlineMarkdown(cell, header, 0); headerRow.appendChild(cell);
+            });
+            tableHead.appendChild(headerRow); table.appendChild(tableHead);
+            var tableBody = document.createElement('tbody'); index += 2;
+            while (index < lines.length && lines[index].trim() && lines[index].indexOf('|') >= 0) {
+              var row = document.createElement('tr');
+              splitMarkdownTableRow(lines[index]).forEach(function (value, column) {
+                var cell = document.createElement('td'); cell.style.textAlign = alignments[column] || 'left';
+                appendInlineMarkdown(cell, value, 0); row.appendChild(cell);
+              });
+              tableBody.appendChild(row); index += 1;
+            }
+            table.appendChild(tableBody); tableWrap.appendChild(table); parent.appendChild(tableWrap); continue;
+          }
+
+          var heading = line.match(/^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/);
+          if (heading) {
+            var headingNode = document.createElement('h' + heading[1].length);
+            appendInlineMarkdown(headingNode, heading[2], 0); parent.appendChild(headingNode); index += 1; continue;
+          }
+          if (/^\s{0,3}(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+            parent.appendChild(document.createElement('hr')); index += 1; continue;
+          }
+          if (/^\s{0,3}>/.test(line)) {
+            var quoteLines = [];
+            while (index < lines.length && /^\s{0,3}>/.test(lines[index])) {
+              quoteLines.push(lines[index].replace(/^\s{0,3}>\s?/, '')); index += 1;
+            }
+            var quote = document.createElement('blockquote'); appendMarkdown(quote, quoteLines.join('\n')); parent.appendChild(quote); continue;
+          }
+
+          var listMatch = line.match(/^\s{0,3}([-+*]|\d+[.)])\s+(.+)$/);
+          if (listMatch) {
+            var ordered = /^\d/.test(listMatch[1]);
+            var list = document.createElement(ordered ? 'ol' : 'ul');
+            while (index < lines.length) {
+              var itemMatch = lines[index].match(/^\s{0,3}([-+*]|\d+[.)])\s+(.+)$/);
+              if (!itemMatch || /^\d/.test(itemMatch[1]) !== ordered) break;
+              var item = document.createElement('li');
+              var itemText = itemMatch[2];
+              var task = itemText.match(/^\[([ xX])\]\s*(.*)$/);
+              if (task) {
+                var marker = document.createElement('span'); marker.className = 'task-marker'; marker.textContent = task[1] === ' ' ? '☐' : '🗹'; item.appendChild(marker);
+                appendInlineMarkdown(item, task[2], 0);
+              } else appendInlineMarkdown(item, itemText, 0);
+              list.appendChild(item); index += 1;
+            }
+            parent.appendChild(list); continue;
+          }
+
+          var paragraphLines = [line]; index += 1;
+          while (index < lines.length && !isMarkdownBlockStart(lines[index])) { paragraphLines.push(lines[index]); index += 1; }
+          var paragraph = document.createElement('p'); appendInlineMarkdown(paragraph, paragraphLines.join('\n'), 0); parent.appendChild(paragraph);
+        }
+      }
+
+      function appendMessageBody(item, message) {
+        if (message.role === 'assistant' && Array.isArray(message.blocks) && message.blocks.length) {
+          message.blocks.forEach(function (block) {
+            if (block.type === 'code') {
+              var code = document.createElement('pre'); code.className = 'code';
+              appendHighlightedPython(code, block.content || ''); item.appendChild(code);
+            } else if (block.content) {
+              appendMarkdown(item, block.content);
+            }
+          });
+          return;
+        }
+        var body = document.createElement('span'); body.textContent = message.content; item.appendChild(body);
+      }
+
+      function connect() {
+        if (!token) { statusEl.textContent = 'Missing connection token'; return; }
+        var scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        socket = new WebSocket(scheme + '//' + location.host + '/ws?token=' + encodeURIComponent(token));
+        statusEl.textContent = 'Connecting...';
+        dotEl.className = '';
+        socket.onopen = function () { socket.send(JSON.stringify({type:'snapshot'})); };
+        socket.onmessage = function (event) {
+          try {
+            var payload = JSON.parse(event.data);
+            if (payload.type === 'snapshot') render(payload);
+            if (payload.type === 'error') statusEl.textContent = payload.message || 'Remote error';
+          } catch (_) {}
+        };
+        socket.onclose = function () {
+          statusEl.textContent = 'Disconnected - reconnecting...';
+          dotEl.className = '';
+          clearTimeout(reconnectTimer);
+          reconnectTimer = setTimeout(connect, 1500);
+        };
+      }
+
+      function render(state) {
+        latestState = state;
+        if (state.session !== lastSession) stickToBottom = true;
+        lastSession = state.session || '';
+        messagesEl.textContent = '';
+        if (!state.messages || !state.messages.length) {
+          var empty = document.createElement('div'); empty.className = 'empty'; empty.textContent = 'Start a conversation from your phone.'; messagesEl.appendChild(empty);
+        } else {
+          state.messages.forEach(function (message) {
+            var item = document.createElement('div'); item.className = 'message ' + message.role;
+            var role = document.createElement('span'); role.className = 'role'; role.textContent = message.role;
+            item.appendChild(role); appendMessageBody(item, message); messagesEl.appendChild(item);
+          });
+        }
+        var busy = state.status && state.status.phase !== 'idle';
+        dotEl.className = busy ? 'busy' : 'online';
+        statusEl.textContent = busy ? state.status.label : 'Connected';
+        stopEl.style.display = busy ? 'block' : 'none';
+        sendEl.style.display = 'block';
+        var queued = state.queued || [];
+        queuedEl.style.display = queued.length ? 'block' : 'none';
+        queuedEl.textContent = queued.length ? 'Queued: ' + queued.join(' | ') : '';
+        if (stickToBottom) scrollToBottom();
+      }
+
+      function sendPrompt() {
+        var text = inputEl.value;
+        if (!text.trim() || !socket || socket.readyState !== WebSocket.OPEN) return;
+        socket.send(JSON.stringify({type:'prompt',text:text}));
+        inputEl.value = ''; inputEl.style.height = 'auto'; stickToBottom = true; scrollToBottom(); inputEl.focus();
+      }
+      sendEl.onclick = sendPrompt;
+      stopEl.onclick = function () { if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({type:'stop'})); };
+      inputEl.oninput = function () { this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight,150) + 'px'; };
+      inputEl.onkeydown = function (event) { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendPrompt(); } };
+      inputEl.onfocus = function () { stickToBottom = isNearBottom(); setTimeout(syncVisualViewport, 50); };
+      messagesEl.addEventListener('scroll', function () {
+        if (!programmaticScroll) stickToBottom = isNearBottom();
+      }, {passive:true});
+      if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', syncVisualViewport);
+        window.visualViewport.addEventListener('scroll', syncVisualViewport);
+      }
+      window.addEventListener('resize', syncVisualViewport);
+      syncVisualViewport();
+      connect();
+    }());
+  </script>
+</body>
+</html>`;
 const WORKSPACE_ROOT = path.resolve(process.cwd());
 const HOME_DIR = os.homedir();
 const NEXUS_DIR = path.join(HOME_DIR, ".nexus");
@@ -192,6 +589,7 @@ const COMMANDS = [
   { name: "/rename", description: "rename the current thread" },
   { name: "/new", description: "start a new chat with a new uid" },
   { name: "/mcp", description: "manage MCP servers: start, stop, and reload configuration" },
+  { name: "/remote-control", description: "connect a phone to this session over the local network" },
   { name: "/compact", description: "manually compact context: /compact [optional instruction]" },
   { name: "/cache", description: "show prompt fingerprint and provider cache-token telemetry" },
   { name: "/loop", description: "usage: /loop <interval> <prompt>" },
@@ -262,7 +660,7 @@ const FALLBACK_TOOL_DESCRIPTIONS = {
   harness_overview:
     "harness_overview() -> dict: Continual harness overview: memories, skills, subagent templates, prompt notes, refinements.",
   harness_memory:
-    "harness_memory(key: str, content: str = '', delete: bool = False) -> dict: Create, update, or delete a persistent harness memory by stable key.",
+    "harness_memory(key: str, content: str = '', delete: bool = False) -> dict: Read a persistent memory when content is omitted; create/update it when content is supplied; delete it with delete=True.",
   manage_skill:
     "manage_skill(name: str, description: str = '', body: str = '', delete: bool = False) -> dict: Create, update, or delete a personal skill under ~/.nexus/skills. Workspace and bundled skills are read-only.",
   harness_prompt_note:
@@ -364,6 +762,22 @@ let commandMenuDismissed = false;
 let commandMenuSelected = 0;
 let commandMenuScroll = 0;
 let activeBuffer = "main";
+let remoteControlServer = null;
+let remoteControlWebSocketServer = null;
+let remoteControlPort = 0;
+let remoteControlToken = "";
+let remoteControlUrl = "";
+let remoteControlState = "stopped";
+let remoteControlError = "";
+let remoteControlQrLines = [];
+let remoteControlClients = new Set();
+let remoteControlBroadcastTimer = null;
+let remoteControlLastFingerprint = "";
+let remoteControlPromptChain = Promise.resolve();
+let remoteControlQuiet = false;
+let lastRemoteControlRenderedRows = [];
+let lastRemoteControlRenderedCols = 0;
+let lastRemoteControlRenderedHeight = 0;
 let selectedModel = "";
 let reasoningEnabledByModel = {};
 let modelSearch = "";
@@ -1257,6 +1671,15 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
           "- Use /plan to switch the session into read-only planning when requested.",
         ]),
     "",
+    "SUBAGENT ORCHESTRATION (MUST FOLLOW):",
+    "- rlm_spawn children are persistent full Nexus agent processes with no tool-turn ceiling. They inherit the active provider/model, this system prompt, execute-block loop, workspace, and tool chain; they may inspect, create, edit, execute, and verify within the delegated scope.",
+    "- rlm_spawn is non-blocking: it returns an admitted handle immediately. End the spawn block, then continue useful independent parent work on subsequent turns. call wait_subagents only later, when the next step truly depends on child completion, because wait_subagents intentionally blocks.",
+    "- Delegate independent, non-overlapping tasks and include task-specific context in each prompt. Because all children share the workspace, never assign overlapping file ownership concurrently.",
+    "- A spawn execute block must only launch workers, print/return their admission handles, and end immediately. Never call join/await/wait_subagents, sleep, poll files, or run a status loop in that same block. Workers continue in the background after the block ends.",
+    "- Collect results in a later execute block with list_subagents() for a non-blocking snapshot, or wait_subagents([id1, id2, ...], timeout=...) only when the parent has no independent work left and genuinely needs the results.",
+    "- Do not treat a running status, elapsed polling time, or not-yet-created workspace files as failure. Inspect each terminal status, result, and error before drawing conclusions.",
+    "- After collection, synthesize results and run parent-side integration verification. Never claim child workspace isolation prevented completion; children share the same working directory.",
+    "",
     "TOOL USAGE FORMAT (MANDATORY):",
     "- If tool use is needed, output exactly one fenced ````execute code block.",
     "- Execute fences may use three or more backticks; use four by default.",
@@ -1309,7 +1732,7 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     ...(lines.length > 0 ? lines : ["- (none)"]),
     "- Skills outside the workspace must never be inspected or edited with file helpers or run_shell. Discover with list_skills(), load complete instructions with get_skill(name), and create/update/delete personal skills only with manage_skill(name, description, body, delete). Workspace and bundled skills are read-only.",
     "- Use harness_overview() to inspect persistent harness capabilities and state.",
-    "- Use harness_memory(key, content) only for durable user preferences or project facts. Reuse stable keys to avoid duplicates; delete with harness_memory(key, delete=True). Never store secrets, credentials, transient task state, or guesses.",
+    "- Use harness_memory(key) to read a durable memory and harness_memory(key, content) to create/update one. Reuse stable keys to avoid duplicates; delete with harness_memory(key, delete=True). Never store secrets, credentials, transient task state, or guesses.",
     "- Use harness_prompt_note for reusable behavioral guidance, harness_subagent for reusable subagent templates, and record_refinement/refine_reflection only for small evidence-backed improvements. Never store secrets.",
     "- Use set_reminder when the user explicitly asks for a reminder; pass their human time phrase without inventing a timestamp.",
     "- Use run_shell(..., background=True) for long-running commands that do not need to block the current turn. Background jobs have a fixed 10-minute (600-second) process-tree timeout. The launch result immediately includes job_id, pid, and timeout; completion or timeout arrives later as a run_shell tool result. Run prerequisites synchronously when later steps depend on their result.",
@@ -3034,6 +3457,28 @@ function cleanupTerminal(options = {}) {
       // ignore
     }
     mcpBridgeServer = null;
+  }
+  if (remoteControlBroadcastTimer) {
+    clearTimeout(remoteControlBroadcastTimer);
+    remoteControlBroadcastTimer = null;
+  }
+  for (const client of remoteControlClients) {
+    try {
+      client.terminate();
+    } catch {}
+  }
+  remoteControlClients.clear();
+  if (remoteControlWebSocketServer) {
+    try {
+      remoteControlWebSocketServer.close();
+    } catch {}
+    remoteControlWebSocketServer = null;
+  }
+  if (remoteControlServer) {
+    try {
+      remoteControlServer.close();
+    } catch {}
+    remoteControlServer = null;
   }
   delete process.env.NEXUS_TUI_BRIDGE_PORT;
   delete process.env.NEXUS_TUI_BRIDGE_PID;
@@ -6079,6 +6524,15 @@ PLAN_MODE = ${collaborationMode === "plan" ? "True" : "False"}
 PLAN_ALLOWED_TOOLS = set(${JSON.stringify([...PLAN_MODE_ALLOWED_TOOL_NAMES])})
 _steps = 0
 
+if hasattr(tools, "configure_subagent_runtime"):
+    tools.configure_subagent_runtime(
+        system_prompt=Path(sys.argv[2]).read_text(encoding="utf-8"),
+        model=${JSON.stringify(selectedModel)},
+        reasoning_enabled=${getReasoningEnabledForModel(selectedModel) ? "True" : "False"},
+        reasoning_effort=${JSON.stringify(getThinkingEffort())},
+        session_id=${JSON.stringify(currentSessionUid || "")},
+    )
+
 def tracer(frame, event, arg):
     global _steps
     if event == "call":
@@ -6224,7 +6678,9 @@ sys.__stdout__.flush()
     // independent of the generated code length.
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-exec-"));
     const codePath = path.join(tempDir, "execute.py.txt");
+    const systemPromptPath = path.join(tempDir, "system-prompt.txt");
     await fs.writeFile(codePath, String(code ?? ""), "utf8");
+    await fs.writeFile(systemPromptPath, String(systemPromptText || ""), "utf8");
     let protocolBuffer = "";
     let resultJson = "";
     const consumeProtocolLine = (line) => {
@@ -6242,7 +6698,7 @@ sys.__stdout__.flush()
         resultJson = line.slice(resultPrefix.length);
       }
     };
-    const { stdout } = await spawnPythonCommandStreaming(["-c", runner, codePath], {
+    const { stdout } = await spawnPythonCommandStreaming(["-c", runner, codePath, systemPromptPath], {
       timeout: TOOL_EXEC_TIMEOUT_MS,
       maxBuffer: 2 * 1024 * 1024,
       onStdout: (chunk) => {
@@ -7239,6 +7695,16 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
       if (stopRequested) {
         activeToolRun = null;
         emitStopNotice();
+        break;
+      }
+
+      // A user message submitted while this turn was busy must not wait for
+      // an arbitrarily long execute -> result -> execute chain. The completed
+      // tool result is already in history, so yield this request here; the
+      // serialized assistant chain will append and submit the queued user
+      // message as the next turn.
+      if (hasQueuedPromptForToolBoundary(generation)) {
+        activeToolRun = null;
         break;
       }
 
@@ -9632,6 +10098,11 @@ async function runSlashCommand(commandName, commandArgs = "") {
     return true;
   }
 
+  if (commandName === "/remote-control") {
+    openRemoteControlBuffer();
+    return true;
+  }
+
   if (commandName === "/resume") {
     if (pendingAssistantRequests > 0) {
       appendTuiErrorMessage("/resume");
@@ -10331,6 +10802,122 @@ function closeSettingsBuffer() {
   renderFrame(false);
 }
 
+function openRemoteControlBuffer() {
+  const reuseAltScreen = altScreenActive;
+  input = "";
+  inputCursorIndex = 0;
+  pendingPastedPayloads = [];
+  commandMenuDismissed = false;
+  activeBuffer = "remote_control";
+  enterAltScreenIfNeeded();
+  isBracketedPasteActive = false;
+  bracketedPasteBuffer = "";
+  pasteParserBuffer = "";
+  lastRemoteControlRenderedRows = [];
+  lastRemoteControlRenderedCols = 0;
+  lastRemoteControlRenderedHeight = 0;
+  forceFullClearOnNextRender = !reuseAltScreen;
+  cancelIdleFlush();
+  burstMode = false;
+  markDirty();
+  renderFrame(true);
+  startRemoteControlServer().catch((error) => {
+    remoteControlState = "error";
+    remoteControlError = error?.message || String(error);
+    markDirty();
+    renderFrame(true);
+  });
+}
+
+function closeRemoteControlBuffer() {
+  exitAltScreenIfNeeded({ preserveRestoredScreen: true });
+  activeBuffer = "main";
+  lastRemoteControlRenderedRows = [];
+  lastRemoteControlRenderedCols = 0;
+  lastRemoteControlRenderedHeight = 0;
+  cancelIdleFlush();
+  burstMode = false;
+  markDirty();
+  renderFrame(false);
+}
+
+async function restartRemoteControlServer() {
+  remoteControlState = "starting";
+  remoteControlError = "";
+  markDirty();
+  renderFrame(true);
+  await stopRemoteControlServer();
+  await startRemoteControlServer();
+}
+
+function renderRemoteControlBuffer() {
+  process.stdout.write(HIDE_CURSOR);
+  const rows = process.stdout.rows || 24;
+  const cols = process.stdout.columns || 80;
+  if (!hasInitializedScreen || forceFullClearOnNextRender) {
+    readline.cursorTo(process.stdout, 0, 0);
+    readline.clearScreenDown(process.stdout);
+    hasInitializedScreen = true;
+    forceFullClearOnNextRender = false;
+    lastRemoteControlRenderedRows = [];
+  }
+  if (
+    lastRemoteControlRenderedCols !== cols ||
+    lastRemoteControlRenderedHeight !== rows
+  ) {
+    lastRemoteControlRenderedRows = [];
+    lastRemoteControlRenderedCols = cols;
+    lastRemoteControlRenderedHeight = rows;
+  }
+
+  const frameRows = Array.from({ length: rows }, () => ({ text: "", color: null }));
+  const setCenteredRow = (y, content, color = null) => {
+    if (y < 0 || y >= rows) return;
+    const clipped = String(content || "").slice(0, cols);
+    const left = " ".repeat(Math.max(0, Math.floor((cols - clipped.length) / 2)));
+    frameRows[y] = { text: `${left}${clipped}`, color };
+  };
+
+  if (remoteControlState === "starting") {
+    setCenteredRow(Math.max(1, Math.floor(rows / 2) - 1), "Starting remote control...", GOLDENROD_COLOR);
+    setCenteredRow(Math.max(2, Math.floor(rows / 2) + 1), "Binding to the local network", PLACEHOLDER_COLOR);
+  } else if (remoteControlState === "error") {
+    setCenteredRow(Math.max(1, Math.floor(rows / 2) - 2), "Remote control could not start", RED_COLOR);
+    for (const [index, line] of wrapLine(remoteControlError || "Unknown error", Math.max(1, cols - 4)).entries()) {
+      setCenteredRow(Math.floor(rows / 2) + index, line, PLACEHOLDER_COLOR);
+    }
+  } else if (remoteControlState === "stopped") {
+    setCenteredRow(Math.max(1, Math.floor(rows / 2) - 1), "Remote control is stopped", PLACEHOLDER_COLOR);
+    setCenteredRow(Math.max(2, Math.floor(rows / 2) + 1), "Press R to start it", GOLDENROD_COLOR);
+  } else {
+    const qrHeight = remoteControlQrLines.length;
+    const urlLines = wrapLine(remoteControlUrl, Math.max(1, cols - 4));
+    const contentHeight = 2 + urlLines.length + 1 + qrHeight + 2;
+    let y = Math.max(0, Math.floor((rows - contentHeight) / 2));
+    setCenteredRow(y++, "Nexus Remote Control", GOLDENROD_COLOR);
+    setCenteredRow(y++, `${remoteControlClients.size} phone${remoteControlClients.size === 1 ? "" : "s"} connected`, remoteControlClients.size > 0 ? GREEN_COLOR : PLACEHOLDER_COLOR);
+    for (const line of urlLines) setCenteredRow(y++, line, BLUE_COLOR);
+    y += 1;
+    for (const line of remoteControlQrLines) setCenteredRow(y++, line);
+    y += 1;
+    setCenteredRow(y, "Scan with your phone camera while both devices are on the same network", PLACEHOLDER_COLOR);
+  }
+  frameRows[rows - 1] = {
+    text: "Esc: return (server stays running)  R: restart  S: stop",
+    color: PLACEHOLDER_COLOR,
+  };
+
+  for (let y = 0; y < rows; y += 1) {
+    const next = frameRows[y];
+    const previous = lastRemoteControlRenderedRows[y];
+    if (previous && previous.text === next.text && previous.color === next.color) continue;
+    if (next.color) writeColoredLine(y, next.text, cols, next.color);
+    else writeLine(y, next.text, cols);
+  }
+  lastRemoteControlRenderedRows = frameRows;
+  dirty = false;
+}
+
 async function cycleSelectedRuntimeSetting(direction = 1) {
   const setting = getFilteredRuntimeSettings()[settingsSelected];
   if (!setting || !Array.isArray(setting.options) || setting.options.length < 2) {
@@ -10377,6 +10964,420 @@ async function cycleSelectedRuntimeSetting(direction = 1) {
   } finally {
     settingsBusy = false;
   }
+}
+
+function getPreferredLanAddress() {
+  const candidates = [];
+  for (const entries of Object.values(os.networkInterfaces())) {
+    for (const entry of entries || []) {
+      const family = typeof entry?.family === "string" ? entry.family : String(entry?.family || "");
+      if (!entry || entry.internal || family !== "IPv4") continue;
+      const address = String(entry.address || "");
+      if (!address || address.startsWith("169.254.")) continue;
+      let priority = 3;
+      if (/^192\.168\./.test(address) || /^10\./.test(address)) priority = 0;
+      else if (/^172\.(1[6-9]|2\d|3[01])\./.test(address)) priority = 1;
+      else if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(address)) priority = 2;
+      candidates.push({ address, priority });
+    }
+  }
+  candidates.sort((a, b) => a.priority - b.priority || a.address.localeCompare(b.address));
+  return candidates[0]?.address || "";
+}
+
+function buildRemoteControlStatus() {
+  if (!isAssistantThinking()) {
+    return { phase: "idle", label: "Connected", startedAt: 0 };
+  }
+  if (activeToolRun && !activeToolRun.done) {
+    return {
+      phase: "running",
+      label: `Running ${stripAnsiSgr(String(activeToolRun.label || "code execution")).slice(0, 200)}`,
+      startedAt: Number(activeToolRun.startedAt) || Date.now(),
+    };
+  }
+  return {
+    phase: "thinking",
+    label: "Thinking...",
+    startedAt: thinkingStartedAt || Date.now(),
+  };
+}
+
+function getRemoteControlVisibleMessages() {
+  const visible = messages.filter((message) => {
+    if (!message || message.hidden === true || message.role === "system") return false;
+    if (message.ephemeral === true && !String(message.content || "").trim()) return false;
+    return ["user", "assistant", "tool", "error"].includes(message.role);
+  });
+  const remoteMessages = [];
+  for (const message of visible.slice(-REMOTE_CONTROL_MAX_MESSAGES)) {
+    if (message.role === "assistant" && shouldShowThinkingBlocks()) {
+      const reasoning = extractReasoningDisplayText(message.reasoningDetails);
+      if (reasoning) {
+        remoteMessages.push({
+          role: "reasoning",
+          content: reasoning.length > MAX_REASONING_DISPLAY_CHARS
+            ? `${reasoning.slice(0, MAX_REASONING_DISPLAY_CHARS)}\n... [reasoning truncated]`
+            : reasoning,
+        });
+      }
+    }
+    const raw = typeof message.content === "string"
+      ? message.content
+      : JSON.stringify(message.content ?? "", null, 2);
+    let content;
+    if (message.role === "tool") {
+      const displayLines = getToolResultLinesForDisplay(raw);
+      if (displayLines.length > TOOL_RESULT_TRUNCATE_MAX_LINES) {
+        const head = displayLines.slice(0, TOOL_RESULT_TRUNCATE_HEAD_LINES);
+        const tail = displayLines.slice(-TOOL_RESULT_TRUNCATE_TAIL_LINES);
+        const hidden = displayLines.length - head.length - tail.length;
+        content = [...head, `... +${hidden} lines`, ...tail].join("\n");
+      } else {
+        content = displayLines.join("\n");
+      }
+    } else {
+      content = raw.length > REMOTE_CONTROL_MAX_MESSAGE_CHARS
+        ? `${raw.slice(0, REMOTE_CONTROL_MAX_MESSAGE_CHARS)}\n... [truncated on remote]`
+        : raw;
+    }
+    const entry = { role: message.role, content };
+    if (message.role === "assistant") {
+      const annotated = annotateAssistantCodeBlocks(content);
+      const blocks = [];
+      for (const line of annotated) {
+        const type = line.python ? "code" : "text";
+        const previous = blocks[blocks.length - 1];
+        if (previous?.type === type) previous.content += `\n${line.text}`;
+        else blocks.push({ type, content: line.text });
+      }
+      entry.blocks = blocks;
+    }
+    remoteMessages.push(entry);
+  }
+  return remoteMessages.slice(-REMOTE_CONTROL_MAX_MESSAGES);
+}
+
+function buildRemoteControlSnapshot() {
+  return {
+    type: "snapshot",
+    session: currentSessionUid || "",
+    workspace: path.basename(WORKSPACE_ROOT),
+    status: buildRemoteControlStatus(),
+    queued: queuedBusyPrompts
+      .filter((entry) => entry.sessionUid === currentSessionUid)
+      .map((entry) => entry.text),
+    messages: getRemoteControlVisibleMessages(),
+  };
+}
+
+function getRemoteControlFingerprint() {
+  const status = buildRemoteControlStatus();
+  const visible = messages.filter(
+    (message) => message && message.hidden !== true && message.role !== "system"
+  );
+  const tail = visible.slice(-3).map((message) => {
+    const content = String(message.content || "");
+    const reasoning = extractReasoningDisplayText(message.reasoningDetails);
+    return [
+      message.role,
+      message.ephemeral === true,
+      content.length,
+      content.slice(-160),
+      reasoning.length,
+      reasoning.slice(-80),
+    ];
+  });
+  return JSON.stringify({
+    session: currentSessionUid,
+    count: visible.length,
+    tail,
+    status,
+    showThinkingBlocks: shouldShowThinkingBlocks(),
+    queued: queuedBusyPrompts.map((entry) => [entry.sessionUid, entry.id, entry.text]),
+  });
+}
+
+function sendRemoteControlSnapshot(client) {
+  if (!client || client.readyState !== WebSocket.OPEN) return false;
+  try {
+    client.send(JSON.stringify(buildRemoteControlSnapshot()));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function broadcastRemoteControlSnapshot(options = {}) {
+  if (remoteControlClients.size === 0) return;
+  const fingerprint = getRemoteControlFingerprint();
+  if (options.force !== true && fingerprint === remoteControlLastFingerprint) return;
+  remoteControlLastFingerprint = fingerprint;
+  for (const client of remoteControlClients) {
+    sendRemoteControlSnapshot(client);
+  }
+}
+
+function scheduleRemoteControlBroadcast(options = {}) {
+  if (remoteControlClients.size === 0 || remoteControlBroadcastTimer) return;
+  remoteControlBroadcastTimer = setTimeout(() => {
+    remoteControlBroadcastTimer = null;
+    broadcastRemoteControlSnapshot(options);
+  }, REMOTE_CONTROL_BROADCAST_MS);
+}
+
+async function submitRemoteControlPrompt(rawText) {
+  const normalized = String(rawText || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (!normalized.trim()) return { ok: false, error: "Message is empty" };
+  if (normalized.length > REMOTE_CONTROL_MAX_PROMPT_CHARS) {
+    return { ok: false, error: `Message exceeds ${REMOTE_CONTROL_MAX_PROMPT_CHARS} characters` };
+  }
+
+  const trimmedInput = normalized.trim();
+  if (trimmedInput.startsWith("/") && !trimmedInput.includes("\n")) {
+    const commandName = trimmedInput.split(/\s+/)[0].toLowerCase();
+    const isKnownCommand =
+      commandName === "/model" ||
+      commandName === "/thinking" ||
+      COMMANDS.some((command) => command.name === commandName);
+    if (isKnownCommand) {
+      const commandArgs = trimmedInput.slice(commandName.length).trim();
+      await runSlashCommand(commandName, commandArgs);
+      scheduleRemoteControlBroadcast({ force: true });
+      return { ok: true, command: true };
+    }
+  }
+
+  const queueBehindActiveTurn = isAssistantThinking();
+  const promptHookRun = await runHooks({
+    eventName: "UserPromptSubmit",
+    input: { prompt: trimmedInput, source: "remote-control" },
+    timeoutMs: 30000,
+  });
+  if (promptHookRun.blocked) {
+    const reason = promptHookRun.blockReason ? `: ${promptHookRun.blockReason}` : ".";
+    appendAssistantMessage(`Prompt blocked by hook${reason}`, {
+      excludeFromRequest: true,
+      persistHistory: false,
+    });
+    return { ok: false, error: "Prompt blocked by hook" };
+  }
+
+  const submission = { submittedInput: normalized, resolvedContent: normalized };
+  commitSubmittedInputHistory(normalized);
+  if (!queueBehindActiveTurn) {
+    if (promptHookRun.additionalContext) pendingHookContext = promptHookRun.additionalContext;
+    appendSubmittedUserMessage(submission);
+  }
+  queueAssistantReply(selectedModel, {
+    queuedPrompt: queueBehindActiveTurn ? trimmedInput : "",
+    deferredUserMessage: queueBehindActiveTurn ? submission : null,
+    deferredHookContext: queueBehindActiveTurn ? promptHookRun.additionalContext || "" : "",
+  });
+  markDirty();
+  renderFrame(false);
+  scheduleRemoteControlBroadcast({ force: true });
+  return { ok: true, queued: queueBehindActiveTurn };
+}
+
+function handleRemoteControlSocketMessage(client, rawData) {
+  let payload = null;
+  try {
+    payload = JSON.parse(String(rawData || ""));
+  } catch {
+    client.send(JSON.stringify({ type: "error", message: "Invalid message" }));
+    return;
+  }
+  if (payload?.type === "snapshot") {
+    sendRemoteControlSnapshot(client);
+    return;
+  }
+  if (payload?.type === "stop") {
+    if (isAssistantThinking()) handleStopRequest();
+    scheduleRemoteControlBroadcast({ force: true });
+    return;
+  }
+  if (payload?.type !== "prompt") return;
+
+  remoteControlPromptChain = remoteControlPromptChain
+    .then(() => submitRemoteControlPrompt(payload.text))
+    .then((result) => {
+      if (!result?.ok && client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({ type: "error", message: result?.error || "Message failed" }));
+      }
+    })
+    .catch((error) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({ type: "error", message: error?.message || String(error) }));
+      }
+    });
+}
+
+function listenRemoteControlServer(server, port, host = "0.0.0.0") {
+  return new Promise((resolve, reject) => {
+    const onError = (error) => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(port, host);
+  });
+}
+
+async function startRemoteControlServer(options = {}) {
+  if (remoteControlServer?.listening) return { ok: true, url: remoteControlUrl };
+  remoteControlQuiet = options.quiet === true;
+  remoteControlState = "starting";
+  remoteControlError = "";
+  remoteControlToken = randomBytes(24).toString("base64url");
+  remoteControlLastFingerprint = "";
+  const publicHost = String(options.publicHost || getPreferredLanAddress());
+  if (!publicHost) {
+    const error = new Error("No local-network IPv4 address was found. Connect this computer to Wi-Fi or Ethernet and try again.");
+    remoteControlState = "error";
+    remoteControlError = error.message;
+    throw error;
+  }
+
+  const server = http.createServer((req, res) => {
+    const pathname = new URL(req.url || "/", "http://localhost").pathname;
+    if (req.method === "GET" && pathname === "/") {
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": "default-src 'self'; connect-src ws: wss:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+      });
+      res.end(REMOTE_CONTROL_HTML);
+      return;
+    }
+    if (req.method === "GET" && pathname === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ ok: true, app: "nexus" }));
+      return;
+    }
+    res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Not found");
+  });
+  const webSocketServer = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
+  server.on("upgrade", (req, socket, head) => {
+    let requestUrl;
+    try {
+      requestUrl = new URL(req.url || "/", "http://localhost");
+    } catch {
+      socket.destroy();
+      return;
+    }
+    const origin = String(req.headers.origin || "");
+    const expectedOrigin = `http://${req.headers.host || ""}`;
+    if (
+      requestUrl.pathname !== "/ws" ||
+      requestUrl.searchParams.get("token") !== remoteControlToken ||
+      (origin && origin !== expectedOrigin)
+    ) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    webSocketServer.handleUpgrade(req, socket, head, (client) => {
+      webSocketServer.emit("connection", client, req);
+    });
+  });
+  webSocketServer.on("connection", (client) => {
+    client.remoteWindowStartedAt = Date.now();
+    client.remoteWindowMessages = 0;
+    remoteControlClients.add(client);
+    sendRemoteControlSnapshot(client);
+    markDirty();
+    if (!remoteControlQuiet) renderFrame(true);
+    client.on("message", (data) => {
+      const now = Date.now();
+      if (now - client.remoteWindowStartedAt >= 1000) {
+        client.remoteWindowStartedAt = now;
+        client.remoteWindowMessages = 0;
+      }
+      client.remoteWindowMessages += 1;
+      if (client.remoteWindowMessages > 12) {
+        client.close(1008, "Rate limit exceeded");
+        return;
+      }
+      handleRemoteControlSocketMessage(client, data);
+    });
+    client.on("close", () => {
+      remoteControlClients.delete(client);
+      markDirty();
+      if (!remoteControlQuiet) renderFrame(true);
+    });
+    client.on("error", () => {});
+  });
+
+  const requestedPort = options.port === 0
+    ? 0
+    : Math.max(1, Math.min(65535, Number(options.port) || 3939));
+  const bindHost = String(options.host || "0.0.0.0");
+  try {
+    await listenRemoteControlServer(server, requestedPort, bindHost);
+  } catch (error) {
+    if (error?.code !== "EADDRINUSE" || requestedPort === 0) {
+      webSocketServer.close();
+      remoteControlState = "error";
+      remoteControlError = error?.message || String(error);
+      throw error;
+    }
+    await listenRemoteControlServer(server, 0, bindHost);
+  }
+
+  remoteControlServer = server;
+  remoteControlWebSocketServer = webSocketServer;
+  const address = server.address();
+  remoteControlPort = typeof address === "object" && address ? address.port : requestedPort;
+  remoteControlUrl = `http://${publicHost}:${remoteControlPort}/#${remoteControlToken}`;
+  qrcodeTerminal.generate(remoteControlUrl, { small: true }, (qr) => {
+    remoteControlQrLines = String(qr || "").trimEnd().split("\n");
+  });
+  remoteControlState = "running";
+  markDirty();
+  if (!remoteControlQuiet) renderFrame(true);
+  return { ok: true, url: remoteControlUrl };
+}
+
+async function stopRemoteControlServer() {
+  if (remoteControlBroadcastTimer) {
+    clearTimeout(remoteControlBroadcastTimer);
+    remoteControlBroadcastTimer = null;
+  }
+  for (const client of remoteControlClients) {
+    try {
+      client.terminate();
+    } catch {}
+  }
+  remoteControlClients.clear();
+  const server = remoteControlServer;
+  const webSocketServer = remoteControlWebSocketServer;
+  remoteControlServer = null;
+  remoteControlWebSocketServer = null;
+  if (webSocketServer) {
+    try {
+      webSocketServer.close();
+    } catch {}
+  }
+  if (server) {
+    await new Promise((resolve) => server.close(() => resolve()));
+  }
+  remoteControlState = "stopped";
+  remoteControlPort = 0;
+  remoteControlUrl = "";
+  remoteControlToken = "";
+  remoteControlQrLines = [];
+  remoteControlQuiet = false;
+  markDirty();
+  if (process.stdout.isTTY) renderFrame(true);
 }
 
 function renderSettingsBuffer() {
@@ -11737,6 +12738,11 @@ function removeQueuedBusyPrompt(entry) {
   if (!entry) return;
   const index = queuedBusyPrompts.indexOf(entry);
   if (index >= 0) queuedBusyPrompts.splice(index, 1);
+}
+
+function hasQueuedPromptForToolBoundary(generation = chatGeneration) {
+  if (generation !== chatGeneration) return false;
+  return queuedBusyPrompts.some((entry) => entry.sessionUid === currentSessionUid);
 }
 
 function getQueuedBusyPromptStatusLines(cols) {
@@ -13514,6 +14520,10 @@ function renderFrame(forceChatRefresh = false) {
     renderSettingsBuffer();
     return;
   }
+  if (activeBuffer === "remote_control") {
+    renderRemoteControlBuffer();
+    return;
+  }
   if (activeBuffer === "mcp") {
     renderMcpBuffer();
     return;
@@ -13966,6 +14976,7 @@ function renderMenuOnly() {
 
 function markDirty() {
   dirty = true;
+  scheduleRemoteControlBroadcast();
 }
 
 function cancelIdleFlush() {
@@ -15009,6 +16020,8 @@ function runFormatSelfTest() {
     const queuedStatusLines = getQueuedBusyPromptStatusLines(80);
     const styledQueuedHeader = styleQueuedBusyHeaderLine(queuedStatusLines[0]);
     const queuedInputGapRows = getMainStatusInputGapRows(80);
+    const yieldsAtToolBoundary = hasQueuedPromptForToolBoundary(chatGeneration);
+    const rejectsStaleToolBoundary = hasQueuedPromptForToolBoundary(chatGeneration + 1) === false;
     removeQueuedBusyPrompt(queuedPreview);
     const longQueuedPreview = addQueuedBusyPrompt("x".repeat(500));
     const narrowQueuedStatusLines = getQueuedBusyPromptStatusLines(20);
@@ -15019,6 +16032,9 @@ function runFormatSelfTest() {
       queuedStatusLines.length !== 2 ||
       !queuedStatusLines[0].includes("Queued for the next turn") ||
       !queuedStatusLines[1].includes("queued preview message") ||
+      !yieldsAtToolBoundary ||
+      !rejectsStaleToolBoundary ||
+      hasQueuedPromptForToolBoundary(chatGeneration) ||
       queuedInputGapRows !== 0 ||
       ordinaryInputGapRows !== STATUS_INPUT_GAP ||
       stripAnsiSgr(styledQueuedHeader) !== queuedStatusLines[0] ||
@@ -15254,6 +16270,13 @@ function runFormatSelfTest() {
       !deferredPrompt.includes("completion or timeout arrives later") ||
       !deferredPrompt.includes("Never confuse 'not configured locally' with 'not available'") ||
       !deferredPrompt.includes("supports stdio and HTTP MCP servers") ||
+      !deferredPrompt.includes("persistent full Nexus agent processes") ||
+      !deferredPrompt.includes("rlm_spawn is non-blocking") ||
+      !deferredPrompt.includes("no tool-turn ceiling") ||
+      !deferredPrompt.includes("A spawn execute block must only launch workers") ||
+      !deferredPrompt.includes("Never call join/await/wait_subagents, sleep, poll files") ||
+      !deferredPrompt.includes("Workers continue in the background after the block ends") ||
+      deferredPrompt.includes("These workers are process-local") ||
       deferredPrompt.includes("mcp_list()") ||
       deferredPrompt.includes("android_build(project_path") ||
       deferredPrompt.includes("kernel_exec(code")
@@ -16732,6 +17755,117 @@ async function runMcpSelfTest() {
   }
 }
 
+async function runRemoteControlSelfTest() {
+  const out = process.stdout.write.bind(process.stdout);
+  let client = null;
+  const originalMessageLength = messages.length;
+  const hadThinkingBlocksSetting = Object.prototype.hasOwnProperty.call(nexusConfig, "show_thinking_blocks");
+  const originalThinkingBlocksSetting = nexusConfig.show_thinking_blocks;
+  try {
+    nexusConfig.show_thinking_blocks = true;
+    messages.push({
+      role: "assistant",
+      content: ["````execute", "print('hello from remote')", "````"].join("\n"),
+      reasoningDetails: [{ type: "reasoning.text", text: "private reasoning trace" }],
+    });
+    messages.push({
+      role: "tool",
+      content: Array.from({ length: 30 }, (_, index) => `tool line ${index + 1}`).join("\n"),
+    });
+
+    const started = await startRemoteControlServer({
+      port: 0,
+      host: "127.0.0.1",
+      publicHost: "127.0.0.1",
+      quiet: true,
+    });
+    if (!started?.ok || !remoteControlPort || remoteControlQrLines.length === 0) {
+      throw new Error("gateway did not start or generate a QR code");
+    }
+
+    const pageResponse = await fetch(`http://127.0.0.1:${remoteControlPort}/`);
+    const pageText = await pageResponse.text();
+    if (
+      !pageResponse.ok ||
+      !pageText.includes("Nexus Remote") ||
+      !pageText.includes("interactive-widget=resizes-content") ||
+      !pageText.includes("appendHighlightedPython") ||
+      !pageText.includes("appendMarkdown") ||
+      pageText.includes(remoteControlToken)
+    ) {
+      throw new Error("remote page response was invalid or leaked its token");
+    }
+    const remoteScript = pageText.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+    if (!remoteScript) throw new Error("remote page omitted its client script");
+    try {
+      new Function(remoteScript);
+    } catch (error) {
+      throw new Error(`remote client script did not parse: ${error?.message || String(error)}`);
+    }
+
+    const socketUrl = `ws://127.0.0.1:${remoteControlPort}/ws?token=${encodeURIComponent(remoteControlToken)}`;
+    client = new WebSocket(socketUrl, {
+      headers: { Origin: `http://127.0.0.1:${remoteControlPort}` },
+    });
+    const snapshot = await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("snapshot timed out")), 5000);
+      client.once("error", (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      client.once("message", (data) => {
+        clearTimeout(timeout);
+        try {
+          resolve(JSON.parse(String(data || "")));
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    if (snapshot?.type !== "snapshot" || !Array.isArray(snapshot?.messages)) {
+      throw new Error("WebSocket did not return a session snapshot");
+    }
+    const reasoningMessage = snapshot.messages.find((message) => message.role === "reasoning");
+    const assistantMessage = snapshot.messages.find(
+      (message) => message.role === "assistant" && Array.isArray(message.blocks)
+    );
+    const toolMessage = snapshot.messages.find((message) => message.role === "tool");
+    if (!reasoningMessage?.content.includes("private reasoning trace")) {
+      throw new Error("remote snapshot omitted reasoning traces");
+    }
+    if (!assistantMessage?.blocks.some(
+      (block) => block.type === "code" && block.content.includes("print('hello from remote')")
+    )) {
+      throw new Error("remote snapshot omitted execute block metadata");
+    }
+    if (!toolMessage?.content.includes("... +") || toolMessage.content.includes("tool line 15")) {
+      throw new Error("remote snapshot did not truncate tool output");
+    }
+    client.close();
+    await new Promise((resolve) => client.once("close", resolve));
+    client = null;
+    await stopRemoteControlServer();
+    out("REMOTE_OK\n");
+    return 0;
+  } catch (error) {
+    if (client) {
+      try {
+        client.terminate();
+      } catch {}
+    }
+    await stopRemoteControlServer().catch(() => {});
+    out(`REMOTE_FAIL: ${error?.message || String(error)}\n`);
+    return 1;
+  } finally {
+    messages.length = originalMessageLength;
+    if (hadThinkingBlocksSetting) {
+      nexusConfig.show_thinking_blocks = originalThinkingBlocksSetting;
+    } else {
+      delete nexusConfig.show_thinking_blocks;
+    }
+  }
+}
+
 if (process.argv.includes("--self-test-append")) {
   const code = runAppendSelfTest();
   process.exit(code);
@@ -16753,6 +17887,11 @@ if (process.argv.includes("--self-test-mcp")) {
 
 if (process.argv.includes("--self-test-background")) {
   runBackgroundShellSelfTest().then((code) => process.exit(code));
+  return;
+}
+
+if (process.argv.includes("--self-test-remote")) {
+  runRemoteControlSelfTest().then((code) => process.exit(code));
   return;
 }
 
@@ -16790,6 +17929,8 @@ process.stdin.on("data", (rawChunk) => {
     closeProvidersBuffer();
   } else if (activeBuffer === "settings" && chunk === "\u001b") {
     closeSettingsBuffer();
+  } else if (activeBuffer === "remote_control" && chunk === "\u001b") {
+    closeRemoteControlBuffer();
   } else if (activeBuffer === "mcp" && chunk === "\u001b") {
     closeMcpBuffer();
   } else if (activeBuffer === "loops" && chunk === "\u001b") {
@@ -17346,6 +18487,33 @@ process.stdin.on("keypress", async (str, key) => {
       updateMcpSelectionState();
       markDirty();
       renderFrame(true);
+      return;
+    }
+    return;
+  }
+
+  if (activeBuffer === "remote_control") {
+    if (key?.name === "escape" || key?.sequence === "\u001b" || str === "\u001b") {
+      closeRemoteControlBuffer();
+      return;
+    }
+    const action = String(str || key?.name || "").toLowerCase();
+    if (action === "s") {
+      await stopRemoteControlServer();
+      return;
+    }
+    if (
+      action === "r" ||
+      key?.sequence === "\r" ||
+      key?.name === "return" ||
+      key?.name === "enter"
+    ) {
+      restartRemoteControlServer().catch((error) => {
+        remoteControlState = "error";
+        remoteControlError = error?.message || String(error);
+        markDirty();
+        renderFrame(true);
+      });
       return;
     }
     return;
