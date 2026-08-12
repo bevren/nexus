@@ -2412,7 +2412,16 @@ def tool_search(query: str, limit: int = 5) -> dict:
     }
 
 
+def deep_think(thought: str) -> dict:
+    """Acknowledge a deliberate external reasoning step without echoing it."""
+    value = str(thought or "").strip()
+    if not value:
+        return {"ok": False, "error": "deep_think: thought must be non-empty"}
+    return {"ok": True, "acknowledged": True, "message": "Thought recorded. Continue solving."}
+
+
 FUNCTIONS = {
+    "deep_think": deep_think,
     "tool_search": tool_search,
     "create_plan": create_plan,
     "update_plan": update_plan,
@@ -2460,6 +2469,7 @@ FUNCTIONS = {
 }
 
 FUNCTION_DESCRIPTIONS = {
+    "deep_think": "deep_think(thought: str) -> dict: Record a private deliberate reasoning step, then continue solving with the returned acknowledgement. Available when External thinking is enabled and native thinking is disabled.",
     "tool_search": "tool_search(query: str, limit: int = 5) -> dict: Search deferred built-in helper names and descriptions. Returns the most relevant exact helper signatures; call a discovered helper in a later execute block.",
     "create_plan": "create_plan(entries: str|list[str]) -> dict: Create a new workspace to-do plan and return the full plan.",
     "update_plan": "update_plan(completed: int|str|list[int|str]|None = None, new_entries: str|list[str]|None = None) -> dict: Mark plan entries completed and/or add new plan entries, then return updated entries and current plan.",

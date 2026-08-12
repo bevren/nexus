@@ -9,6 +9,17 @@ const os = require("os");
 const { execFile, spawn, spawnSync } = require("child_process");
 const { createHash, randomUUID } = require("crypto");
 
+const PACKAGE_ROOT = __dirname;
+const TOOLS_SCRIPT_PATH = path.join(PACKAGE_ROOT, "tools.py");
+
+function getPythonRuntimeEnvironment() {
+  const existingPythonPath = String(process.env.PYTHONPATH || "").trim();
+  return {
+    ...process.env,
+    PYTHONPATH: [PACKAGE_ROOT, existingPythonPath].filter(Boolean).join(path.delimiter),
+  };
+}
+
 let OpenAI = null;
 try {
   const openaiModule = require("openai");
@@ -29,6 +40,7 @@ const RED_COLOR = "\u001b[91m";
 const WHITE_COLOR = "\u001b[97m";
 const BOLD_WHITE = "\u001b[1m\u001b[97m";
 const VSCODE_BLUE_COLOR = "\u001b[38;2;86;156;214m";
+const GOLDENROD_COLOR = "\u001b[38;2;218;165;32m";
 const CODE_BLOCK_BG_COLOR = "\u001b[48;5;236m";
 const SESSION_EVEN_BG_COLOR = "\u001b[48;2;24;24;24m";
 const SESSION_SELECTED_FG_COLOR = "\u001b[38;2;184;134;11m";
@@ -101,6 +113,8 @@ const MAX_REASONING_DISPLAY_CHARS = 4000;
 const MAX_INPUT_HISTORY_ITEMS = 500;
 const DEFAULT_LLM_REQUEST_TIMEOUT_MS = 120000;
 const DEFAULT_MODEL_CONTEXT_WINDOW = 1000000;
+const DEFAULT_THINKING_EFFORT = "high";
+const THINKING_EFFORT_OPTIONS = ["low", "high", "xhigh", "max"];
 const MIN_LLM_REQUEST_TIMEOUT_MS = 10000;
 const MAX_LLM_REQUEST_TIMEOUT_MS = 600000;
 const THINKING_ANIMATION_INTERVAL_MS = 320;
@@ -126,6 +140,8 @@ const ENABLE_BRACKETED_PASTE = "\u001b[?2004h";
 const DISABLE_BRACKETED_PASTE = "\u001b[?2004l";
 const ENABLE_FOCUS_REPORTING = "\u001b[?1004h";
 const DISABLE_FOCUS_REPORTING = "\u001b[?1004l";
+const ENABLE_KEYBOARD_PROTOCOL = "\u001b[>1u";
+const DISABLE_KEYBOARD_PROTOCOL = "\u001b[<u";
 const ENABLE_MOUSE_TRACKING = "\u001b[?1000h\u001b[?1006h";
 const DISABLE_MOUSE_TRACKING = "\u001b[?1000l\u001b[?1006l";
 const ENTER_ALT_SCREEN = "\u001b[?1049h";
@@ -162,7 +178,7 @@ const FALLBACK_MODELS = [
 const COMMANDS = [
   { name: "/plan", description: "toggle read-only plan mode: /plan [on|off|status]" },
   { name: "/providers", description: "manage provider list and credentials" },
-  { name: "/set", description: "set runtime values: /set model <name> | /set thinking <on|off>" },
+  { name: "/settings", description: "view and change runtime settings" },
   { name: "/resume", description: "show session list and resume selected chat" },
   { name: "/clear", description: "clear chat window and delete current session history file" },
   { name: "/permissions", description: "choose what Codex is allowed to do" },
@@ -236,8 +252,11 @@ const SYSTEM_PROMPT_VISIBLE_TOOL_NAMES = new Set([
   "get_git_diff",
   "web_search",
   "fetch_url",
+  "deep_think",
 ]);
 const FALLBACK_TOOL_DESCRIPTIONS = {
+  deep_think:
+    "deep_think(thought: str) -> dict: Record a private deliberate reasoning step, then continue solving with the returned acknowledgement. Available when External thinking is enabled and native thinking is disabled.",
   tool_search:
     "tool_search(query: str, limit: int = 5) -> dict: Search deferred built-in helper names and descriptions. Returns only the most relevant helper signatures; call the discovered helper in a later execute block.",
   harness_overview:
@@ -316,6 +335,7 @@ const FALLBACK_TOOL_DESCRIPTIONS = {
 
 let input = "";
 let inputCursorIndex = 0;
+let inputVerticalGoalColumn = null;
 let submittedInputHistory = [];
 let submittedInputHistoryIndex = -1;
 let submittedInputHistoryDraft = "";
@@ -381,6 +401,14 @@ let providersLoadError = "";
 let lastProvidersRenderedRows = [];
 let lastProvidersRenderedCols = 0;
 let lastProvidersRenderedHeight = 0;
+let settingsSelected = 0;
+let settingsScroll = 0;
+let settingsSearch = "";
+let settingsMessage = "";
+let settingsBusy = false;
+let lastSettingsRenderedRows = [];
+let lastSettingsRenderedCols = 0;
+let lastSettingsRenderedHeight = 0;
 let providerEditorMode = "";
 let providerEditorIndex = -1;
 let providerEditorFieldIndex = 0;
@@ -474,6 +502,7 @@ let terminalTitleSpinnerFrameIndex = 0;
 let terminalTitleSpinnerTimer = null;
 let terminalHasFocus = true;
 let focusReportingEnabled = false;
+let keyboardProtocolModeEnabled = false;
 let thinkingStartedAt = 0;
 let activeToolRun = null; // { label, startedAt, done, ok }
 let stopRequested = false;
@@ -499,6 +528,7 @@ let cachedChatLinesCols = 0;
 let cachedChatLinesLen = -1;
 let cachedChatLinesLastRef = null;
 let cachedChatLinesSpacing = -1;
+let cachedChatLinesShowThinkingBlocks = true;
 const cachedTranscriptLinesByEntries = new WeakMap();
 
 function createSessionUid() {
@@ -535,9 +565,9 @@ function getSessionReasoningConfig() {
 // setReasoningEnabledForModel(false) on provider/empty-content retries).
 // On resume we must not let those stale flags win over the user's explicit
 // preference. Walk the loaded transcript newest-first for the last
-// reasoning-state signal: an explicit "/set thinking on" or an auto-disable
-// notice both mean thinking should come back ON; only an explicit
-// "/set thinking off" preserves the off state.
+// reasoning-state signal: an explicit settings change or an auto-disable
+// notice both mean thinking should come back ON; only an explicit settings
+// change to false preserves the off state.
 function pruneAutoDisabledReasoningFlags(persistedMap, transcript) {
   const result = { ...persistedMap };
   let lastSignal = null; // "explicit-on" | "explicit-off" | "auto"
@@ -577,7 +607,7 @@ function isAssistantNoContentFallbackMessage(content) {
   const normalized = content.trim();
   return (
     normalized === "Provider returned no assistant content." ||
-    normalized === "Provider returned no assistant content. Try /set thinking off for this model."
+    normalized === "Provider returned no assistant content. Try disabling thinking in /settings for this model."
   );
 }
 
@@ -993,7 +1023,12 @@ function getBundledPythonExe() {
 }
 
 async function runPythonCommand(args, options = {}) {
-  const mergedOptions = { cwd: process.cwd(), windowsHide: true, ...options };
+  const mergedOptions = {
+    cwd: process.cwd(),
+    windowsHide: true,
+    env: getPythonRuntimeEnvironment(),
+    ...options,
+  };
   const bundledExe = getBundledPythonExe();
 
   // Prefer a self-contained tools.exe bundled next to this app.
@@ -1016,7 +1051,12 @@ async function runPythonCommand(args, options = {}) {
 }
 
 function spawnPythonCommandStreaming(args, options = {}) {
-  const mergedOptions = { cwd: process.cwd(), windowsHide: true, ...options };
+  const mergedOptions = {
+    cwd: process.cwd(),
+    windowsHide: true,
+    env: getPythonRuntimeEnvironment(),
+    ...options,
+  };
   const timeoutMs = Number(mergedOptions.timeout);
   const maxBuffer = Math.max(1024, Number(mergedOptions.maxBuffer) || 2 * 1024 * 1024);
   const onStdout = typeof mergedOptions.onStdout === "function" ? mergedOptions.onStdout : null;
@@ -1116,8 +1156,12 @@ function spawnPythonCommandStreaming(args, options = {}) {
 
 function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
   const planModeActive = (runtime?.collaborationMode || collaborationMode) === "plan";
+  const externalThinkingActive = typeof runtime?.externalThinkingActive === "boolean"
+    ? runtime.externalThinkingActive
+    : shouldUseExternalThinking();
   const entries = Object.entries(descriptions || {}).filter(([name]) => {
     if (!SYSTEM_PROMPT_VISIBLE_TOOL_NAMES.has(name)) return false;
+    if (name === "deep_think" && !externalThinkingActive) return false;
     return !planModeActive || PLAN_MODE_ALLOWED_TOOL_NAMES.has(name);
   });
   const lines = entries
@@ -1178,6 +1222,14 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "",
     "CONTEXT USE (MUST FOLLOW):",
     "- Use context effectively: avoid unnecessary repetition, avoid re-reading unchanged large files, and prefer targeted edits/tool calls.",
+    ...(externalThinkingActive
+      ? [
+          "",
+          "EXTERNAL THINKING (MUST FOLLOW):",
+          "- Native model thinking is disabled. Before complex reasoning, call deep_think(\"your deliberate thought\") in an execute block, then continue from its acknowledgement.",
+          "- Use deep_think for reasoning only; do not place file edits, shell commands, secrets, or user-facing answers inside it.",
+        ]
+      : []),
     "",
     "SKILL USE (MUST FOLLOW):",
     "- Before starting specialized or artifact work (including PDF, PowerPoint/slides, Word documents, spreadsheets, Android apps, or service integrations), call list_skills() to discover applicable workflows.",
@@ -1271,7 +1323,7 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
 
 async function loadToolDescriptionsFromPython() {
   try {
-    const { stdout } = await runPythonCommand(["tools.py", "--describe-json"], {
+    const { stdout } = await runPythonCommand([TOOLS_SCRIPT_PATH, "--describe-json"], {
       timeout: 3000,
       maxBuffer: 256 * 1024,
     });
@@ -1299,7 +1351,7 @@ async function loadToolDescriptionsFromPython() {
 
 async function loadSkillsCatalog() {
   try {
-    const { stdout } = await runPythonCommand(["tools.py", "--list-skills-json"], {
+    const { stdout } = await runPythonCommand([TOOLS_SCRIPT_PATH, "--list-skills-json"], {
       timeout: 3000,
       maxBuffer: 128 * 1024,
     });
@@ -3012,6 +3064,13 @@ function cleanupTerminal(options = {}) {
     altScreenActive = false;
   }
 
+  // Keyboard protocol stacks are separate for main and alternate screens.
+  // Return to the main screen before popping the mode pushed at startup.
+  if (keyboardProtocolModeEnabled) {
+    process.stdout.write(DISABLE_KEYBOARD_PROTOCOL);
+    keyboardProtocolModeEnabled = false;
+  }
+
   process.stdout.write("\u001b[r");
   if (clearScreen && process.stdout.isTTY) {
     // Clear visible content and scrollback, then place cursor at top-left.
@@ -3277,6 +3336,37 @@ function normalizeModelContextWindow(value) {
   return Math.floor(raw);
 }
 
+function normalizeThinkingEffort(value) {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return THINKING_EFFORT_OPTIONS.includes(normalized) ? normalized : DEFAULT_THINKING_EFFORT;
+}
+
+function getThinkingEffort() {
+  return normalizeThinkingEffort(nexusConfig?.thinking_effort);
+}
+
+function shouldShowThinkingBlocks() {
+  return nexusConfig?.show_thinking_blocks !== false;
+}
+
+function isExternalThinkingEnabled() {
+  return nexusConfig?.external_thinking === true;
+}
+
+function shouldUseExternalThinking(modelId = selectedModel) {
+  return isExternalThinkingEnabled() && !getReasoningEnabledForModel(modelId);
+}
+
+function applyThinkingRequestSettings(payload, modelId = selectedModel, enabled = true) {
+  if (!payload || !enabled || !getReasoningEnabledForModel(modelId)) return payload;
+  payload.reasoning_effort = getThinkingEffort();
+  payload.reasoning = { enabled: true };
+  // Python's OpenAI `extra_body={"thinking": ...}` is serialized as this
+  // top-level provider extension by the JavaScript SDK.
+  payload.thinking = { type: "enabled" };
+  return payload;
+}
+
 function getLlmRequestTimeoutMs() {
   return normalizeLlmRequestTimeoutMs(nexusConfig?.llm_request_timeout_ms);
 }
@@ -3288,6 +3378,9 @@ async function ensureNexusConfigFileReady() {
     provider: DEFAULT_PROVIDERS[0].name,
     model_context_window_override: DEFAULT_MODEL_CONTEXT_WINDOW,
     llm_request_timeout_ms: DEFAULT_LLM_REQUEST_TIMEOUT_MS,
+    thinking_effort: DEFAULT_THINKING_EFFORT,
+    show_thinking_blocks: true,
+    external_thinking: false,
   };
   const content = `${JSON.stringify(initialConfig, null, 2)}\n`;
   try {
@@ -3363,6 +3456,11 @@ async function saveNexusConfig() {
     llm_request_timeout_ms: normalizeLlmRequestTimeoutMs(
       nexusConfig?.llm_request_timeout_ms ?? current?.llm_request_timeout_ms
     ),
+    thinking_effort: normalizeThinkingEffort(
+      nexusConfig?.thinking_effort ?? current?.thinking_effort
+    ),
+    show_thinking_blocks: nexusConfig?.show_thinking_blocks !== false,
+    external_thinking: nexusConfig?.external_thinking === true,
   };
   nexusConfig = next;
   await fs.writeFile(NEXUS_CONFIG_FILE, `${JSON.stringify(next, null, 2)}\n`, "utf8");
@@ -3387,6 +3485,9 @@ async function loadNexusConfig() {
       parsed?.model_context_window_override
     ),
     llm_request_timeout_ms: normalizeLlmRequestTimeoutMs(parsed?.llm_request_timeout_ms),
+    thinking_effort: normalizeThinkingEffort(parsed?.thinking_effort),
+    show_thinking_blocks: parsed?.show_thinking_blocks !== false,
+    external_thinking: parsed?.external_thinking === true,
   };
   const providerName = typeof parsed.provider === "string" ? parsed.provider.trim() : "";
   if (providerName) {
@@ -5135,7 +5236,7 @@ async function runCompaction(customInstruction = "") {
   }
   const resolvedModel = selectedModel;
   if (!resolvedModel || String(resolvedModel).trim().length === 0) {
-    return { ok: false, error: "Model is not configured. Use /set model <name>." };
+    return { ok: false, error: "Model is not configured. Use /settings." };
   }
 
   ensureSystemMessageAtTop(resolvedModel);
@@ -5265,7 +5366,12 @@ async function runCompaction(customInstruction = "") {
       (postCompactRun.additionalContext || "") || pendingHookContext || "";
     if (contextToInject.trim()) {
       ensureSystemMessageAtTop();
-      messages.push({ role: "user", content: contextToInject.trim(), excludeFromRequest: false });
+      messages.push({
+        role: "user",
+        content: contextToInject.trim(),
+        hidden: true,
+        excludeFromRequest: false,
+      });
       scrollChatToBottom();
       markDirty();
       renderFrame(true);
@@ -5748,7 +5854,7 @@ function shouldRetryWithoutReasoning(error) {
     return true;
   }
 
-  const mentionsReasoning = msg.includes("reasoning");
+  const mentionsReasoning = msg.includes("reasoning") || msg.includes("thinking");
   const unsupportedHint =
     msg.includes("unsupported") ||
     msg.includes("not supported") ||
@@ -6758,7 +6864,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
   if (!resolvedModel || String(resolvedModel).trim().length === 0) {
     finalizePendingAssistantMessage(
       pendingIndex,
-      "Model is not configured. Use /set model <name>.",
+      "Model is not configured. Use /settings.",
       generation,
       { role: "error", persistHistory: true }
     );
@@ -6771,6 +6877,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
     messages.push({
       role: "user",
       content: String(pendingHookContext).trim(),
+      hidden: true,
       excludeFromRequest: false,
     });
     pendingHookContext = "";
@@ -6792,9 +6899,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
         model: resolvedModel,
         messages: msgs,
       };
-      if (includeReasoning) {
-        payload.reasoning = { enabled: true };
-      }
+      applyThinkingRequestSettings(payload, resolvedModel, includeReasoning);
 
       const requestPromise = client.chat.completions.create(payload);
       let timeoutId = null;
@@ -6827,7 +6932,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
         const retryCompletion = await performRequest(retryMessages, false);
         setReasoningEnabledForModel(resolvedModel, false);
         appendAssistantMessage(
-          "Auto-disabled thinking for this model (provider rejected the reasoning parameter). Run /set thinking on to re-enable.",
+          "Auto-disabled thinking for this model (provider rejected the reasoning parameter). Use /settings to re-enable it.",
           { excludeFromRequest: true, persistHistory: false }
         );
         await rewriteSessionWithCurrentMessages().catch(() => {});
@@ -6900,7 +7005,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
           if (retried.disabledReasoning && getReasoningEnabledForModel(resolvedModel)) {
             setReasoningEnabledForModel(resolvedModel, false);
             appendAssistantMessage(
-              "Auto-disabled thinking for this model (empty content after retries). Run /set thinking on to re-enable.",
+              "Auto-disabled thinking for this model (empty content after retries). Use /settings to re-enable it.",
               { excludeFromRequest: true, persistHistory: false }
             );
             await rewriteSessionWithCurrentMessages().catch(() => {});
@@ -6916,7 +7021,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
     const assistantContent = assistantPayload.text;
     const assistantReasoningDetails = reasoningEnabledNow ? assistantPayload.reasoningDetails : null;
     const emptyContentMessage = getReasoningEnabledForModel(resolvedModel)
-      ? "Provider returned no assistant content. Try /set thinking off for this model."
+      ? "Provider returned no assistant content. Try disabling thinking in /settings for this model."
       : "Provider returned no assistant content.";
     finalizePendingAssistantMessage(
       pendingIndex,
@@ -7186,7 +7291,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
             if (retried.disabledReasoning && getReasoningEnabledForModel(resolvedModel)) {
               setReasoningEnabledForModel(resolvedModel, false);
               appendAssistantMessage(
-                "Auto-disabled thinking for this model (empty follow-up content after retries). Run /set thinking on to re-enable.",
+                "Auto-disabled thinking for this model (empty follow-up content after retries). Use /settings to re-enable it.",
                 { excludeFromRequest: true, persistHistory: false }
               );
               await rewriteSessionWithCurrentMessages().catch(() => {});
@@ -7201,7 +7306,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
       if (followUpContent.trim().length === 0) {
         appendAssistantMessage(
           getReasoningEnabledForModel(resolvedModel)
-            ? "Provider returned no assistant content after the tool run (even after retries). Try /set thinking off for this model."
+            ? "Provider returned no assistant content after the tool run (even after retries). Try disabling thinking in /settings for this model."
             : "Provider returned no assistant content after the tool run (even after retries).",
           { excludeFromRequest: true, persistHistory: false }
         );
@@ -7867,9 +7972,7 @@ async function runSolveLoop(taskText) {
   solveLastStatus = "Thinking...";
   const requestWithTimeout = async (messagesForRequest, options = {}) => {
     const payload = { model: resolvedModel, messages: messagesForRequest };
-    if (getReasoningEnabledForModel(resolvedModel)) {
-      payload.reasoning = { enabled: true };
-    }
+    applyThinkingRequestSettings(payload, resolvedModel, true);
     const controller = new AbortController();
     solveRequestAbortController = controller;
     const requestPromise = client.chat.completions.create(payload, { signal: controller.signal });
@@ -9506,7 +9609,7 @@ async function runSlashCommand(commandName, commandArgs = "") {
   }
 
   if (commandName === "/thinking") {
-    appendTuiErrorMessage("/thinking", "deprecated. Use '/set thinking <on|off>'");
+    appendTuiErrorMessage("/thinking", "deprecated. Use '/settings'");
     return true;
   }
 
@@ -9524,83 +9627,8 @@ async function runSlashCommand(commandName, commandArgs = "") {
     return true;
   }
 
-  if (commandName === "/set") {
-    const args = String(commandArgs ?? "").trim();
-    const [keyToken = ""] = args.split(/\s+/);
-    const settingKey = keyToken.toLowerCase();
-    const settingValue = keyToken ? args.slice(keyToken.length).trim() : "";
-
-    if (settingKey === "model") {
-      if (!settingValue) {
-        appendTuiErrorMessage("/set", "invalid usage. Use '/set model <name>'");
-        return true;
-      }
-
-      const providerIndex = providers.findIndex((entry) => entry?.name === selectedProviderName);
-      if (providerIndex < 0) {
-        appendTuiErrorMessage("/set", "failed because no active provider is selected");
-        return true;
-      }
-
-      const previousModel = normalizeProviderModel(providers[providerIndex]?.model);
-      providers[providerIndex] = normalizeProviderEntry({
-        ...providers[providerIndex],
-        model: settingValue,
-      });
-      const nextModel = normalizeProviderModel(providers[providerIndex]?.model);
-      await saveProvidersToFile();
-      resetLlmClient();
-      syncSelectedModelFromActiveProvider();
-      if (previousModel !== nextModel) {
-        await loadModelsFromProvider(true);
-      }
-      appendAssistantMessage(`Set model to "${selectedModel}"`, {
-        excludeFromRequest: true,
-        persistHistory: false,
-      });
-      await rewriteSessionWithCurrentMessages();
-      refreshMainBufferAfterCommand();
-      return true;
-    }
-
-    if (settingKey === "thinking") {
-      if (!selectedModel || selectedModel.trim().length === 0) {
-        appendTuiErrorMessage("/set", "failed because current model is not set");
-        return true;
-      }
-      if (settingValue.trim().length === 0) {
-        const stateText = getReasoningEnabledForModel(selectedModel) ? "on" : "off";
-        appendAssistantMessage(`Thinking is currently ${stateText} for ${selectedModel.trim()}`, {
-          excludeFromRequest: true,
-          persistHistory: false,
-        });
-        await rewriteSessionWithCurrentMessages();
-        refreshMainBufferAfterCommand();
-        return true;
-      }
-      const normalizedValue = settingValue.toLowerCase();
-      if (normalizedValue !== "on" && normalizedValue !== "off") {
-        appendTuiErrorMessage("/set", "invalid usage. Use '/set thinking <on|off>'");
-        return true;
-      }
-
-      setReasoningEnabledForModel(selectedModel, normalizedValue === "on");
-      appendAssistantMessage(
-        `Set thinking ${normalizedValue === "on" ? "on" : "off"}`,
-        {
-          excludeFromRequest: true,
-          persistHistory: false,
-        }
-      );
-      await rewriteSessionWithCurrentMessages();
-      refreshMainBufferAfterCommand();
-      return true;
-    }
-
-    appendTuiErrorMessage(
-      "/set",
-      "invalid usage. Use '/set model <name>' or '/set thinking <on|off>'"
-    );
+  if (commandName === "/settings") {
+    openSettingsBuffer();
     return true;
   }
 
@@ -9997,6 +10025,7 @@ function shouldTransitionCommandDirectlyToAltBuffer(commandName, commandArgs = "
   if (
     normalized === "/kernels" ||
     normalized === "/providers" ||
+    normalized === "/settings" ||
     normalized === "/mcp" ||
     normalized === "/model" ||
     (normalized === "/loops" && !args)
@@ -10162,6 +10191,289 @@ function closeProvidersBuffer() {
   burstMode = false;
   markDirty();
   renderFrame(false);
+}
+
+function getSettingsVisibleCount() {
+  const rows = process.stdout.rows || 24;
+  return Math.max(1, rows - 5);
+}
+
+function uniqueSettingOptions(values, currentValue) {
+  const result = [];
+  for (const value of [...values, currentValue]) {
+    if (value === undefined || value === null || value === "") continue;
+    if (!result.some((existing) => existing === value)) result.push(value);
+  }
+  return result;
+}
+
+function formatContextWindow(value) {
+  const amount = Number(value);
+  if (amount >= 1000000 && amount % 1000000 === 0) return `${amount / 1000000}m`;
+  if (amount >= 1000 && amount % 1000 === 0) return `${amount / 1000}k`;
+  return String(amount);
+}
+
+function formatRequestTimeout(value) {
+  const amount = Number(value);
+  if (amount >= 60000 && amount % 60000 === 0) return `${amount / 60000}m`;
+  if (amount >= 1000 && amount % 1000 === 0) return `${amount / 1000}s`;
+  return `${amount}ms`;
+}
+
+function capitalizeSettingLabel(value) {
+  const label = String(value || "");
+  return label ? `${label[0].toUpperCase()}${label.slice(1)}` : "";
+}
+
+function getRuntimeSettings() {
+  const contextWindow = normalizeModelContextWindow(nexusConfig?.model_context_window_override);
+  const requestTimeout = getLlmRequestTimeoutMs();
+  return [
+    { key: "thinking", label: "thinking", value: getReasoningEnabledForModel(selectedModel), options: [true, false] },
+    {
+      key: "thinking_blocks",
+      label: "thinking blocks",
+      value: shouldShowThinkingBlocks(),
+      options: [true, false],
+    },
+    {
+      key: "external_thinking",
+      label: "external thinking",
+      value: isExternalThinkingEnabled(),
+      options: [true, false],
+    },
+    {
+      key: "thinking_effort",
+      label: "thinking effort",
+      value: getThinkingEffort(),
+      options: THINKING_EFFORT_OPTIONS,
+    },
+    {
+      key: "context_window",
+      label: "context window",
+      value: contextWindow,
+      options: [128000, 256000, 384000, 512000, 768000, 1000000],
+      format: formatContextWindow,
+    },
+    {
+      key: "request_timeout",
+      label: "request timeout",
+      value: requestTimeout,
+      options: uniqueSettingOptions([30000, 60000, 120000, 300000, 600000], requestTimeout),
+      format: formatRequestTimeout,
+    },
+  ];
+}
+
+function getFilteredRuntimeSettings() {
+  const query = settingsSearch.trim().toLowerCase();
+  const settings = getRuntimeSettings();
+  if (!query) return settings;
+  return settings.filter((setting) => {
+    const value = setting.format ? setting.format(setting.value) : String(setting.value);
+    return `${setting.label} ${value}`.toLowerCase().includes(query);
+  });
+}
+
+function updateSettingsSelectionState() {
+  const settings = getFilteredRuntimeSettings();
+  settingsSelected = Math.max(0, Math.min(settingsSelected, Math.max(0, settings.length - 1)));
+  if (settingsSelected < settingsScroll) settingsScroll = settingsSelected;
+  const visibleCount = getSettingsVisibleCount();
+  if (settingsSelected >= settingsScroll + visibleCount) {
+    settingsScroll = settingsSelected - visibleCount + 1;
+  }
+  settingsScroll = Math.min(settingsScroll, Math.max(0, settings.length - visibleCount));
+}
+
+function openSettingsBuffer() {
+  const reuseAltScreen = altScreenActive;
+  commandBufferQuery = "";
+  lastCommandRenderedRows = [];
+  lastCommandRenderedCols = 0;
+  lastCommandRenderedHeight = 0;
+  input = "";
+  inputCursorIndex = 0;
+  pendingPastedPayloads = [];
+  commandMenuDismissed = false;
+  commandMenuSelected = 0;
+  commandMenuScroll = 0;
+  activeBuffer = "settings";
+  enterAltScreenIfNeeded();
+  isBracketedPasteActive = false;
+  bracketedPasteBuffer = "";
+  pasteParserBuffer = "";
+  settingsSelected = 0;
+  settingsScroll = 0;
+  settingsSearch = "";
+  settingsMessage = "";
+  settingsBusy = false;
+  lastSettingsRenderedRows = [];
+  lastSettingsRenderedCols = 0;
+  lastSettingsRenderedHeight = 0;
+  forceFullClearOnNextRender = !reuseAltScreen;
+  cancelIdleFlush();
+  burstMode = false;
+  markDirty();
+  renderFrame(true);
+}
+
+function closeSettingsBuffer() {
+  exitAltScreenIfNeeded({ preserveRestoredScreen: true });
+  activeBuffer = "main";
+  lastSettingsRenderedRows = [];
+  lastSettingsRenderedCols = 0;
+  lastSettingsRenderedHeight = 0;
+  cancelIdleFlush();
+  burstMode = false;
+  markDirty();
+  renderFrame(false);
+}
+
+async function cycleSelectedRuntimeSetting(direction = 1) {
+  const setting = getFilteredRuntimeSettings()[settingsSelected];
+  if (!setting || !Array.isArray(setting.options) || setting.options.length < 2) {
+    settingsMessage = `No other ${setting?.label || "setting"} values are available.`;
+    return;
+  }
+  const currentIndex = setting.options.findIndex((value) => value === setting.value);
+  const startIndex = currentIndex >= 0 ? currentIndex : direction > 0 ? -1 : 0;
+  const nextIndex = (startIndex + direction + setting.options.length) % setting.options.length;
+  const nextValue = setting.options[nextIndex];
+
+  settingsBusy = true;
+  settingsMessage = `Updating ${setting.label}...`;
+  markDirty();
+  renderFrame(true);
+  try {
+    if (setting.key === "thinking") {
+      if (!selectedModel) throw new Error("current model is not set");
+      setReasoningEnabledForModel(selectedModel, nextValue);
+      await rewriteSessionWithCurrentMessages();
+    } else if (setting.key === "thinking_blocks") {
+      nexusConfig.show_thinking_blocks = nextValue === true;
+      await saveNexusConfig();
+      cachedChatLines = null;
+      lastRenderableMessageCount = -1;
+    } else if (setting.key === "external_thinking") {
+      nexusConfig.external_thinking = nextValue === true;
+      await saveNexusConfig();
+    } else if (setting.key === "thinking_effort") {
+      nexusConfig.thinking_effort = normalizeThinkingEffort(nextValue);
+      await saveNexusConfig();
+    } else if (setting.key === "context_window") {
+      nexusConfig.model_context_window_override = normalizeModelContextWindow(nextValue);
+      await saveNexusConfig();
+    } else if (setting.key === "request_timeout") {
+      nexusConfig.llm_request_timeout_ms = normalizeLlmRequestTimeoutMs(nextValue);
+      await saveNexusConfig();
+    }
+    const updated = getRuntimeSettings().find((entry) => entry.key === setting.key);
+    const formattedValue = updated?.format ? updated.format(updated.value) : String(updated?.value ?? nextValue);
+    settingsMessage = `${setting.label}: ${formattedValue}`;
+  } catch (error) {
+    settingsMessage = `Could not update ${setting.label}: ${error?.message || String(error)}`;
+  } finally {
+    settingsBusy = false;
+  }
+}
+
+function renderSettingsBuffer() {
+  process.stdout.write(HIDE_CURSOR);
+  const rows = process.stdout.rows || 24;
+  const cols = process.stdout.columns || 80;
+  const panelWidth = Math.min(Math.max(60, Math.floor(cols * 0.85)), cols);
+  const panelLeft = Math.max(0, Math.floor((cols - panelWidth) / 2));
+  const settings = getFilteredRuntimeSettings();
+  const visibleCount = getSettingsVisibleCount();
+  updateSettingsSelectionState();
+
+  if (!hasInitializedScreen || forceFullClearOnNextRender) {
+    readline.cursorTo(process.stdout, 0, 0);
+    readline.clearScreenDown(process.stdout);
+    hasInitializedScreen = true;
+    forceFullClearOnNextRender = false;
+    lastSettingsRenderedRows = [];
+  }
+  if (lastSettingsRenderedCols !== cols || lastSettingsRenderedHeight !== rows) {
+    lastSettingsRenderedRows = [];
+    lastSettingsRenderedCols = cols;
+    lastSettingsRenderedHeight = rows;
+  }
+
+  const frameRows = Array.from({ length: rows }, () => ({
+    text: " ".repeat(cols),
+    color: null,
+    styledText: "",
+  }));
+  const setPanelRow = (y, content, color = null, styledContent = "") => {
+    if (y < 0 || y >= rows) return;
+    const clipped = String(content || "").slice(0, panelWidth).padEnd(panelWidth, " ");
+    const left = " ".repeat(panelLeft);
+    const right = " ".repeat(Math.max(0, cols - panelLeft - panelWidth));
+    frameRows[y] = {
+      text: `${left}${clipped}${right}`.slice(0, cols),
+      color,
+      styledText: styledContent ? `${left}${styledContent}${right}` : "",
+    };
+  };
+
+  if (settingsSearch) setPanelRow(0, settingsSearch);
+  else setPanelRow(0, "Type to search", PLACEHOLDER_COLOR);
+  if (settingsMessage) setPanelRow(1, settingsMessage, PLACEHOLDER_COLOR);
+  if (settings.length === 0) setPanelRow(2, "no matching settings", PLACEHOLDER_COLOR);
+  const end = Math.min(settings.length, settingsScroll + visibleCount);
+  for (let i = settingsScroll; i < end; i += 1) {
+    const setting = settings[i];
+    const selected = i === settingsSelected;
+    const marker = selected ? "●" : "○";
+    const value = setting.format ? setting.format(setting.value) : String(setting.value);
+    const label = capitalizeSettingLabel(setting.label);
+    const valueColumn = Math.min(28, Math.max(1, panelWidth - value.length));
+    const mainText = ` ${marker} ${label}:`.padEnd(valueColumn, " ") + value;
+    if (selected) {
+      const options = setting.options
+        .map((option) => setting.format ? setting.format(option) : String(option))
+        .join(", ");
+      const hintText = options ? `       [${options}]` : "";
+      const visibleMain = mainText.slice(0, panelWidth);
+      const visibleHint = hintText.slice(0, Math.max(0, panelWidth - visibleMain.length));
+      const padding = " ".repeat(Math.max(0, panelWidth - visibleMain.length - visibleHint.length));
+      setPanelRow(
+        2 + i - settingsScroll,
+        `${mainText}${hintText}`,
+        null,
+        `${GOLDENROD_COLOR}${visibleMain}${RESET_COLOR}${PLACEHOLDER_COLOR}${visibleHint}${RESET_COLOR}${padding}`
+      );
+    } else {
+      setPanelRow(2 + i - settingsScroll, mainText);
+    }
+  }
+  setPanelRow(
+    rows - 1,
+    settingsBusy ? "Updating setting..." : "Enter/Right: next value  Left: previous value  Esc: return",
+    PLACEHOLDER_COLOR
+  );
+
+  for (let y = 0; y < rows; y += 1) {
+    const nextRow = frameRows[y];
+    const prevRow = lastSettingsRenderedRows[y];
+    if (
+      prevRow &&
+      prevRow.text === nextRow.text &&
+      prevRow.color === nextRow.color &&
+      prevRow.styledText === nextRow.styledText
+    ) continue;
+    if (nextRow.styledText) writeStyledLine(y, nextRow.text, nextRow.styledText, cols);
+    else if (nextRow.color) writeColoredLine(y, nextRow.text, cols, nextRow.color);
+    else writeLine(y, nextRow.text, cols);
+  }
+  lastSettingsRenderedRows = frameRows;
+  const cursorX = Math.min(panelLeft + settingsSearch.length, panelLeft + panelWidth - 1);
+  readline.cursorTo(process.stdout, cursorX, 0);
+  process.stdout.write(SHOW_CURSOR);
+  dirty = false;
 }
 
 function getMcpVisibleCount() {
@@ -12038,6 +12350,7 @@ function highlightPythonInline(line) {
 
 function buildChatVisualLines(cols, sourceEntries = messages) {
   const revealActive = sourceEntries === messages && hasActiveAnswerReveal();
+  const showThinkingBlocks = shouldShowThinkingBlocks();
   let entryStartIndex = -1;
   if (sourceEntries === messages) {
     if (!revealActive) {
@@ -12047,7 +12360,8 @@ function buildChatVisualLines(cols, sourceEntries = messages) {
         cachedChatLinesCols === cols &&
         cachedChatLinesLen === messages.length &&
         cachedChatLinesLastRef === lastRef &&
-        cachedChatLinesSpacing === MESSAGE_SPACING_ROWS
+        cachedChatLinesSpacing === MESSAGE_SPACING_ROWS &&
+        cachedChatLinesShowThinkingBlocks === showThinkingBlocks
       ) {
         return cachedChatLines;
       }
@@ -12060,7 +12374,8 @@ function buildChatVisualLines(cols, sourceEntries = messages) {
       cached.cols === cols &&
       cached.length === sourceEntries.length &&
       cached.lastRef === lastRef &&
-      cached.spacing === MESSAGE_SPACING_ROWS
+      cached.spacing === MESSAGE_SPACING_ROWS &&
+      cached.showThinkingBlocks === showThinkingBlocks
     ) {
       return cached.lines;
     }
@@ -12077,7 +12392,10 @@ function buildChatVisualLines(cols, sourceEntries = messages) {
 
     const role = typeof entry?.role === "string" ? entry.role : "";
     const entryLines = [...buildTranscriptLinesForEntry(entry, contentWidth)];
-    const reasoningText = role === "assistant" ? extractReasoningDisplayText(entry?.reasoningDetails) : "";
+    const reasoningText =
+      role === "assistant" && showThinkingBlocks
+        ? extractReasoningDisplayText(entry?.reasoningDetails)
+        : "";
     const reasoningLines = [];
     if (reasoningText) {
       const logical = reasoningText.split("\n");
@@ -12162,6 +12480,7 @@ function buildChatVisualLines(cols, sourceEntries = messages) {
       cachedChatLinesLen = messages.length;
       cachedChatLinesLastRef = messages.length > 0 ? messages[messages.length - 1] : null;
       cachedChatLinesSpacing = MESSAGE_SPACING_ROWS;
+      cachedChatLinesShowThinkingBlocks = showThinkingBlocks;
     }
   } else if (Array.isArray(sourceEntries)) {
     cachedTranscriptLinesByEntries.set(sourceEntries, {
@@ -12169,6 +12488,7 @@ function buildChatVisualLines(cols, sourceEntries = messages) {
       length: sourceEntries.length,
       lastRef: sourceEntries.length > 0 ? sourceEntries[sourceEntries.length - 1] : null,
       spacing: MESSAGE_SPACING_ROWS,
+      showThinkingBlocks,
       lines: visualLines,
     });
   }
@@ -12574,13 +12894,15 @@ function writeAlignCenterColoredLine(y, rawText, cols, color) {
   process.stdout.write(`${color}${clipped}${RESET_COLOR}`);
 }
 
-function getInputCursorMetrics(cols) {
-  if (!input) {
+function getInputCursorMetricsAtIndex(source, cursorIndex, cols) {
+  const value = typeof source === "string" ? source : "";
+  const safeCursorIndex = Math.max(0, Math.min(value.length, Number(cursorIndex) || 0));
+  if (!value) {
     return { x: PROMPT_PREFIX.length, row: 0 };
   }
 
-  const logicalLines = input.split("\n");
-  const beforeCursor = input.slice(0, inputCursorIndex);
+  const logicalLines = value.split("\n");
+  const beforeCursor = value.slice(0, safeCursorIndex);
   const beforeCursorLines = beforeCursor.split("\n");
   const currentLineIndex = beforeCursorLines.length - 1;
   const currentLineCursorCol = beforeCursorLines[currentLineIndex].length;
@@ -12602,6 +12924,10 @@ function getInputCursorMetrics(cols) {
     x: wrappedCurrent[wrappedCurrent.length - 1].length,
     row: consumedRows + wrappedCurrent.length - 1,
   };
+}
+
+function getInputCursorMetrics(cols) {
+  return getInputCursorMetricsAtIndex(input, inputCursorIndex, cols);
 }
 
 function getCursorPosition(cols, startRow, inputViewportOffset = 0, cursorMetrics = null) {
@@ -13184,6 +13510,10 @@ function renderFrame(forceChatRefresh = false) {
     renderProvidersBuffer();
     return;
   }
+  if (activeBuffer === "settings") {
+    renderSettingsBuffer();
+    return;
+  }
   if (activeBuffer === "mcp") {
     renderMcpBuffer();
     return;
@@ -13378,6 +13708,17 @@ function renderFrame(forceChatRefresh = false) {
     }
   };
 
+  const clearStaleChatRows = () => {
+    const oldChatHeight = lastChatAreaHeight ?? 0;
+    const chatClearHeight = Math.max(chatAreaHeight, oldChatHeight);
+    const occupiedEnd = chatStartRow + chatVisualLines.length;
+    for (let y = 0; y < chatClearHeight; y += 1) {
+      if (y < chatStartRow || y >= occupiedEnd) {
+        writeLine(y, "", cols);
+      }
+    }
+  };
+
   if (revealActiveNow) {
     // Repaint every visible chat row in place (no clear step): static rows
     // are rewritten with identical content (invisible), while the revealing
@@ -13387,21 +13728,20 @@ function renderFrame(forceChatRefresh = false) {
     for (let i = 0; i < chatVisualLines.length; i += 1) {
       paintChatLine(chatStartRow + i, chatVisualLines[i]);
     }
+    // Thinking/status collapse can move the entire chat block while the
+    // answer fade is active. Remove rows occupied by its previous position
+    // so user messages are not left behind as apparent duplicates.
+    if (needsChatRefresh) {
+      clearStaleChatRows();
+    }
     answerRevealSettlePending = false;
   } else if (needsChatRefresh) {
-    const oldChatHeight = lastChatAreaHeight ?? 0;
-    const chatClearHeight = Math.max(chatAreaHeight, oldChatHeight);
     // Paint new content first so the transcript never visibly disappears.
     for (let i = 0; i < chatVisualLines.length; i += 1) {
       paintChatLine(chatStartRow + i, chatVisualLines[i]);
     }
     // Then erase only rows no longer occupied by the new chat frame.
-    const occupiedEnd = chatStartRow + chatVisualLines.length;
-    for (let y = 0; y < chatClearHeight; y += 1) {
-      if (y < chatStartRow || y >= occupiedEnd) {
-        writeLine(y, "", cols);
-      }
-    }
+    clearStaleChatRows();
   }
 
   const oldTop = lastFrameTop ?? frameTop;
@@ -13713,6 +14053,10 @@ function resetSubmittedInputHistoryNavigation() {
   submittedInputHistoryDraft = "";
 }
 
+function resetInputVerticalGoalColumn() {
+  inputVerticalGoalColumn = null;
+}
+
 function commitSubmittedInputHistory(text) {
   const value = typeof text === "string" ? text.replace(/\r\n/g, "\n").replace(/\r/g, "\n") : "";
   if (!/\S/.test(value)) {
@@ -13754,6 +14098,7 @@ function browseSubmittedInputHistory(direction) {
       input = submittedInputHistoryDraft;
       submittedInputHistoryDraft = "";
       inputCursorIndex = input.length;
+      resetInputVerticalGoalColumn();
       updateCommandMenuState();
       return true;
     }
@@ -13763,20 +14108,27 @@ function browseSubmittedInputHistory(direction) {
 
   input = submittedInputHistory[submittedInputHistoryIndex] || "";
   inputCursorIndex = input.length;
+  resetInputVerticalGoalColumn();
   updateCommandMenuState();
   return true;
 }
 
 function breakSubmittedInputHistoryNavigation() {
+  resetInputVerticalGoalColumn();
   if (submittedInputHistoryIndex !== -1) {
     resetSubmittedInputHistoryNavigation();
   }
 }
 
 function appendSubmittedUserMessage(submission) {
-  if (!submission || typeof submission.resolvedContent !== "string") {
+  if (
+    !submission ||
+    submission.appended === true ||
+    typeof submission.resolvedContent !== "string"
+  ) {
     return false;
   }
+  submission.appended = true;
   ensureSystemMessageAtTop();
   messages.push({ role: "user", content: submission.resolvedContent });
   appendHistoryEntry("user", submission.resolvedContent);
@@ -13946,26 +14298,31 @@ function backspace() {
 }
 
 function moveCursorLeft() {
+  resetInputVerticalGoalColumn();
   if (inputCursorIndex > 0) {
     inputCursorIndex -= 1;
   }
 }
 
 function moveCursorRight() {
+  resetInputVerticalGoalColumn();
   if (inputCursorIndex < input.length) {
     inputCursorIndex += 1;
   }
 }
 
 function moveCursorToStart() {
+  resetInputVerticalGoalColumn();
   inputCursorIndex = 0;
 }
 
 function moveCursorToEnd() {
+  resetInputVerticalGoalColumn();
   inputCursorIndex = input.length;
 }
 
 function moveCursorWordLeft() {
+  resetInputVerticalGoalColumn();
   if (inputCursorIndex === 0) {
     return;
   }
@@ -13981,6 +14338,7 @@ function moveCursorWordLeft() {
 }
 
 function moveCursorWordRight() {
+  resetInputVerticalGoalColumn();
   if (inputCursorIndex >= input.length) {
     return;
   }
@@ -13993,6 +14351,75 @@ function moveCursorWordRight() {
     i += 1;
   }
   inputCursorIndex = i;
+}
+
+function moveInputCursorVertically(direction, cols = process.stdout.columns || 80) {
+  const step = direction < 0 ? -1 : direction > 0 ? 1 : 0;
+  if (step === 0) return false;
+
+  const current = getInputCursorMetricsAtIndex(input, inputCursorIndex, cols);
+  const targetRow = current.row + step;
+  const visualLineCount = buildInputVisualLines(cols).length;
+  if (targetRow < 0 || targetRow >= visualLineCount) return false;
+
+  if (inputVerticalGoalColumn === null) {
+    inputVerticalGoalColumn = current.x;
+  }
+
+  let bestIndex = inputCursorIndex;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (let index = 0; index <= input.length; index += 1) {
+    const candidate = getInputCursorMetricsAtIndex(input, index, cols);
+    if (candidate.row !== targetRow) continue;
+    const distance = Math.abs(candidate.x - inputVerticalGoalColumn);
+    if (distance < bestDistance) {
+      bestIndex = index;
+      bestDistance = distance;
+    }
+  }
+
+  if (!Number.isFinite(bestDistance)) return false;
+  inputCursorIndex = bestIndex;
+  updateCommandMenuState();
+  return true;
+}
+
+function normalizeKeyboardProtocolKey(key) {
+  const sequence = typeof key?.sequence === "string" ? key.sequence : "";
+  const match = /^\u001b\[(\d+)(?:[:][^;u]*)?(?:;(\d+)(?::\d+)?)?(?:;[^u]*)?u$/.exec(sequence);
+  if (!match) return key;
+
+  const codePoint = Number(match[1]);
+  const modifiers = Math.max(1, Number(match[2]) || 1) - 1;
+  let name = "undefined";
+  if (codePoint === 13) name = "return";
+  else if (codePoint === 9) name = "tab";
+  else if (codePoint === 27) name = "escape";
+  else if (codePoint === 127) name = "backspace";
+  else if (codePoint >= 32 && codePoint <= 126) name = String.fromCodePoint(codePoint).toLowerCase();
+
+  return {
+    ...key,
+    name,
+    shift: Boolean(modifiers & 1),
+    meta: Boolean(modifiers & 2),
+    ctrl: Boolean(modifiers & 4),
+  };
+}
+
+function isInputNewlineKey(str, key) {
+  const isCtrlJ =
+    (key?.ctrl && key?.name === "j") ||
+    key?.name === "linefeed" ||
+    key?.sequence === "\n" ||
+    str === "\n";
+  const isModifiedEnter =
+    ((key?.ctrl || key?.shift) && (key?.name === "enter" || key?.name === "return")) ||
+    key?.sequence === "\u001b[13;2u" ||
+    key?.sequence === "\u001b[13;5u" ||
+    key?.sequence === "\u001b[27;2;13~" ||
+    key?.sequence === "\u001b[27;5;13~";
+  return isCtrlJ || isModifiedEnter;
 }
 
 function deleteWordBackward() {
@@ -14115,8 +14542,53 @@ function runAppendSelfTest() {
     lastStatusTop = null;
     lastStatusHeight = 0;
     lastMenuRenderedLines = [];
+
+    input = "abcd\nef\nghij";
+    inputCursorIndex = 7;
+    inputVerticalGoalColumn = null;
+    if (!moveInputCursorVertically(-1, 80) || inputCursorIndex !== 2) {
+      out(`SELFTEST_FAIL: multiline Up did not move to the preceding row (${inputCursorIndex})\n`);
+      return 1;
+    }
+    if (moveInputCursorVertically(-1, 80)) {
+      out("SELFTEST_FAIL: multiline Up moved above the first row\n");
+      return 1;
+    }
+    if (!moveInputCursorVertically(1, 80) || inputCursorIndex !== 7) {
+      out(`SELFTEST_FAIL: multiline Down did not restore the next row (${inputCursorIndex})\n`);
+      return 1;
+    }
+
+    const shiftEnterKey = normalizeKeyboardProtocolKey({ sequence: "\u001b[13;2u" });
+    const ctrlCKey = normalizeKeyboardProtocolKey({ sequence: "\u001b[99;5u" });
+    if (
+      shiftEnterKey?.name !== "return" ||
+      shiftEnterKey?.shift !== true ||
+      !isInputNewlineKey(null, shiftEnterKey) ||
+      ctrlCKey?.name !== "c" ||
+      ctrlCKey?.ctrl !== true ||
+      isInputNewlineKey("\r", { name: "return", sequence: "\r" })
+    ) {
+      out("SELFTEST_FAIL: modified key protocol decoding\n");
+      return 1;
+    }
+
+    input = "";
+    inputCursorIndex = 0;
+    inputVerticalGoalColumn = null;
     ensureSystemMessageAtTop();
     messages.push({ role: "user", content: "hello self test" });
+    messages.push({
+      role: "user",
+      content: "hello self test",
+      hidden: true,
+      excludeFromRequest: false,
+    });
+    const firstPromptLines = buildChatVisualLines(80).map((line) => stripAnsiSgr(line.text));
+    if (firstPromptLines.filter((line) => line.includes("hello self test")).length !== 1) {
+      out("SELFTEST_FAIL: hidden hook context duplicated the submitted prompt\n");
+      return 1;
+    }
 
     const BT = String.fromCharCode(96, 96, 96);
     const NL = String.fromCharCode(10);
@@ -14250,6 +14722,8 @@ function runAppendSelfTest() {
 async function runExecuteTransportSelfTest() {
   const out = process.stdout.write.bind(process.stdout);
   const previousMode = collaborationMode;
+  const readFixtureName = `.nexus-self-test-read-${process.pid}-${Date.now()}.txt`;
+  const readFixturePath = path.join(WORKSPACE_ROOT, readFixtureName);
   const largeCode = `${"# large execute transport\n".repeat(2500)}print("LARGE_EXEC_OK")`;
   const result = await executeCodeWithPythonTool(largeCode);
   if (!result?.ok || !String(result.output || "").includes("LARGE_EXEC_OK")) {
@@ -14307,12 +14781,25 @@ async function runExecuteTransportSelfTest() {
     out(`EXECUTE_FAIL: run_shell output did not stream before completion: ${JSON.stringify({ shellStreamResult, shellStreamedText, firstDelayMs: firstShellStreamAt - shellStreamStartedAt, leadMs: shellStreamFinishedAt - firstShellStreamAt })}\n`);
     return 1;
   }
+  const deepThinkResult = await executeCodeWithPythonTool(
+    "print(deep_think('private self-test thought'))"
+  );
+  const deepThinkOutput = String(deepThinkResult?.output || "");
+  if (
+    !deepThinkResult?.ok ||
+    !deepThinkOutput.includes("acknowledged") ||
+    deepThinkOutput.includes("private self-test thought")
+  ) {
+    out(`EXECUTE_FAIL: deep_think acknowledgement failed: ${JSON.stringify(deepThinkResult)}\n`);
+    return 1;
+  }
   try {
+    fsSync.writeFileSync(readFixturePath, "NEXUS_READ_OK\n", "utf8");
     collaborationMode = "plan";
     const readResult = await executeCodeWithPythonTool(
-      "print(get_file_content('package.json', start_line=1, end_line=1))"
+      `print(get_file_content(${JSON.stringify(readFixtureName)}, start_line=1, end_line=1))`
     );
-    if (!readResult?.ok || !String(readResult.output || "").includes("{")) {
+    if (!readResult?.ok || !String(readResult.output || "").includes("NEXUS_READ_OK")) {
       out(`EXECUTE_FAIL: plan mode blocked read-only inspection: ${JSON.stringify(readResult)}\n`);
       return 1;
     }
@@ -14363,6 +14850,7 @@ async function runExecuteTransportSelfTest() {
     }
   } finally {
     collaborationMode = previousMode;
+    fsSync.rmSync(readFixturePath, { force: true });
   }
   out("EXECUTE_OK\n");
   return 0;
@@ -14371,6 +14859,68 @@ async function runExecuteTransportSelfTest() {
 function runFormatSelfTest() {
   const out = process.stdout.write.bind(process.stdout);
   try {
+    const runtimeSettingKeys = getRuntimeSettings().map((setting) => setting.key);
+    if (
+      !COMMANDS.some((command) => command.name === "/settings") ||
+      COMMANDS.some((command) => command.name === "/set") ||
+      runtimeSettingKeys.join(",") !== "thinking,thinking_blocks,external_thinking,thinking_effort,context_window,request_timeout" ||
+      typeof getRuntimeSettings().find((setting) => setting.key === "thinking")?.value !== "boolean" ||
+      typeof getRuntimeSettings().find((setting) => setting.key === "thinking_blocks")?.value !== "boolean" ||
+      typeof getRuntimeSettings().find((setting) => setting.key === "external_thinking")?.value !== "boolean" ||
+      getRuntimeSettings().find((setting) => setting.key === "context_window")?.options.join(",") !==
+        "128000,256000,384000,512000,768000,1000000" ||
+      capitalizeSettingLabel("external thinking") !== "External thinking"
+    ) {
+      out(`FORMAT_FAIL: runtime settings buffer is incomplete: ${JSON.stringify(runtimeSettingKeys)}\n`);
+      return 1;
+    }
+    const thinkingPayload = applyThinkingRequestSettings({}, "self-test-model", true);
+    if (
+      thinkingPayload.reasoning_effort !== "high" ||
+      thinkingPayload.reasoning?.enabled !== true ||
+      thinkingPayload.thinking?.type !== "enabled"
+    ) {
+      out(`FORMAT_FAIL: thinking request settings are incomplete: ${JSON.stringify(thinkingPayload)}\n`);
+      return 1;
+    }
+    const externalThinkingPrompt = buildSystemPromptFromDescriptions(
+      { deep_think: FALLBACK_TOOL_DESCRIPTIONS.deep_think },
+      { collaborationMode: "build", externalThinkingActive: true }
+    );
+    const regularPrompt = buildSystemPromptFromDescriptions(
+      { deep_think: FALLBACK_TOOL_DESCRIPTIONS.deep_think },
+      { collaborationMode: "build", externalThinkingActive: false }
+    );
+    if (
+      !externalThinkingPrompt.includes("deep_think(thought: str)") ||
+      !externalThinkingPrompt.includes("EXTERNAL THINKING") ||
+      regularPrompt.includes("deep_think")
+    ) {
+      out("FORMAT_FAIL: external thinking prompt activation is incorrect\n");
+      return 1;
+    }
+    const savedShowThinkingBlocks = nexusConfig.show_thinking_blocks;
+    const reasoningDisplayFixture = [{
+      role: "assistant",
+      content: "visible answer",
+      reasoningDetails: [{ type: "reasoning.text", text: "private reasoning trace" }],
+    }];
+    nexusConfig.show_thinking_blocks = false;
+    const hiddenReasoningLines = buildChatVisualLines(80, reasoningDisplayFixture)
+      .map((line) => stripAnsiSgr(line.text));
+    nexusConfig.show_thinking_blocks = true;
+    const shownReasoningLines = buildChatVisualLines(80, reasoningDisplayFixture)
+      .map((line) => stripAnsiSgr(line.text));
+    if (savedShowThinkingBlocks === undefined) delete nexusConfig.show_thinking_blocks;
+    else nexusConfig.show_thinking_blocks = savedShowThinkingBlocks;
+    if (
+      hiddenReasoningLines.some((line) => line.includes("private reasoning trace")) ||
+      !hiddenReasoningLines.some((line) => line.includes("visible answer")) ||
+      !shownReasoningLines.some((line) => line.includes("private reasoning trace"))
+    ) {
+      out("FORMAT_FAIL: thinking blocks display setting did not hide reasoning only\n");
+      return 1;
+    }
     const sessionNow = Date.UTC(2026, 0, 1, 12, 0, 0);
     const sessionRow = formatSessionListRow(
       {
@@ -15845,7 +16395,7 @@ async function runKernelSelfTest() {
     const stale = { "deepseek-chat": false };
     const autoTranscript = [
       { role: "assistant", content: "Set thinking on", excludeFromRequest: true },
-      { role: "assistant", content: "Auto-disabled thinking for this model (empty content with thinking on). Run /set thinking on to re-enable.", excludeFromRequest: true },
+      { role: "assistant", content: "Auto-disabled thinking for this model (empty content with thinking on). Use /settings to re-enable.", excludeFromRequest: true },
     ];
     const prunedAuto = pruneAutoDisabledReasoningFlags(stale, autoTranscript);
     if (Object.prototype.hasOwnProperty.call(prunedAuto, "deepseek-chat")) {
@@ -15857,7 +16407,7 @@ async function runKernelSelfTest() {
     ];
     const prunedOff = pruneAutoDisabledReasoningFlags(stale, offTranscript);
     if (prunedOff["deepseek-chat"] !== false) {
-      out(`KERNEL_FAIL: explicit /set thinking off must survive resume: ${JSON.stringify(prunedOff)}\n`);
+      out(`KERNEL_FAIL: explicit settings change to thinking off must survive resume: ${JSON.stringify(prunedOff)}\n`);
       return 1;
     }
 
@@ -16211,9 +16761,10 @@ readline.emitKeypressEvents(process.stdin);
 
 if (process.stdin.isTTY) {
   process.stdin.setRawMode(true);
-  process.stdout.write(`${ENABLE_BRACKETED_PASTE}${ENABLE_FOCUS_REPORTING}`);
+  process.stdout.write(`${ENABLE_BRACKETED_PASTE}${ENABLE_FOCUS_REPORTING}${ENABLE_KEYBOARD_PROTOCOL}`);
   bracketedPasteModeEnabled = true;
   focusReportingEnabled = true;
+  keyboardProtocolModeEnabled = true;
   setMouseTrackingEnabled(APP_MOUSE_TRACKING_ENABLED);
 }
 
@@ -16237,6 +16788,8 @@ process.stdin.on("data", (rawChunk) => {
     closeSessionsBuffer();
   } else if (activeBuffer === "providers" && chunk === "\u001b") {
     closeProvidersBuffer();
+  } else if (activeBuffer === "settings" && chunk === "\u001b") {
+    closeSettingsBuffer();
   } else if (activeBuffer === "mcp" && chunk === "\u001b") {
     closeMcpBuffer();
   } else if (activeBuffer === "loops" && chunk === "\u001b") {
@@ -16294,6 +16847,7 @@ process.stdin.on("data", (rawChunk) => {
 });
 
 process.stdin.on("keypress", async (str, key) => {
+  key = normalizeKeyboardProtocolKey(key);
   const seq = typeof key?.sequence === "string" ? key.sequence : "";
   const focusSequence = seq || (typeof str === "string" ? str : "");
   if (focusSequence === "\u001b[I" || focusSequence === "\u001b[O") {
@@ -16797,6 +17351,62 @@ process.stdin.on("keypress", async (str, key) => {
     return;
   }
 
+  if (activeBuffer === "settings") {
+    if (key?.ctrl || settingsBusy) return;
+    if (key?.name === "escape" || key?.sequence === "\u001b" || str === "\u001b") {
+      closeSettingsBuffer();
+      return;
+    }
+    if (key?.name === "up" || key?.name === "down") {
+      const settings = getFilteredRuntimeSettings();
+      settingsSelected = key.name === "up"
+        ? Math.max(0, settingsSelected - 1)
+        : Math.min(Math.max(0, settings.length - 1), settingsSelected + 1);
+      updateSettingsSelectionState();
+      settingsMessage = "";
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+    if (key?.name === "backspace") {
+      if (settingsSearch.length > 0) {
+        settingsSearch = settingsSearch.slice(0, -1);
+        settingsSelected = 0;
+        settingsScroll = 0;
+        settingsMessage = "";
+        updateSettingsSelectionState();
+      }
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+    if (
+      key?.name === "left" ||
+      key?.name === "right" ||
+      key?.sequence === "\r" ||
+      key?.name === "return" ||
+      key?.name === "enter"
+    ) {
+      await cycleSelectedRuntimeSetting(key?.name === "left" ? -1 : 1);
+      updateSettingsSelectionState();
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+    if (!key?.meta && str && !str.startsWith("\u001b")) {
+      if (shouldBlockPastedInput(str)) return;
+      settingsSearch += str;
+      settingsSelected = 0;
+      settingsScroll = 0;
+      settingsMessage = "";
+      updateSettingsSelectionState();
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+    return;
+  }
+
   if (activeBuffer === "providers") {
     if (key?.ctrl) {
       return;
@@ -17121,16 +17731,7 @@ process.stdin.on("keypress", async (str, key) => {
     return;
   }
 
-  const isCtrlJ =
-    (key?.ctrl && key?.name === "j") ||
-    key?.name === "linefeed" ||
-    key?.sequence === "\n" ||
-    str === "\n";
-  const isCtrlEnter =
-    (key?.ctrl && (key?.name === "enter" || key?.name === "return")) ||
-    key?.sequence === "\u001b[13;5u" ||
-    key?.sequence === "\u001b[27;5;13~";
-  if (isCtrlJ || isCtrlEnter) {
+  if (isInputNewlineKey(str, key)) {
     appendText("\n");
     scheduleInputRender(menuWasVisible, noCommandsWasVisible);
     return;
@@ -17159,7 +17760,9 @@ process.stdin.on("keypress", async (str, key) => {
   }
 
   if (key?.name === "up" || key?.name === "down") {
-    const changed = browseSubmittedInputHistory(key.name === "up" ? -1 : 1);
+    const direction = key.name === "up" ? -1 : 1;
+    const changed =
+      moveInputCursorVertically(direction) || browseSubmittedInputHistory(direction);
     if (changed) {
       scheduleInputRender(menuWasVisible, noCommandsWasVisible);
     }

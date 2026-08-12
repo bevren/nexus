@@ -1,15 +1,52 @@
 {
-  "name": "nexus",
+  "name": "@bevren/nexus",
   "version": "1.0.0",
-  "description": "",
+  "description": "Terminal coding agent with persistent tools, skills, MCP, and kernels",
   "license": "ISC",
-  "author": "",
+  "author": "duxx",
   "type": "commonjs",
   "main": "index.js",
+  "bin": {
+    "nexus": "bin/nexus.js"
+  },
+  "files": [
+    "bin/",
+    "index.js",
+    "tools.py",
+    "kernel.py",
+    "harness.py",
+    "skills_deps.py",
+    "skills/",
+    "!skills/**/__pycache__/",
+    "!skills/**/*.py[cod]"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bevren/nexus.git"
+  },
+  "homepage": "https://github.com/bevren/nexus#readme",
+  "bugs": {
+    "url": "https://github.com/bevren/nexus/issues"
+  },
+  "keywords": [
+    "ai",
+    "coding-agent",
+    "terminal",
+    "tui",
+    "mcp"
+  ],
+  "preferGlobal": true,
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "start": "node index.js",
     "test": "node index.js --self-test-append && node index.js --self-test-format && node index.js --self-test-execute && node index.js --self-test-background && node --check index.js",
-    "build": "esbuild index.js --bundle --platform=node --format=cjs --outfile=dist/bundle.js && node --experimental-sea-config sea-config.json && node -e \"require('fs').copyFileSync(process.execPath,'nexus.exe')\" && postject nexus.exe NODE_SEA_BLOB sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 && python -m PyInstaller --noconfirm --distpath dist tools_launcher.spec && copy /Y dist\\tools.exe tools.exe"
+    "build": "esbuild index.js --bundle --platform=node --format=cjs --outfile=dist/bundle.js && node --experimental-sea-config sea-config.json && node -e \"require('fs').copyFileSync(process.execPath,'nexus.exe')\" && postject nexus.exe NODE_SEA_BLOB sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 && python -m PyInstaller --noconfirm --distpath dist tools_launcher.spec && copy /Y dist\\tools.exe tools.exe",
+    "prepublishOnly": "npm test"
   },
   "dependencies": {
     "openai": "^6.25.0",
