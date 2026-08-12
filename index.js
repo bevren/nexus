@@ -26,6 +26,9 @@ const BLUE_COLOR = "\u001b[94m";
 const TOKEN_COLOR = "\u001b[94m";
 const GREEN_COLOR = "\u001b[92m";
 const RED_COLOR = "\u001b[91m";
+const WHITE_COLOR = "\u001b[97m";
+const BOLD_WHITE = "\u001b[1m\u001b[97m";
+const VSCODE_BLUE_COLOR = "\u001b[38;2;86;156;214m";
 const CODE_BLOCK_BG_COLOR = "\u001b[48;5;236m";
 const CODE_BLOCK_FG_COLOR = "\u001b[38;5;252m";
 const CODE_BLOCK_KEYWORD_COLOR = "\u001b[38;5;81m";
@@ -443,6 +446,8 @@ const BACKGROUND_SHELL_TIMEOUT_MS = 10 * 60 * 1000;
 const EXECUTE_LIVE_MAX_OUTPUT_CHARS = 8 * 1024;
 const EXECUTE_LIVE_MAX_LINES = 40;
 const EXECUTE_LIVE_REFRESH_MS = 100;
+const QUEUED_BUSY_MAX_VISIBLE = 3;
+const QUEUED_BUSY_MAX_PREVIEW_CHARS = 160;
 let mcpBridgeReadyPromise = null;
 let mcpBridgeState = "";
 let mcpBridgeError = "";
@@ -7081,14 +7086,9 @@ function queueAssistantReply(modelId, options = {}) {
       );
     })
     .finally(() => {
-      const hadPending = pendingAssistantRequests > 0;
-      pendingAssistantRequests = Math.max(0, pendingAssistantRequests - 1);
-      if (hadPending && pendingAssistantRequests === 0) {
-        thinkingStartedAt = 0;
-        startPendingAnswerReveals();
-      }
+      const { hadPending, becameIdle } = completeAssistantRequestLifecycle();
       updateThinkingAnimationState();
-      if (hadPending && pendingAssistantRequests === 0) {
+      if (becameIdle) {
         markDirty();
         renderFrame(false);
         // Turn completed: fire Notification then Stop hooks. Stop hooks run
@@ -7131,6 +7131,24 @@ function queueAssistantReply(modelId, options = {}) {
           });
       }
     });
+}
+
+function completeAssistantRequestLifecycle() {
+  const hadPending = pendingAssistantRequests > 0;
+  pendingAssistantRequests = Math.max(0, pendingAssistantRequests - 1);
+
+  // A queued request keeps the global Thinking status active, but the answer
+  // from the turn that just completed must still begin fading immediately.
+  // Otherwise it remains on the held black frame until the whole queue drains.
+  if (hadPending) {
+    startPendingAnswerReveals();
+  }
+
+  const becameIdle = hadPending && pendingAssistantRequests === 0;
+  if (becameIdle) {
+    thinkingStartedAt = 0;
+  }
+  return { hadPending, becameIdle };
 }
 
 function getSolveSessionFilePath(id) {
@@ -10700,9 +10718,17 @@ function styleEditedToolHeaderLine(visibleText, toolColor) {
   const plusCount = match[3];
   const minusCount = match[4];
   const bulletColor = toolColor || GREEN_COLOR;
-  const BOLD_WHITE = "\u001b[1m\u001b[97m";
-
   return `${bulletColor}${bullet}${RESET_COLOR} ${BOLD_WHITE}Edited${RESET_COLOR} ${filePath} (${GREEN_COLOR}+${plusCount}${RESET_COLOR} ${RED_COLOR}-${minusCount}${RESET_COLOR})`;
+}
+
+function styleToolExecutionHeaderLine(visibleText, toolColor) {
+  const match = String(visibleText ?? "").match(/^(\S)\s+(Ran|Running)\s+(\S+)(.*)$/);
+  if (!match) {
+    return null;
+  }
+
+  const bulletColor = toolColor || GREEN_COLOR;
+  return `${bulletColor}${match[1]}${RESET_COLOR} ${BOLD_WHITE}${match[2]}${RESET_COLOR} ${VSCODE_BLUE_COLOR}${match[3]}${RESET_COLOR}${match[4]}`;
 }
 
 function isUnifiedDiffText(text) {
@@ -10989,8 +11015,12 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
           const color = i === 0 && w === 0 ? toolColor : PLACEHOLDER_COLOR;
           const editedHeaderStyled =
             i === 0 && w === 0 ? styleEditedToolHeaderLine(visibleText, toolColor) : null;
+          const executionHeaderStyled =
+            i === 0 && w === 0 ? styleToolExecutionHeaderLine(visibleText, toolColor) : null;
           if (editedHeaderStyled) {
             line = editedHeaderStyled;
+          } else if (executionHeaderStyled) {
+            line = executionHeaderStyled;
           } else if (color) {
             line = `${color}${visibleText}${RESET_COLOR}`;
           }
@@ -11032,7 +11062,7 @@ function getMainFrameTopForCurrentLayout(rows, cols) {
   const statusRows = getMainStatusRowCount();
   const statusVisible = statusRows > 0;
   const statusChatGapRows = statusVisible ? STATUS_CHAT_GAP : 0;
-  const statusInputGapRows = statusVisible ? STATUS_INPUT_GAP : 0;
+  const statusInputGapRows = statusVisible ? getMainStatusInputGapRows(cols) : 0;
   if (APPEND_CHAT_TO_SCROLLBACK) {
     const neededReservedRows = getAppendReservedBottomRowsFromLayout(
       inputVisualLines.length,
@@ -11076,7 +11106,9 @@ function getAppendReservedBottomRowsFromLayout(inputRowsCount, menuHeight, inclu
   const statusRows = includeStatus ? getMainStatusRowCount() : 0;
   const statusVisible = statusRows > 0;
   const statusChatGapRows = statusVisible ? STATUS_CHAT_GAP : 0;
-  const statusInputGapRows = statusVisible ? STATUS_INPUT_GAP : 0;
+  const statusInputGapRows = statusVisible
+    ? getMainStatusInputGapRows(process.stdout.columns || 80)
+    : 0;
   return Math.max(
     1,
     chatGapRows +
@@ -11102,9 +11134,13 @@ function isAssistantThinking() {
 function addQueuedBusyPrompt(text) {
   const normalized = String(text || "").replace(/\s+/g, " ").trim();
   if (!normalized) return null;
+  const characters = Array.from(normalized);
+  const preview = characters.length > QUEUED_BUSY_MAX_PREVIEW_CHARS
+    ? `${characters.slice(0, QUEUED_BUSY_MAX_PREVIEW_CHARS - 3).join("")}...`
+    : normalized;
   const entry = {
     id: ++queuedBusyPromptSequence,
-    text: normalized,
+    text: preview,
     sessionUid: currentSessionUid,
   };
   queuedBusyPrompts.push(entry);
@@ -11123,13 +11159,24 @@ function getQueuedBusyPromptStatusLines(cols) {
     (entry) => entry.sessionUid === currentSessionUid
   );
   if (sessionPrompts.length === 0) return [];
-  const width = Math.max(20, Number(cols) || process.stdout.columns || 80);
+  const terminalWidth = Math.max(
+    1,
+    Math.floor(Number(cols) || process.stdout.columns || 80)
+  );
+  // Leave the terminal's final cell unused so writing a full-width preview
+  // cannot trigger automatic wrapping and shift the composer layout.
+  const width = Math.max(
+    0,
+    Math.min(QUEUED_BUSY_MAX_PREVIEW_CHARS, terminalWidth - 1)
+  );
   const clip = (value) => {
-    const text = String(value || "");
-    if (text.length <= width) return text;
-    return `${text.slice(0, Math.max(1, width - 3))}...`;
+    const characters = Array.from(String(value || ""));
+    if (width === 0) return "";
+    if (characters.length <= width) return characters.join("");
+    if (width <= 3) return ".".repeat(width);
+    return `${characters.slice(0, width - 3).join("")}...`;
   };
-  const visible = sessionPrompts.slice(0, 3);
+  const visible = sessionPrompts.slice(0, QUEUED_BUSY_MAX_VISIBLE);
   const lines = [clip("• Queued for the next turn")];
   for (const entry of visible) {
     lines.push(clip(`  ↳ ${entry.text}`));
@@ -11140,11 +11187,26 @@ function getQueuedBusyPromptStatusLines(cols) {
   return lines;
 }
 
+function styleQueuedBusyHeaderLine(line) {
+  const text = String(line || "");
+  const queuedIndex = text.indexOf("Queued");
+  if (queuedIndex < 0) {
+    return `${WHITE_COLOR}${text}${RESET_COLOR}`;
+  }
+  const prefix = text.slice(0, queuedIndex);
+  const suffix = text.slice(queuedIndex + "Queued".length);
+  return `${WHITE_COLOR}${prefix}${RESET_COLOR}${BOLD_WHITE}Queued${RESET_COLOR}${suffix}`;
+}
+
 function getMainStatusRowCount() {
   const baseVisible = isAssistantThinking() || isMcpStartupStatusVisible() || solveStartupActive;
   if (!baseVisible) return 0;
   const queuedRows = getQueuedBusyPromptStatusLines(process.stdout.columns || 80).length;
   return STATUS_BAR_ROWS + (queuedRows > 0 ? 1 + queuedRows : 0);
+}
+
+function getMainStatusInputGapRows(cols = process.stdout.columns || 80) {
+  return getQueuedBusyPromptStatusLines(cols).length > 0 ? 0 : STATUS_INPUT_GAP;
 }
 
 function isMcpStartupStatusVisible() {
@@ -11232,13 +11294,17 @@ function emitStopNotice() {
   renderFrame(true);
 }
 
-function getViewportChatInputGapRows(statusVisible, statusRows = STATUS_BAR_ROWS) {
+function getViewportChatInputGapRows(
+  statusVisible,
+  statusRows = STATUS_BAR_ROWS,
+  cols = process.stdout.columns || 80
+) {
   if (!statusVisible) {
     return CHAT_INPUT_GAP_NO_STATUS;
   }
 
   // Reserve the status bar block so chat content shifts upward while thinking.
-  return CHAT_INPUT_GAP + STATUS_CHAT_GAP + statusRows + STATUS_INPUT_GAP;
+  return CHAT_INPUT_GAP + STATUS_CHAT_GAP + statusRows + getMainStatusInputGapRows(cols);
 }
 
 function getStatusBarText() {
@@ -11269,9 +11335,9 @@ function getStatusBarText() {
   if (activeToolRun) {
     const label = activeToolRun.label || "code execution";
     const elapsed = Math.floor((Date.now() - activeToolRun.startedAt) / 1000);
-    const frame = SPINNER_FRAMES[spinnerFrameIndex % SPINNER_FRAMES.length];
     if (!activeToolRun.done) {
-      return `${frame} ${SHINE_BRIGHT}Running:${SHINE_RESET} ${label} (${elapsed}s)`;
+      const symbol = spinnerFrameIndex % 2 === 0 ? "\u2022" : "\u25e6";
+      return styleRunningToolStatus(symbol, label, elapsed);
     }
     const mark = activeToolRun.ok ? "\u2713" : "\u2717";
     return `${mark} ${label} (${elapsed}s)`;
@@ -11282,6 +11348,11 @@ function getStatusBarText() {
   const symbol = thinkingFrameIndex % 2 === 0 ? "\u2022" : "\u25e6";
   const thinkingText = `${THINKING_FRAMES[thinkingFrameIndex % THINKING_FRAMES.length]} (${elapsedSeconds}s)`;
   return `${symbol} ${applyShineEffect(thinkingText, shineFrameIndex, 5)}`;
+}
+
+function styleRunningToolStatus(symbol, command, elapsedSeconds) {
+  const highlightedCommand = highlightPythonInline(command);
+  return `${symbol} ${BOLD_WHITE}Running${RESET_COLOR} ${highlightedCommand}${PLACEHOLDER_COLOR} (${elapsedSeconds}s)${RESET_COLOR}`;
 }
 
 const SHINE_RESET = "\u001b[0m";
@@ -11673,6 +11744,12 @@ function highlightPythonCodeLine(line, isFenceLine = false) {
   }
 
   return `${CODE_BLOCK_BG_COLOR}${CODE_BLOCK_FG_COLOR}${out}${RESET_COLOR}`;
+}
+
+function highlightPythonInline(line) {
+  return highlightPythonCodeLine(String(line ?? ""))
+    .split(CODE_BLOCK_BG_COLOR).join("")
+    .split(CODE_BLOCK_FG_COLOR).join(PLACEHOLDER_COLOR);
 }
 
 function buildChatVisualLines(cols, sourceEntries = messages) {
@@ -12834,8 +12911,8 @@ function renderFrame(forceChatRefresh = false) {
   const statusRows = statusLines.length;
   const statusVisible = statusRows > 0;
   const statusChatGapRows = statusVisible ? STATUS_CHAT_GAP : 0;
-  const statusInputGapRows = statusVisible ? STATUS_INPUT_GAP : 0;
-  const chatInputGapRows = getViewportChatInputGapRows(statusVisible, statusRows);
+  const statusInputGapRows = statusVisible ? getMainStatusInputGapRows(cols) : 0;
+  const chatInputGapRows = getViewportChatInputGapRows(statusVisible, statusRows, cols);
   const footerBlockHeight = menuHeight > 0 ? 0 : MAIN_FOOTER_GAP + footerHeight;
   const menuBlockHeight = footerBlockHeight + (menuHeight > 0 ? MENU_INPUT_GAP + menuHeight : 0);
   const neededReservedRows = getAppendReservedBottomRowsFromLayout(
@@ -13069,8 +13146,15 @@ function renderFrame(forceChatRefresh = false) {
       rowMap.set(statusBlockTop + i, { type: "plain", text: "" });
     }
     for (let i = 0; i < statusRows; i += 1) {
+      const rowType = i === 0
+        ? "status"
+        : i === 1 && queuedStatusLines.length > 0
+          ? "plain"
+          : queuedStatusLines.length > 0 && i === 2
+            ? "queuedHeader"
+            : "muted";
       rowMap.set(statusTop + i, {
-        type: i === 0 ? "status" : i === 1 && queuedStatusLines.length > 0 ? "plain" : "muted",
+        type: rowType,
         text: statusLines[i] || "",
       });
     }
@@ -13109,6 +13193,8 @@ function renderFrame(forceChatRefresh = false) {
       } else {
         writeLine(y, "", cols);
       }
+    } else if (row.type === "queuedHeader") {
+      writeStyledLine(y, row.text, styleQueuedBusyHeaderLine(row.text), cols);
     } else if (row.type === "placeholder") {
       writePlaceholderLine(y, row.text, cols);
     } else {
@@ -13927,14 +14013,28 @@ function runFormatSelfTest() {
     pendingAssistantRequests = Math.max(1, pendingAssistantRequests);
     const queuedPreview = addQueuedBusyPrompt("queued preview message");
     const queuedStatusLines = getQueuedBusyPromptStatusLines(80);
+    const styledQueuedHeader = styleQueuedBusyHeaderLine(queuedStatusLines[0]);
+    const queuedInputGapRows = getMainStatusInputGapRows(80);
     removeQueuedBusyPrompt(queuedPreview);
+    const longQueuedPreview = addQueuedBusyPrompt("x".repeat(500));
+    const narrowQueuedStatusLines = getQueuedBusyPromptStatusLines(20);
+    removeQueuedBusyPrompt(longQueuedPreview);
+    const ordinaryInputGapRows = getMainStatusInputGapRows(80);
     pendingAssistantRequests = savedPendingAssistantRequests;
     if (
       queuedStatusLines.length !== 2 ||
       !queuedStatusLines[0].includes("Queued for the next turn") ||
-      !queuedStatusLines[1].includes("queued preview message")
+      !queuedStatusLines[1].includes("queued preview message") ||
+      queuedInputGapRows !== 0 ||
+      ordinaryInputGapRows !== STATUS_INPUT_GAP ||
+      stripAnsiSgr(styledQueuedHeader) !== queuedStatusLines[0] ||
+      !styledQueuedHeader.startsWith(WHITE_COLOR) ||
+      !styledQueuedHeader.includes(`${BOLD_WHITE}Queued${RESET_COLOR}`) ||
+      longQueuedPreview?.text.length > QUEUED_BUSY_MAX_PREVIEW_CHARS ||
+      !narrowQueuedStatusLines.some((line) => line.endsWith("...")) ||
+      narrowQueuedStatusLines.some((line) => Array.from(line).length > 19)
     ) {
-      out(`FORMAT_FAIL: queued busy prompt status is incorrect: ${JSON.stringify(queuedStatusLines)}\n`);
+      out(`FORMAT_FAIL: queued busy prompt status or spacing is incorrect: ${JSON.stringify(queuedStatusLines)}\n`);
       return 1;
     }
     if (
@@ -14063,6 +14163,32 @@ function runFormatSelfTest() {
     const plainToolJoined = plainToolLines.join("\n");
     if (plainToolJoined.includes(DIFF_REMOVE_BG_COLOR) || plainToolJoined.includes(DIFF_ADD_BG_COLOR)) {
       out("FORMAT_FAIL: plain tool text should not get diff background");
+      return 1;
+    }
+
+    const successfulToolHeader = buildTranscriptLinesForEntry(
+      { role: "tool", name: "code_execution", toolOk: true, content: "ok" },
+      80
+    )[0];
+    const failedToolHeader = buildTranscriptLinesForEntry(
+      { role: "tool", name: "code_execution", toolOk: false, content: "failed" },
+      80
+    )[0];
+    if (
+      !successfulToolHeader.startsWith(`${GREEN_COLOR}\u2022${RESET_COLOR} ${BOLD_WHITE}Ran${RESET_COLOR} ${VSCODE_BLUE_COLOR}code_execution${RESET_COLOR}`) ||
+      !failedToolHeader.startsWith(`${RED_COLOR}\u2022${RESET_COLOR} ${BOLD_WHITE}Ran${RESET_COLOR} ${VSCODE_BLUE_COLOR}code_execution${RESET_COLOR}`)
+    ) {
+      out("FORMAT_FAIL: completed execution header colors are incorrect\n");
+      return 1;
+    }
+
+    const runningStatus = styleRunningToolStatus("\u2022", "run_shell('python loop.py')", 3);
+    if (
+      stripAnsiSgr(runningStatus) !== "\u2022 Running run_shell('python loop.py') (3s)" ||
+      !runningStatus.includes(BOLD_WHITE) ||
+      !runningStatus.includes(CODE_BLOCK_STRING_COLOR)
+    ) {
+      out("FORMAT_FAIL: running execution status must use an animated dot, bold label, and highlighted command\n");
       return 1;
     }
 
@@ -14390,6 +14516,40 @@ function runFormatSelfTest() {
       revealLaterColor <= revealStartColor
     ) {
       out("FORMAT_FAIL: answer reveal must fade from black toward normal foreground");
+      return 1;
+    }
+
+    const savedPendingForQueuedReveal = pendingAssistantRequests;
+    const savedThinkingStartedAt = thinkingStartedAt;
+    const savedPendingRevealEntries = [...pendingAnswerRevealEntries];
+    pendingAnswerRevealEntries.clear();
+    const queuedTurnAnswer = {
+      role: "assistant",
+      content: "queued turn fade test",
+      revealUntil: Number.POSITIVE_INFINITY,
+    };
+    pendingAnswerRevealEntries.add(queuedTurnAnswer);
+    pendingAssistantRequests = 2;
+    const queuedTurnLifecycle = completeAssistantRequestLifecycle();
+    const queuedTurnFadeStarted =
+      queuedTurnLifecycle.hadPending === true &&
+      queuedTurnLifecycle.becameIdle === false &&
+      pendingAssistantRequests === 1 &&
+      Number.isFinite(queuedTurnAnswer.revealUntil) &&
+      queuedTurnAnswer.revealUntil > Date.now();
+    queuedTurnAnswer.revealUntil = 0;
+    if (answerRevealTimer) {
+      clearInterval(answerRevealTimer);
+      answerRevealTimer = null;
+    }
+    pendingAnswerRevealEntries.clear();
+    for (const entry of savedPendingRevealEntries) {
+      pendingAnswerRevealEntries.add(entry);
+    }
+    pendingAssistantRequests = savedPendingForQueuedReveal;
+    thinkingStartedAt = savedThinkingStartedAt;
+    if (!queuedTurnFadeStarted) {
+      out("FORMAT_FAIL: a completed answer must begin fading before the queued turn starts\n");
       return 1;
     }
 
