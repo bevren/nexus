@@ -6,8 +6,8 @@ const fs = require("fs/promises");
 const fsSync = require("fs");
 const path = require("path");
 const os = require("os");
-const { execFile, spawnSync } = require("child_process");
-const { randomUUID } = require("crypto");
+const { execFile, spawn, spawnSync } = require("child_process");
+const { createHash, randomUUID } = require("crypto");
 
 let OpenAI = null;
 try {
@@ -130,7 +130,6 @@ const NEXUS_DIR = path.join(HOME_DIR, ".nexus");
 const SESSIONS_DIR = path.join(NEXUS_DIR, "sessions");
 const NEXUS_CONFIG_FILE = path.join(NEXUS_DIR, "config.json");
 const NEXUS_PROVIDERS_FILE = path.join(NEXUS_DIR, "providers.json");
-const NEXUS_MEMORY_FILE = path.join(NEXUS_DIR, "memory.jsonl");
 const DEFAULT_PROVIDERS = [
   {
     name: "Open Router",
@@ -157,7 +156,6 @@ const COMMANDS = [
   { name: "/set", description: "set runtime values: /set model <name> | /set thinking <on|off>" },
   { name: "/resume", description: "show session list and resume selected chat" },
   { name: "/clear", description: "clear chat window and delete current session history file" },
-  { name: "/clear-memory", description: "clear all saved memory and memory keywords" },
   { name: "/permissions", description: "choose what Codex is allowed to do" },
   {
     name: "/sandbox-add-read-dir",
@@ -170,6 +168,7 @@ const COMMANDS = [
   { name: "/new", description: "start a new chat with a new uid" },
   { name: "/mcp", description: "manage MCP servers: start, stop, and reload configuration" },
   { name: "/compact", description: "manually compact context: /compact [optional instruction]" },
+  { name: "/cache", description: "show prompt fingerprint and provider cache-token telemetry" },
   { name: "/loop", description: "usage: /loop <interval> <prompt>" },
   { name: "/loops", description: "list or cancel scheduled loops: /loops | /loops cancel <id>" },
   { name: "/hooks", description: "show configured lifecycle hooks (read-only)" },
@@ -177,6 +176,7 @@ const COMMANDS = [
   { name: "/kernels", description: "view, resume, restart, or delete sessions created by /solve" },
 ];
 const PLAN_MODE_ALLOWED_TOOL_NAMES = new Set([
+  "tool_search",
   "create_plan",
   "update_plan",
   "get_current_plan",
@@ -193,21 +193,62 @@ const PLAN_MODE_ALLOWED_TOOL_NAMES = new Set([
   "read_file_summary",
   "fetch_url",
   "list_skills",
+  "get_skill",
+  "harness_overview",
   "web_search",
-  "mcp_list",
-  "list_subagents",
+]);
+const SYSTEM_PROMPT_VISIBLE_TOOL_NAMES = new Set([
+  "tool_search",
+  "mcp_search",
+  "list_skills",
+  "get_skill",
+  "manage_skill",
+  "harness_overview",
+  "harness_memory",
+  "harness_prompt_note",
+  "harness_subagent",
+  "record_refinement",
+  "refine_reflection",
+  "set_reminder",
+  "create_plan",
+  "update_plan",
+  "get_current_plan",
+  "get_current_working_directory",
+  "get_file_list",
+  "get_file_content",
+  "find_files",
+  "list_directory",
+  "path_exists",
+  "find_in_file",
+  "write_file",
+  "replace_in_file",
+  "run_shell",
+  "get_git_status",
+  "get_git_diff",
+  "web_search",
+  "fetch_url",
 ]);
 const FALLBACK_TOOL_DESCRIPTIONS = {
-  insert_memory:
-    "insert_memory(memory: str, keyword: str|list[str]) -> dict: Save persistent memory with one or more keywords. Preference statements (like/dislike/prefer/love/hate) are auto-upserted by topic to prevent conflicting duplicates.",
-  retrieve_memory:
-    "retrieve_memory(query: str = '', use_regex: bool = False, case_sensitive: bool = False, regex_flags: str = '', keywords: str|list[str]|None = None, max_results: int = 20) -> list[dict]: Retrieve memories by string/regex and/or keyword filters.",
-  memory_keywords:
-    "memory_keywords() -> list[dict]: List all inserted memory keywords with usage counts.",
-  remove_memory:
-    "remove_memory(id: str) -> dict: Remove one memory record by id.",
-  update_memory:
-    "update_memory(id: str, memory: str|None = None, keyword: str|list[str]|None = None) -> dict: Update one memory record by id (memory text and/or keywords).",
+  tool_search:
+    "tool_search(query: str, limit: int = 5) -> dict: Search deferred built-in helper names and descriptions. Returns only the most relevant helper signatures; call the discovered helper in a later execute block.",
+  harness_overview:
+    "harness_overview() -> dict: Continual harness overview: memories, skills, subagent templates, prompt notes, refinements.",
+  harness_memory:
+    "harness_memory(key: str, content: str = '', delete: bool = False) -> dict: Create, update, or delete a persistent harness memory by stable key.",
+  manage_skill:
+    "manage_skill(name: str, description: str = '', body: str = '', delete: bool = False) -> dict: Create, update, or delete a personal skill under ~/.nexus/skills. Workspace and bundled skills are read-only.",
+  harness_prompt_note:
+    "harness_prompt_note(name: str, content: str = '', delete: bool = False) -> dict: Create, update, or delete persistent reusable prompt guidance.",
+  harness_subagent:
+    "harness_subagent(name: str, prompt: str = '', model: str = '', system: str = '', delete: bool = False) -> dict: Create, update, or delete a reusable subagent template.",
+  record_refinement:
+    "record_refinement(summary: str, evidence: str = '') -> dict: Persist a small reusable pattern with supporting evidence.",
+  refine_reflection:
+    "refine_reflection(auto: bool = True) -> dict: Synthesize a refinement from recent subagent results and prompt notes.",
+  web_search:
+    "web_search(query: str, max_results: int = 5) -> dict: Search the web and return relevant titles, snippets, and URLs.",
+  fetch_url:
+    "fetch_url(url: str, max_chars: int = 20000) -> dict: Fetch a URL and extract visible text content. Returns {url, title, text, truncated, error}.",
   exclude_history_messages:
     "exclude_history_messages(latest_n: int = 0, role: str = '', query: str = '', use_regex: bool = False, case_sensitive: bool = False, regex_flags: str = '', max_matches: int = 200, include_system: bool = False) -> dict: Exclude matching existing chat messages from future LLM requests.",
   create_plan:
@@ -243,7 +284,7 @@ const FALLBACK_TOOL_DESCRIPTIONS = {
   replace_in_file:
     "replace_in_file(path: str, old: str, new: str, count: int = -1, use_regex: bool = False, regex_flags: str = '') -> dict: Replace text in a file (literal or regex).",
   run_shell:
-    "run_shell(command: str, timeout: int|float = 10) -> dict: Run shell command with timeout seconds.",
+    "run_shell(command: str, timeout: int|float = 10, background: bool = False) -> dict: Run synchronously with a process-tree timeout. With background=True, use a fixed 600-second process-tree timeout, return {ok, job_id, pid, status, timeout} immediately, and add completion to chat later.",
   android_build:
     "android_build(project_path: str = 'android-smoke', deploy: bool = True, timeout: int|float = 300) -> dict: Build an Android project locally in Termux. With deploy=true, install the APK over paired on-phone ADB, stop the old app, and launch the updated activity.",
   get_git_status:
@@ -395,6 +436,13 @@ let mcpCatalog = [];
 let mcpCatalogDocumentFrequency = new Map();
 let mcpCatalogAverageDocumentLength = 0;
 let mcpBridgeReadyResolve = null;
+const backgroundShellJobs = new Map();
+const backgroundShellProcesses = new Set();
+const BACKGROUND_SHELL_MAX_OUTPUT_CHARS = 64 * 1024;
+const BACKGROUND_SHELL_TIMEOUT_MS = 10 * 60 * 1000;
+const EXECUTE_LIVE_MAX_OUTPUT_CHARS = 8 * 1024;
+const EXECUTE_LIVE_MAX_LINES = 40;
+const EXECUTE_LIVE_REFRESH_MS = 100;
 let mcpBridgeReadyPromise = null;
 let mcpBridgeState = "";
 let mcpBridgeError = "";
@@ -413,8 +461,11 @@ let spinnerAnimationTimer = null;
 let thinkingStartedAt = 0;
 let activeToolRun = null; // { label, startedAt, done, ok }
 let stopRequested = false;
+let queuedBusyPromptSequence = 0;
+const queuedBusyPrompts = [];
 let pendingAssistantMessageIndex = -1;
 let contextLeftPercentByModel = {};
+let cacheTelemetryByModel = {};
 let currentSessionUid = createSessionUid();
 let sessionFilePath = getSessionFilePath(currentSessionUid);
 let sessionInitPromise = null;
@@ -689,6 +740,8 @@ function updateContextBudgetFromCompletion(completion, modelId = selectedModel) 
   const timingsCacheN = Number(timings?.cache_n);
   const timingsPromptN = Number(timings?.prompt_n);
   const timingsPredictedN = Number(timings?.predicted_n);
+
+  updateCacheTelemetryFromCompletion(completion, modelId);
   const timingsContextTokens =
     (Number.isFinite(timingsCacheN) && timingsCacheN > 0 ? timingsCacheN : 0) +
     (Number.isFinite(timingsPromptN) && timingsPromptN > 0 ? timingsPromptN : 0) +
@@ -712,6 +765,91 @@ function updateContextBudgetFromCompletion(completion, modelId = selectedModel) 
     setContextLeftPercent(responseModelId, percentLeft);
   }
   ensureSystemMessageAtTop(modelId);
+}
+
+function getSystemPromptFingerprint() {
+  return createHash("sha256").update(String(systemPromptText || ""), "utf8").digest("hex").slice(0, 12);
+}
+
+function extractCacheTokenUsage(completion) {
+  const usage = completion?.usage && typeof completion.usage === "object" ? completion.usage : {};
+  const timings = completion?.timings && typeof completion.timings === "object" ? completion.timings : {};
+  const cachedCandidates = [
+    usage?.prompt_tokens_details?.cached_tokens,
+    usage?.input_tokens_details?.cached_tokens,
+    usage.cached_tokens,
+    usage.cache_read_input_tokens,
+    timings.cache_n,
+  ].map(Number);
+  const cachedTokens = cachedCandidates.find((value) => Number.isFinite(value) && value >= 0);
+  const normalizedPromptTokens = Number(usage.prompt_tokens);
+  const normalizedInputTokens = Number(usage.input_tokens);
+  const timingPromptTokens = Number(timings.prompt_n);
+  const timingCachedTokens = Number(timings.cache_n);
+  let promptTokens = null;
+  if (Number.isFinite(normalizedPromptTokens) && normalizedPromptTokens >= 0) {
+    promptTokens = normalizedPromptTokens;
+  } else if (Number.isFinite(normalizedInputTokens) && normalizedInputTokens >= 0) {
+    const cacheReadTokens = Number(usage.cache_read_input_tokens);
+    promptTokens = normalizedInputTokens + (Number.isFinite(cacheReadTokens) && cacheReadTokens > 0 ? cacheReadTokens : 0);
+  } else if (Number.isFinite(timingPromptTokens) && timingPromptTokens >= 0) {
+    promptTokens = timingPromptTokens + (Number.isFinite(timingCachedTokens) && timingCachedTokens > 0 ? timingCachedTokens : 0);
+  }
+  return {
+    promptTokens,
+    cachedTokens: Number.isFinite(cachedTokens) ? cachedTokens : null,
+  };
+}
+
+function updateCacheTelemetryFromCompletion(completion, modelId = selectedModel) {
+  const key = String(completion?.model || modelId || "").trim() || "unknown";
+  const usage = extractCacheTokenUsage(completion);
+  const fingerprint = getSystemPromptFingerprint();
+  const previous = cacheTelemetryByModel[key];
+  const promptTokens = usage.promptTokens;
+  const cachedTokens = usage.cachedTokens;
+  const cachePercent =
+    Number.isFinite(promptTokens) && promptTokens > 0 && Number.isFinite(cachedTokens)
+      ? Math.max(0, Math.min(100, Math.round((cachedTokens / promptTokens) * 100)))
+      : null;
+  cacheTelemetryByModel[key] = {
+    fingerprint,
+    promptTokens,
+    cachedTokens,
+    cachePercent,
+    prefixChanged: Boolean(previous?.fingerprint && previous.fingerprint !== fingerprint),
+    updatedAt: Date.now(),
+  };
+  if (key !== String(modelId || "").trim() && String(modelId || "").trim()) {
+    cacheTelemetryByModel[String(modelId).trim()] = cacheTelemetryByModel[key];
+  }
+}
+
+function getCacheTelemetry(modelId = selectedModel) {
+  return cacheTelemetryByModel[String(modelId || "").trim()] || null;
+}
+
+function formatCacheTelemetry(modelId = selectedModel) {
+  const telemetry = getCacheTelemetry(modelId);
+  const fingerprint = telemetry?.fingerprint || getSystemPromptFingerprint();
+  const lines = [
+    "Prompt cache telemetry",
+    `- System prompt fingerprint: ${fingerprint}`,
+    `- Prefix changed since previous response: ${telemetry?.prefixChanged ? "yes" : "no"}`,
+  ];
+  if (Number.isFinite(telemetry?.cachedTokens)) {
+    lines.push(`- Provider-reported cached input: ${telemetry.cachedTokens} tokens`);
+  } else {
+    lines.push("- Provider-reported cached input: unavailable");
+  }
+  if (Number.isFinite(telemetry?.promptTokens)) {
+    lines.push(`- Prompt input: ${telemetry.promptTokens} tokens`);
+  }
+  if (Number.isFinite(telemetry?.cachePercent)) {
+    lines.push(`- Cache hit ratio: ${telemetry.cachePercent}%`);
+  }
+  lines.push("- Note: identical fingerprints confirm a stable system prompt; cache reuse still depends on provider support and the complete request prefix.");
+  return lines.join("\n");
 }
 
 function normalizeReasoningDetails(value) {
@@ -812,7 +950,13 @@ function execFileAsync(file, args, options = {}) {
 }
 
 function getBundledPythonExe() {
-  // Prefer the tools.exe that sits NEXT TO this executable (works when sea.exe
+  // Source/development runs must execute the adjacent tools.py; otherwise a
+  // stale tools.exe from a previous package build silently hides helper edits.
+  const executableName = path.basename(process.execPath).toLowerCase();
+  if (executableName === "node" || executableName === "node.exe") {
+    return "";
+  }
+  // Prefer the tools.exe that sits NEXT TO this executable (works when nexus.exe
   // is launched from any cwd via PATH). __dirname resolves to the exe's folder
   // in SEA, process.execPath is the definitive path.
   const candidates = [
@@ -855,11 +999,111 @@ async function runPythonCommand(args, options = {}) {
   return execFileAsync("py", ["-3", ...args], mergedOptions);
 }
 
+function spawnPythonCommandStreaming(args, options = {}) {
+  const mergedOptions = { cwd: process.cwd(), windowsHide: true, ...options };
+  const timeoutMs = Number(mergedOptions.timeout);
+  const maxBuffer = Math.max(1024, Number(mergedOptions.maxBuffer) || 2 * 1024 * 1024);
+  const onStdout = typeof mergedOptions.onStdout === "function" ? mergedOptions.onStdout : null;
+  delete mergedOptions.timeout;
+  delete mergedOptions.maxBuffer;
+  delete mergedOptions.onStdout;
+
+  const bundledExe = getBundledPythonExe();
+  const candidates = bundledExe
+    ? [{ file: bundledExe, args }]
+    : [
+        { file: "python", args },
+        { file: "py", args: ["-3", ...args] },
+      ];
+
+  const runCandidate = (candidate) => new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(candidate.file, candidate.args, {
+        ...mergedOptions,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timer = null;
+    const finish = (error, code = null, signal = null) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (error) {
+        error.stdout = stdout;
+        error.stderr = stderr;
+        error.code = error.code || (signal ? String(signal) : code);
+        reject(error);
+      } else {
+        resolve({ stdout, stderr });
+      }
+    };
+    const append = (field, chunk) => {
+      const text = String(chunk ?? "");
+      if (field === "stdout") {
+        stdout += text;
+        onStdout?.(text);
+      } else {
+        stderr += text;
+      }
+      if (stdout.length + stderr.length > maxBuffer) {
+        const error = new Error(`Python output exceeded ${maxBuffer} bytes`);
+        error.code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+        try { child.kill("SIGKILL"); } catch {}
+        finish(error);
+      }
+    };
+    child.stdout?.on("data", (chunk) => append("stdout", chunk));
+    child.stderr?.on("data", (chunk) => append("stderr", chunk));
+    child.once("error", (error) => finish(error));
+    child.once("close", (code, signal) => {
+      if (code === 0) {
+        finish(null, code, signal);
+      } else {
+        const error = new Error(`Python exited with code ${code}`);
+        error.code = code;
+        error.signal = signal;
+        finish(error, code, signal);
+      }
+    });
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+      timer = setTimeout(() => {
+        const error = new Error(`Python execution timed out after ${Math.round(timeoutMs / 1000)}s`);
+        error.code = "ETIMEDOUT";
+        error.killed = true;
+        try { child.kill("SIGKILL"); } catch {}
+        finish(error);
+      }, timeoutMs);
+      timer.unref?.();
+    }
+  });
+
+  return (async () => {
+    let lastError = null;
+    for (const candidate of candidates) {
+      try {
+        return await runCandidate(candidate);
+      } catch (error) {
+        lastError = error;
+        if (error?.code !== "ENOENT") throw error;
+      }
+    }
+    throw lastError || new Error("Python executable not found");
+  })();
+}
+
 function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
   const planModeActive = (runtime?.collaborationMode || collaborationMode) === "plan";
-  const entries = Object.entries(descriptions || {}).filter(
-    ([name]) => !planModeActive || PLAN_MODE_ALLOWED_TOOL_NAMES.has(name)
-  );
+  const entries = Object.entries(descriptions || {}).filter(([name]) => {
+    if (!SYSTEM_PROMPT_VISIBLE_TOOL_NAMES.has(name)) return false;
+    return !planModeActive || PLAN_MODE_ALLOWED_TOOL_NAMES.has(name);
+  });
   const lines = entries
     .sort((a, b) => a[0].localeCompare(b[0]))
     .map(([name, description]) => `- ${name}: ${description}`);
@@ -870,6 +1114,11 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
       "",
       "CONTEXT USE (MUST FOLLOW):",
       "- Avoid repetition and re-reading unchanged files; inspect targeted context.",
+      "",
+      "SKILL USE (MUST FOLLOW):",
+      "- Before planning specialized or artifact work (including PDF, PowerPoint/slides, Word documents, spreadsheets, Android apps, or service integrations), call list_skills() to discover applicable workflows.",
+      "- If a relevant skill exists, call get_skill(name), read its complete instructions, and incorporate them into the plan. Do not substitute an ad-hoc library workflow without checking skills first.",
+      "- Skip skill discovery only for clearly trivial requests or ordinary code work with no plausible specialized skill. When unsure, check.",
       "",
       "PLAN MODE (MANDATORY):",
       "- Explore the repository, analyze the request, resolve important ambiguities, and produce an implementation-ready plan only.",
@@ -913,6 +1162,18 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "CONTEXT USE (MUST FOLLOW):",
     "- Use context effectively: avoid unnecessary repetition, avoid re-reading unchanged large files, and prefer targeted edits/tool calls.",
     "",
+    "SKILL USE (MUST FOLLOW):",
+    "- Before starting specialized or artifact work (including PDF, PowerPoint/slides, Word documents, spreadsheets, Android apps, or service integrations), call list_skills() to discover applicable workflows.",
+    "- If a relevant skill exists, call get_skill(name), read its complete instructions, and follow it before other implementation actions, package installation, or ad-hoc tooling.",
+    "- Do not install dependencies for a specialized task until skill discovery is complete; the skill may provide its own scripts, environment, dependencies, or required validation workflow.",
+    "- Skip skill discovery only for clearly trivial requests or ordinary code work with no plausible specialized skill. When unsure, check.",
+    "",
+    "MCP USE (MUST FOLLOW):",
+    "- Before using web_search, fetch_url, or a direct HTTP/API workaround for a request targeting an external service (including Reddit, Slack, WhatsApp, email, or browser automation), first call mcp_search(action='list') to inspect configured MCP servers.",
+    "- If a relevant MCP server is configured, use mcp_search(query='capability needed') and then mcp_search(action='call', server='...', tool='...', args={...}) before trying web or direct HTTP.",
+    "- Fall back to web_search, fetch_url, or direct APIs only when no relevant MCP server is configured or the relevant MCP call fails. Briefly preserve the MCP failure in the tool result/context so the fallback is explainable.",
+    "- Deferred MCP schemas are not a reason to skip MCP discovery; mcp_search is the required discovery and call boundary.",
+    "",
     "COLLABORATION MODE (MUST FOLLOW):",
     ...(planModeActive
       ? [
@@ -951,17 +1212,7 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "print(get_file_list(\".\"))",
     "```",
     "",
-    "VALID TOOL-USE RESPONSE EXAMPLE 2:",
-    "```execute",
-    "path = \"index.js\"",
-    "file_info = await get_file_info(path)",
-    "if file_info[\"size\"] < 10000:",
-    "    print(get_file_content(path))",
-    "else:",
-    "    print(await read_file_summary(path))",
-    "```",
-    "",
-    "VALID TOOL-USE RESPONSE EXAMPLE 3:",
+    "VALID SEARCH RESPONSE EXAMPLE:",
     "```execute",
     "matches = find_in_file(",
     "    path=\"index.js\",",
@@ -980,106 +1231,20 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "print(replace_in_file(\"index.js\", old, new, count=1))",
     "```",
     "",
-    "VALID PLAN TOOL RESPONSE EXAMPLE 1:",
-    "```execute",
-    "print(create_plan([",
-    "    \"Inspect repository structure\",",
-    "    \"Implement initial CLI\",",
-    "    \"Add tests for critical flows\",",
-    "]))",
-    "print(get_current_plan())",
-    "```",
-    "",
-    "VALID PLAN TOOL RESPONSE EXAMPLE 2:",
-    "```execute",
-    "print(update_plan(completed=[1, \"Implement initial CLI\"]))",
-    "print(get_current_plan())",
-    "```",
-    "",
-    "VALID PLAN TOOL RESPONSE EXAMPLE 3:",
-    "```execute",
-    "print(update_plan(new_entries=[",
-    "    \"Add CI workflow\",",
-    "    \"Write migration notes\",",
-    "]))",
-    "print(get_current_plan())",
-    "```",
-    "",
     "INVALID RESPONSE EXAMPLE (NEVER DO THIS):",
     "{\"tool\": \"get_file_list\", \"arguments\": {\"path\": \".\"}}",
     "",
-    "RECURSIVE SUBAGENTS (MANDATORY):",
-    "- You can delegate independent workloads to child agents in parallel:",
-    "  h = rlm_spawn('Do X')",
-    "  result = rlm_spawn('Do X', timeout=120)['result']   # poll instead, see below",
-    "- rlm_spawn returns immediately with an admission handle {id, status, prompt}.",
-    "- Poll with list_subagents() until status == 'done', then read result from the entry.",
-    "- Or import the runtime directly in an execute block:",
-    "  import harness",
-    "  h = harness.rlm('Do X')       # spawn; returns handle",
-    "  result = harness.rlm('Do X').join(timeout=120)   # or await h",
-    "  print(harness.rlm.list_subagents())",
-    "  print(harness.rlm.delete_subagent(h))",
-    "- Use subagents when work is parallel/independent (research chunks, separate file reviews, batch tasks).",
-    "- Avoid spawning subagents for trivial one-liner lookups; do those inline.",
-    "- rlm(...) uses the active provider/model from ~/.nexus/providers.json.",
-    "",
-    "CONTINUAL HARNESS (MANDATORY):",
-    "- Persistent state lives in ~/.nexus/harness.json and survives across sessions.",
-    "- harness_overview() -> list current memories, skills, subagent templates, prompt notes, refinements.",
-    "- harness_memory(key, content) / harness_memory(key, delete=True): durable facts about the user or project.",
-    "- harness_prompt_note(name, content) / (name, delete=True): reusable instructions or style guidance.",
-    "- harness_subagent(name, prompt, model, system) / (name, ..., delete=True): save reusable subagent templates, then rlm_spawn(..., template=name).",
-    "- harness_skill(name, description, body) / (name, delete=True): create a real SKILL.md in ~/.nexus/skills (surfaces via list_skills).",
-    "- record_refinement(summary, evidence): persist a reusable pattern with supporting evidence.",
-    "- refine_reflection(): auto-synthesize a refinement from recent subagent results and prompt notes.",
-    "- Use the harness for durable cross-session knowledge. Never store secrets or credentials there.",
-    "- Keep refinements small and evidence-backed. Do not write the same refinement repeatedly.",
-    "",
-    "SKILL DEPENDENCIES (OPTIONAL):",
-    "- A skill folder may contain requirements.txt declaring Python packages.",
-    "- get_skill() auto-installs them into a shared venv at ~/.nexus/skills-venv (never system Python).",
-    "- Install is non-blocking: get_skill returns immediately with deps.status = 'installing'; call get_skill again later to see 'satisfied' or the error.",
-    "- Run skill scripts with skill_python_path() (the venv interpreter) via run_shell.",
-    "- If install fails (offline/bad package), deps.error explains why; fall back to stdlib or document the limitation.",
-    "- Disable auto-install by setting skills_auto_install_deps=false in ~/.nexus/config.json.",
-    "",
-    "SKILLS (OPTIONAL EXTENSIONS):",
-    "- Skills are packaged instructions you can load when the task matches.",
-    "- Call list_skills() to see available skills, then get_skill(name) to load the instructions.",
-    "- Load a skill only when it is relevant to the current task; otherwise ignore.",
-    "- Skill names and descriptions are intentionally deferred. Call list_skills() when discovery is needed.",
-    "",
     "Predefined Python helper functions available in the execution environment:",
     ...(lines.length > 0 ? lines : ["- (none)"]),
-    "",
-    "REMINDERS:",
-    "- When the user asks to be reminded or to remember something later, call set_reminder in an execute block:",
-    "```execute",
-    "print(set_reminder(when='in 5 minutes', prompt='do this'))",
-    "```",
-    "- when accepts human phrases: 'in 5 minutes', 'in 2 hours', 'at 3pm', 'tomorrow 9am', or a recurring cadence like 'every 5 seconds', 'every 10 minutes'. Do not invent a timestamp; pass the user's phrase.",
-    "- After the tool returns, confirm briefly with the scheduled time.",
-    "",
-    "KERNEL (persistent Python REPL):",
-    "- kernel_exec runs Python in a long-lived session kernel; variable and function definitions persist across kernel_exec calls, so multi-step computation can build state incrementally.",
-    "- Use print() to surface results; stdout is returned in {output}.",
-    "- Prefer kernel_exec over write_file/run_shell tricks when the task is iterative computation (define once, reuse many times).",
-    "- kernel_reset() clears the kernel scope when stale state causes confusion.",
-    "",
-    "SOLVE LOOP (/solve):",
-    "- /solve <directory> starts an autonomous loop using that directory's task.md (or README.md), workspace, and private .venv.",
-    "- The goal is a program whose stdout ends with the line SOLVE_OK when it has verified its own solution. Failures return stderr/stdout to inspect.",
-    "- Iterate until the program proves itself with SOLVE_OK or the iteration budget is exhausted, then summarize.",
-    "",
-    "",
-    "MCP TOOLS (Model Context Protocol servers, optional):",
-    "- MCP servers are separate processes exposing extra capabilities as tools.",
-    "- MCP tool schemas stay outside this prompt. Discover only relevant tools with mcp_search().",
-    "- Search: mcp_search(query='what capability is needed', limit=5) -> matching tools with schemas.",
-    "- Describe an exact tool: mcp_search(action='describe', server='server', tool='tool').",
-    "- Call a discovered tool: mcp_search(action='call', server='server', tool='tool', args={...}).",
-    "- List connected servers and tool counts with mcp_search(action='list'); do not assume a server is configured.",
+    "- Skills outside the workspace must never be inspected or edited with file helpers or run_shell. Discover with list_skills(), load complete instructions with get_skill(name), and create/update/delete personal skills only with manage_skill(name, description, body, delete). Workspace and bundled skills are read-only.",
+    "- Use harness_overview() to inspect persistent harness capabilities and state.",
+    "- Use harness_memory(key, content) only for durable user preferences or project facts. Reuse stable keys to avoid duplicates; delete with harness_memory(key, delete=True). Never store secrets, credentials, transient task state, or guesses.",
+    "- Use harness_prompt_note for reusable behavioral guidance, harness_subagent for reusable subagent templates, and record_refinement/refine_reflection only for small evidence-backed improvements. Never store secrets.",
+    "- Use set_reminder when the user explicitly asks for a reminder; pass their human time phrase without inventing a timestamp.",
+    "- Use run_shell(..., background=True) for long-running commands that do not need to block the current turn. Background jobs have a fixed 10-minute (600-second) process-tree timeout. The launch result immediately includes job_id, pid, and timeout; completion or timeout arrives later as a run_shell tool result. Run prerequisites synchronously when later steps depend on their result.",
+    "- All other helpers (kernels, live subagents, Android, and more) are deferred. Use tool_search(query='capability needed') to discover exact signatures.",
+    "- MCP schemas are also deferred. Use mcp_search(query='capability needed'), then mcp_search(action='call', server='...', tool='...', args={...}).",
+    "- For MCP availability questions, first call mcp_search(action='list') to check locally configured servers. If the user asks whether an MCP server exists publicly, use web_search as needed. Never confuse 'not configured locally' with 'not available', and never claim MCP configuration is unsupported without checking: this TUI supports stdio and HTTP MCP servers through /mcp and ~/.nexus/mcp_config.json.",
     "",
     "If no tool use is needed, reply in normal plain text.",
   ].join("\n");
@@ -1163,38 +1328,50 @@ function loadMcpConfig() {
   }
 }
 
-function mcpMessageFrame(message) {
+function mcpMessageFrame(message, framing = "newline") {
   const body = JSON.stringify(message);
+  if (String(framing).toLowerCase() !== "content-length") {
+    return body + "\n";
+  }
   return `Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n\r\n${body}`;
 }
 
 function mcpParseFrame(buffer) {
-  const headerEnd = buffer.indexOf("\r\n\r\n");
-  if (headerEnd === -1) {
-    return null;
+  const prefix = buffer.slice(0, Math.min(buffer.length, 32)).toString("utf8");
+  if (/^Content-Length:/i.test(prefix)) {
+    const headerEnd = buffer.indexOf("\r\n\r\n");
+    if (headerEnd === -1) return null;
+    const header = buffer.slice(0, headerEnd).toString("utf8");
+    const match = /Content-Length:\s*(\d+)/i.exec(header);
+    if (!match) return { message: null, consumed: headerEnd + 4 };
+    const length = Number(match[1]);
+    const bodyStart = headerEnd + 4;
+    if (buffer.length < bodyStart + length) return null;
+    const body = buffer.slice(bodyStart, bodyStart + length).toString("utf8");
+    let parsed = null;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      parsed = null;
+    }
+    return { message: parsed, consumed: bodyStart + length };
   }
-  const header = buffer.slice(0, headerEnd).toString("utf8");
-  const match = /Content-Length:\s*(\d+)/i.exec(header);
-  if (!match) {
-    return null;
-  }
-  const length = Number(match[1]);
-  const bodyStart = headerEnd + 4;
-  if (buffer.length < bodyStart + length) {
-    return null;
-  }
-  const body = buffer.slice(bodyStart, bodyStart + length).toString("utf8");
+
+  const newline = buffer.indexOf(0x0a);
+  if (newline === -1) return null;
+  const body = buffer.slice(0, newline).toString("utf8").trim();
   let parsed = null;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    parsed = null;
+  if (body) {
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      parsed = null;
+    }
   }
-  return { message: parsed, consumed: bodyStart + length };
+  return { message: parsed, consumed: newline + 1 };
 }
 
-// Node's execFile buffers stdout; MCP needs streaming, so use spawn:
-const { spawn } = require("node:child_process");
+// Node's execFile buffers stdout; MCP uses the top-level spawn import for streaming.
 
 class McpStdioClientReal {
   constructor(name, config) {
@@ -1261,7 +1438,8 @@ class McpStdioClientReal {
     if (!this.child || !this.child.stdin || this.child.stdin.destroyed) {
       throw new Error(`MCP server ${this.name}: stdin closed`);
     }
-    this.child.stdin.write(mcpMessageFrame(obj));
+    const framing = String(this.config?.framing || "newline").trim().toLowerCase();
+    this.child.stdin.write(mcpMessageFrame(obj, framing));
   }
 
   _onData(chunk) {
@@ -1811,6 +1989,8 @@ async function startMcpBridgeServer() {
   });
   mcpBridgeServer = server;
   mcpBridgeState = "running";
+  process.env.NEXUS_TUI_BRIDGE_PORT = String(mcpBridgePort);
+  process.env.NEXUS_TUI_BRIDGE_PID = String(process.pid);
 
   // Publish the bridge endpoint so the Python execution environment can find it.
   try {
@@ -1824,9 +2004,382 @@ async function startMcpBridgeServer() {
   }
 }
 
+function createBackgroundOutputCapture(id) {
+  const basePath = path.join(os.tmpdir(), `nexus-background-${process.pid}-${id}`);
+  const stdoutPath = `${basePath}.stdout`;
+  const stderrPath = `${basePath}.stderr`;
+  let stdoutFd = null;
+  let stderrFd = null;
+  try {
+    stdoutFd = fsSync.openSync(stdoutPath, "w");
+    stderrFd = fsSync.openSync(stderrPath, "w");
+    return { stdoutPath, stderrPath, stdoutFd, stderrFd };
+  } catch (error) {
+    if (stdoutFd !== null) fsSync.closeSync(stdoutFd);
+    if (stderrFd !== null) fsSync.closeSync(stderrFd);
+    fsSync.rmSync(stdoutPath, { force: true });
+    fsSync.rmSync(stderrPath, { force: true });
+    throw error;
+  }
+}
+
+function closeBackgroundOutputCaptureHandles(capture) {
+  if (!capture) return;
+  for (const field of ["stdoutFd", "stderrFd"]) {
+    const fd = capture[field];
+    if (fd === null || fd === undefined) continue;
+    try {
+      fsSync.closeSync(fd);
+    } catch {
+      // The descriptor may already be closed after a failed spawn.
+    }
+    capture[field] = null;
+  }
+}
+
+function readBackgroundOutputTail(filePath, maxBytes = BACKGROUND_SHELL_MAX_OUTPUT_CHARS) {
+  try {
+    const size = fsSync.statSync(filePath).size;
+    if (size <= 0) return { text: "", truncated: false };
+    const bytesToRead = Math.min(size, maxBytes);
+    const buffer = Buffer.allocUnsafe(bytesToRead);
+    const fd = fsSync.openSync(filePath, "r");
+    try {
+      const bytesRead = fsSync.readSync(fd, buffer, 0, bytesToRead, size - bytesToRead);
+      return {
+        text: buffer.subarray(0, bytesRead).toString("utf8"),
+        truncated: size > maxBytes,
+        size,
+      };
+    } finally {
+      fsSync.closeSync(fd);
+    }
+  } catch {
+    return { text: "", truncated: false };
+  }
+}
+
+function collectBackgroundOutput(job) {
+  const capture = job?.outputCapture;
+  if (!capture) return;
+  const stdout = readBackgroundOutputTail(capture.stdoutPath);
+  const stderr = readBackgroundOutputTail(capture.stderrPath);
+  job.stdout = stdout.text;
+  job.stderr = stderr.text;
+  job.outputTruncated = stdout.truncated || stderr.truncated;
+  for (const filePath of [capture.stdoutPath, capture.stderrPath]) {
+    try {
+      fsSync.rmSync(filePath, { force: true });
+    } catch {
+      // Output was captured already; cleanup failure must not lose completion.
+    }
+  }
+  job.outputCapture = null;
+}
+
+function discardBackgroundOutputCapture(job) {
+  const capture = job?.outputCapture;
+  if (!capture) return;
+  closeBackgroundOutputCaptureHandles(capture);
+  for (const filePath of [capture.stdoutPath, capture.stderrPath]) {
+    try {
+      fsSync.rmSync(filePath, { force: true });
+    } catch {
+      // A terminating process may briefly retain its redirected file handles.
+    }
+  }
+  job.outputCapture = null;
+}
+
+function terminateBackgroundShellProcess(job) {
+  const child = job?.child;
+  if (!child || !Number.isFinite(Number(child.pid)) || child.exitCode !== null) return;
+  if (process.platform === "win32") {
+    try {
+      spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+        windowsHide: true,
+        timeout: 5000,
+        stdio: "ignore",
+      });
+      return;
+    } catch {
+      // fall through to direct child termination
+    }
+  } else {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+      return;
+    } catch {
+      // fall through to direct child termination
+    }
+  }
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    // process already exited
+  }
+}
+
+async function appendBackgroundShellCompletion(job, result) {
+  const content = JSON.stringify(result, null, 2);
+  const toolInput = `background job ${job.id}: ${job.command}`;
+  if (!cleanedUp && job.sessionUid === currentSessionUid && job.generation === chatGeneration) {
+    appendToolMessages(
+      "run_shell",
+      toolInput,
+      `run_shell(${JSON.stringify(job.command)}, background=True)`,
+      content,
+      content,
+      job.id,
+      Boolean(result.ok),
+      job.generation
+    );
+    return;
+  }
+  if (!job.sessionFilePath) return;
+  const payload = {
+    role: "tool",
+    name: "run_shell",
+    toolCallId: job.id,
+    toolInput,
+    toolCode: `run_shell(${JSON.stringify(job.command)}, background=True)`,
+    toolOk: Boolean(result.ok),
+    content,
+    sessionModel: job.model,
+    sessionWorkspace: WORKSPACE_ROOT,
+    sessionReasoningByModel: job.reasoningByModel,
+    sessionMode: job.mode,
+    excludeFromRequest: false,
+  };
+  await ensureSessionFileReady();
+  await fs.appendFile(job.sessionFilePath, JSON.stringify(payload) + "\n", "utf8").catch(() => {});
+}
+
+function markBackgroundShellJobsDelivered(events) {
+  for (const event of Array.isArray(events) ? events : []) {
+    const id = typeof event?.job_id === "string" ? event.job_id : "";
+    const job = backgroundShellJobs.get(id);
+    if (!job) continue;
+    job.initialResultDelivered = true;
+    if (job.pendingResult) {
+      const pending = job.pendingResult;
+      job.pendingResult = null;
+      backgroundShellJobs.delete(job.id);
+      appendBackgroundShellCompletion(job, pending).catch(() => {});
+    }
+  }
+}
+
+function normalizeBackgroundShellCommand(command) {
+  const value = String(command || "");
+  if (process.platform !== "win32") return value;
+  return value.replace(/^(\s*)python3(?:\.exe)?(?=\s|$)/i, "$1python");
+}
+
+function startBackgroundShellJob(command, timeoutMs = BACKGROUND_SHELL_TIMEOUT_MS) {
+  const id = `shell-${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+  const launchCommand = normalizeBackgroundShellCommand(command);
+  let outputCapture;
+  let child;
+  try {
+    outputCapture = createBackgroundOutputCapture(id);
+    child = spawn(launchCommand, {
+      shell: true,
+      cwd: WORKSPACE_ROOT,
+      windowsHide: true,
+      detached: process.platform !== "win32",
+      stdio: ["ignore", outputCapture.stdoutFd, outputCapture.stderrFd],
+    });
+  } catch (error) {
+    closeBackgroundOutputCaptureHandles(outputCapture);
+    if (outputCapture) {
+      fsSync.rmSync(outputCapture.stdoutPath, { force: true });
+      fsSync.rmSync(outputCapture.stderrPath, { force: true });
+    }
+    return { ok: false, error: error?.message || String(error) };
+  } finally {
+    closeBackgroundOutputCaptureHandles(outputCapture);
+  }
+  if (!Number.isFinite(Number(child.pid))) {
+    if (outputCapture) {
+      fsSync.rmSync(outputCapture.stdoutPath, { force: true });
+      fsSync.rmSync(outputCapture.stderrPath, { force: true });
+    }
+    return { ok: false, error: "background process failed to start" };
+  }
+
+  const job = {
+    id,
+    pid: Number(child.pid),
+    command,
+    child,
+    status: "running",
+    stdout: "",
+    stderr: "",
+    outputTruncated: false,
+    timedOut: false,
+    startedAt: Date.now(),
+    generation: chatGeneration,
+    sessionUid: currentSessionUid,
+    sessionFilePath,
+    model: selectedModel,
+    mode: collaborationMode,
+    reasoningByModel: getSessionReasoningConfig(),
+    finalized: false,
+    initialResultDelivered: false,
+    pendingResult: null,
+    outputCapture,
+    timeoutMs: Math.max(1, Number(timeoutMs) || BACKGROUND_SHELL_TIMEOUT_MS),
+    timeoutTimer: null,
+    timeoutFallbackTimer: null,
+  };
+  backgroundShellJobs.set(id, job);
+  backgroundShellProcesses.add(job);
+
+  let resolveCompletion;
+  job.completion = new Promise((resolve) => {
+    resolveCompletion = resolve;
+  });
+  const finalize = (exitCode, error = null) => {
+    if (job.finalized) return;
+    job.finalized = true;
+    if (job.timeoutTimer) clearTimeout(job.timeoutTimer);
+    if (job.timeoutFallbackTimer) clearTimeout(job.timeoutFallbackTimer);
+    job.timeoutTimer = null;
+    job.timeoutFallbackTimer = null;
+    collectBackgroundOutput(job);
+    job.status = job.timedOut ? "timed_out" : error || exitCode !== 0 ? "failed" : "completed";
+    const result = {
+      ok: job.status === "completed",
+      background: true,
+      job_id: job.id,
+      pid: job.pid,
+      status: job.status,
+      exit_code: Number.isFinite(Number(exitCode)) ? Number(exitCode) : null,
+      stdout: job.stdout,
+      stderr: job.stderr,
+      timed_out: job.timedOut,
+      output_truncated: job.outputTruncated,
+      duration_ms: Date.now() - job.startedAt,
+      ...(job.timedOut
+        ? { error: `Background command timed out after ${Math.round(job.timeoutMs / 1000)}s` }
+        : error ? { error: error?.message || String(error) } : {}),
+    };
+    resolveCompletion(result);
+    if (job.suppressCompletionOutput) {
+      backgroundShellJobs.delete(job.id);
+      return;
+    }
+    if (job.initialResultDelivered) {
+      backgroundShellJobs.delete(job.id);
+      appendBackgroundShellCompletion(job, result).catch(() => {});
+    } else {
+      job.pendingResult = result;
+    }
+  };
+  child.once("error", (error) => finalize(null, error));
+  child.once("close", (code) => {
+    backgroundShellProcesses.delete(job);
+    finalize(code);
+  });
+  job.timeoutTimer = setTimeout(() => {
+    if (job.finalized) return;
+    job.timedOut = true;
+    const timeoutSeconds = Math.round(job.timeoutMs / 1000);
+    const timeoutError = new Error(`Background command timed out after ${timeoutSeconds}s`);
+    terminateBackgroundShellProcess(job);
+    // Process-tree termination normally emits close. Keep a fallback so a
+    // stubborn platform process cannot leave the job pending forever.
+    job.timeoutFallbackTimer = setTimeout(() => finalize(null, timeoutError), 1000);
+    job.timeoutFallbackTimer.unref?.();
+  }, job.timeoutMs);
+  job.timeoutTimer.unref?.();
+  return {
+    ok: true,
+    background: true,
+    job_id: id,
+    pid: job.pid,
+    status: "running",
+    timeout: job.timeoutMs / 1000,
+  };
+}
+
+async function runBackgroundShellSelfTest() {
+  const out = process.stdout.write.bind(process.stdout);
+  const command = 'python3 -c "print(\'BG_OK\')"';
+  try {
+    await startMcpBridgeServer();
+    const execution = await executeCodeWithPythonTool(
+      `print(run_shell(${JSON.stringify(command)}, timeout=5, background=True))`
+    );
+    const event = execution?.backgroundJobEvents?.[0];
+    const job = event?.job_id ? backgroundShellJobs.get(event.job_id) : null;
+    if (
+      !execution?.ok ||
+      !String(execution.output || "").includes("'status': 'running'") ||
+      !job ||
+      !Number.isFinite(Number(job.pid))
+    ) {
+      out(`BACKGROUND_FAIL: launch ${JSON.stringify(execution)}\n`);
+      return 1;
+    }
+    job.suppressCompletionOutput = true;
+    markBackgroundShellJobsDelivered(execution.backgroundJobEvents);
+    const completed = await Promise.race([
+      job.completion,
+      new Promise((resolve) => setTimeout(() => resolve({ status: "self_test_timeout" }), 7000)),
+    ]);
+    if (completed?.status !== "completed" || !String(completed.stdout || "").includes("BG_OK")) {
+      terminateBackgroundShellProcess(job);
+      out(`BACKGROUND_FAIL: completion ${JSON.stringify(completed)}\n`);
+      return 1;
+    }
+    const slowCommand = process.platform === "win32" ? "ping 127.0.0.1 -n 3 >nul" : "sleep 2";
+    const timedLaunch = startBackgroundShellJob(slowCommand, 250);
+    const timedJob = timedLaunch?.job_id ? backgroundShellJobs.get(timedLaunch.job_id) : null;
+    if (!timedJob || timedLaunch.timeout !== 0.25) {
+      out(`BACKGROUND_FAIL: timed launch ${JSON.stringify(timedLaunch)}\n`);
+      return 1;
+    }
+    timedJob.initialResultDelivered = true;
+    timedJob.suppressCompletionOutput = true;
+    const timedResult = await Promise.race([
+      timedJob.completion,
+      new Promise((resolve) => setTimeout(() => resolve({ status: "self_test_timeout" }), 5000)),
+    ]);
+    if (
+      timedResult?.status !== "timed_out" ||
+      timedResult?.timed_out !== true ||
+      !String(timedResult?.error || "").includes("timed out")
+    ) {
+      terminateBackgroundShellProcess(timedJob);
+      out(`BACKGROUND_FAIL: timeout completion ${JSON.stringify(timedResult)}\n`);
+      return 1;
+    }
+    out("BACKGROUND_OK\n");
+    return 0;
+  } catch (error) {
+    out(`BACKGROUND_FAIL: ${String(error?.message || error)}\n`);
+    return 1;
+  } finally {
+    if (mcpBridgeServer) {
+      await new Promise((resolve) => mcpBridgeServer.close(resolve)).catch(() => {});
+      mcpBridgeServer = null;
+    }
+  }
+}
+
 async function handleMcpBridgeRequest(parsed) {
   if (!parsed || typeof parsed !== "object") {
     return { ok: false, error: "bad request" };
+  }
+
+  if (parsed.method === "background_shell") {
+    const command = typeof parsed.command === "string" ? parsed.command.trim() : "";
+    if (!command) {
+      return { ok: false, error: "background shell requires a command" };
+    }
+    return startBackgroundShellJob(command);
   }
 
   // Internal "reminder" method: used by the Python set_reminder tool to
@@ -2392,6 +2945,13 @@ function cleanupTerminal(options = {}) {
   }
   stopLoopScheduler();
   stopKernelProcess();
+  for (const job of backgroundShellProcesses) {
+    if (job.timer) clearTimeout(job.timer);
+    terminateBackgroundShellProcess(job);
+    discardBackgroundOutputCapture(job);
+  }
+  backgroundShellJobs.clear();
+  backgroundShellProcesses.clear();
   if (mcpBridgeServer) {
     try {
       mcpBridgeServer.close();
@@ -2400,6 +2960,8 @@ function cleanupTerminal(options = {}) {
     }
     mcpBridgeServer = null;
   }
+  delete process.env.NEXUS_TUI_BRIDGE_PORT;
+  delete process.env.NEXUS_TUI_BRIDGE_PID;
   clearMouseSelectionTimer();
   mouseSelectionMode = false;
 
@@ -4611,7 +5173,8 @@ function buildOpenRouterMessagesFromHistory(modelId = selectedModel) {
   };
 
   const requestMessages = [];
-  for (const entry of messages) {
+  for (let entryIndex = 0; entryIndex < messages.length; entryIndex += 1) {
+    const entry = messages[entryIndex];
     if (entry && entry.ephemeral === true) {
       continue;
     }
@@ -4640,7 +5203,12 @@ function buildOpenRouterMessagesFromHistory(modelId = selectedModel) {
         typeof entry?.name === "string" && entry.name.trim().length > 0
           ? entry.name.trim()
           : "code_execution";
-      const toolContent = content.trim().length > 0 ? content : "(no output)";
+      const hasLaterRequestEntry = messages.slice(entryIndex + 1).some((later) => {
+        if (!later || later.ephemeral === true || later.excludeFromRequest === true) return false;
+        return ["user", "assistant", "tool", "tool_result"].includes(String(later.role || ""));
+      });
+      const compactedDiscovery = hasLaterRequestEntry ? compactToolDiscoveryContent(entry) : "";
+      const toolContent = compactedDiscovery || (content.trim().length > 0 ? content : "(no output)");
       // Programmatic tool-calling flow uses plain text/code, not API-native tool_call objects.
       // Feed tool outcomes back as user context so the model reliably produces a final answer.
       requestMessages.push({
@@ -5085,6 +5653,36 @@ function extractAllPythonCodeBlockEntries(text) {
   return blocks;
 }
 
+function classifyToolDiscoveryCode(code) {
+  const source = String(code || "");
+  if (/\bmcp_search\s*\(/i.test(source)) {
+    const callsExactTool = /\baction\s*=\s*["']call["']/i.test(source);
+    return callsExactTool ? "" : "mcp_search";
+  }
+  if (/\btool_search\s*\(/i.test(source)) {
+    return "tool_search";
+  }
+  return "";
+}
+
+function compactToolDiscoveryContent(entry) {
+  const kind = classifyToolDiscoveryCode(entry?.toolCode || entry?.toolInput || "");
+  if (!kind) return "";
+  const source = String(entry?.content || "");
+  const names = [];
+  const seen = new Set();
+  const namePattern = /["'](?:name|tool)["']\s*:\s*["']([^"']+)["']/g;
+  let match = null;
+  while ((match = namePattern.exec(source)) !== null && names.length < 10) {
+    const value = String(match[1] || "").trim();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    names.push(value);
+  }
+  const selected = names.length > 0 ? ` Matches: ${names.join(", ")}.` : "";
+  return `[${kind} discovery schema compacted after use.${selected} Rerun discovery if a full signature is needed.]`;
+}
+
 // Recovers code from an execute fence that was cut off before the closing
 // fence (truncated model output). Fence characters are built via code points
 // so this source stays free of literal fence runs.
@@ -5164,10 +5762,15 @@ function buildExecutableCodeForToolCall(toolName, toolArgs) {
   return { code: generatedCode, executionName: toolName };
 }
 
-async function executeCodeWithPythonTool(code) {
+async function executeCodeWithPythonTool(code, options = {}) {
   let tempDir = "";
+  const onOutput = typeof options?.onOutput === "function" ? options.onOutput : null;
+  const streamPrefix = "__NEXUS_EXEC_STREAM__";
+  const resultPrefix = "__NEXUS_EXEC_RESULT__";
+  let liveOutput = "";
   const runner = `
 import asyncio
+import base64
 import io
 import json
 import textwrap
@@ -5266,8 +5869,22 @@ def _compile_generated_async(user_code: str):
     ast.fix_missing_locations(module)
     return compile(module, "<generated>", "exec")
 
-buf = io.StringIO()
-result = {"ok": True, "output": "", "edit_events": [], "edit_summaries": [], "history_actions": [], "plan_ui_events": []}
+def emit_stream_value(value):
+    if value:
+        encoded = base64.b64encode(value.encode("utf-8")).decode("ascii")
+        sys.__stdout__.write("${"__NEXUS_EXEC_STREAM__"}" + encoded + "\\n")
+        sys.__stdout__.flush()
+
+class StreamingBuffer(io.StringIO):
+    def write(self, value):
+        written = super().write(value)
+        emit_stream_value(value)
+        return written
+
+buf = StreamingBuffer()
+if hasattr(tools, "set_shell_stream_writer"):
+    tools.set_shell_stream_writer(lambda _stream_name, value: emit_stream_value(value))
+result = {"ok": True, "output": "", "edit_events": [], "edit_summaries": [], "history_actions": [], "plan_ui_events": [], "background_job_events": []}
 try:
     sys.settrace(tracer)
     compiled = _compile_generated_async(code)
@@ -5292,6 +5909,10 @@ try:
             plan_events = tools.drain_plan_ui_events()
             if isinstance(plan_events, list):
                 result["plan_ui_events"] = [item for item in plan_events if isinstance(item, dict)]
+        if hasattr(tools, "drain_background_job_events"):
+            background_events = tools.drain_background_job_events()
+            if isinstance(background_events, list):
+                result["background_job_events"] = [item for item in background_events if isinstance(item, dict)]
     sys.settrace(None)
     result["output"] = buf.getvalue()
 except Exception as exc:
@@ -5301,7 +5922,8 @@ except Exception as exc:
     result["error"] = f"{exc.__class__.__name__}: {exc}"
     result["traceback"] = traceback.format_exc()
 
-print(json.dumps(result))
+sys.__stdout__.write("${"__NEXUS_EXEC_RESULT__"}" + json.dumps(result) + "\\n")
+sys.__stdout__.flush()
 `.trim();
 
   try {
@@ -5311,11 +5933,45 @@ print(json.dumps(result))
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-exec-"));
     const codePath = path.join(tempDir, "execute.py.txt");
     await fs.writeFile(codePath, String(code ?? ""), "utf8");
-    const { stdout } = await runPythonCommand(["-c", runner, codePath], {
+    let protocolBuffer = "";
+    let resultJson = "";
+    const consumeProtocolLine = (line) => {
+      if (line.startsWith(streamPrefix)) {
+        try {
+          const text = Buffer.from(line.slice(streamPrefix.length), "base64").toString("utf8");
+          liveOutput += text;
+          onOutput?.(text, liveOutput);
+        } catch {
+          // Ignore malformed transport frames; the final payload remains authoritative.
+        }
+        return;
+      }
+      if (line.startsWith(resultPrefix)) {
+        resultJson = line.slice(resultPrefix.length);
+      }
+    };
+    const { stdout } = await spawnPythonCommandStreaming(["-c", runner, codePath], {
       timeout: TOOL_EXEC_TIMEOUT_MS,
       maxBuffer: 2 * 1024 * 1024,
+      onStdout: (chunk) => {
+        protocolBuffer += chunk;
+        for (;;) {
+          const newline = protocolBuffer.indexOf("\n");
+          if (newline < 0) break;
+          const line = protocolBuffer.slice(0, newline).replace(/\r$/, "");
+          protocolBuffer = protocolBuffer.slice(newline + 1);
+          consumeProtocolLine(line);
+        }
+      },
     });
-    const parsed = JSON.parse(String(stdout || "{}"));
+    if (protocolBuffer) consumeProtocolLine(protocolBuffer.replace(/\r$/, ""));
+    if (!resultJson) {
+      const fallbackLine = String(stdout || "")
+        .split(/\r?\n/)
+        .find((line) => line.startsWith(resultPrefix));
+      if (fallbackLine) resultJson = fallbackLine.slice(resultPrefix.length);
+    }
+    const parsed = JSON.parse(resultJson || "{}");
     return {
       ok: Boolean(parsed?.ok),
       output: typeof parsed?.output === "string" ? parsed.output : "",
@@ -5333,6 +5989,9 @@ print(json.dumps(result))
       planUiEvents: Array.isArray(parsed?.plan_ui_events)
         ? parsed.plan_ui_events.filter((item) => item && typeof item === "object")
         : [],
+      backgroundJobEvents: Array.isArray(parsed?.background_job_events)
+        ? parsed.background_job_events.filter((item) => item && typeof item === "object")
+        : [],
     };
   } catch (error) {
     if (error?.killed || error?.signal || error?.code === "ETIMEDOUT") {
@@ -5345,18 +6004,20 @@ print(json.dumps(result))
         editSummaries: [],
         historyActions: [],
         planUiEvents: [],
+        backgroundJobEvents: [],
       };
     }
 
     return {
       ok: false,
-      output: String(error?.stdout || ""),
+      output: liveOutput,
       error: getOpenRouterErrorMessage(error),
       traceback: String(error?.stderr || ""),
       editEvents: [],
       editSummaries: [],
       historyActions: [],
       planUiEvents: [],
+      backgroundJobEvents: [],
     };
   } finally {
     if (tempDir) {
@@ -5379,6 +6040,31 @@ function capToolHistoryText(text, limit) {
   return `${source.slice(0, head)}
 ... [tool result truncated: ${source.length} chars > ${maxChars}] ...
 ${source.slice(-tail)}`;
+}
+
+function getToolUiOk(result) {
+  if (!result?.ok) {
+    return false;
+  }
+  const output = typeof result?.output === "string" ? result.output : "";
+  // A code_execution wrapper can finish successfully while the command it
+  // prints reports failure. Reflect that nested result in the UI status.
+  if (/["']?ok["']?\s*:\s*false\b/i.test(output)) {
+    return false;
+  }
+  const exitCode = output.match(/["']?exit_code["']?\s*:\s*(-?\d+)/i);
+  if (exitCode && Number(exitCode[1]) !== 0) {
+    return false;
+  }
+  if (/["']?timed_out["']?\s*:\s*true\b/i.test(output)) {
+    return false;
+  }
+  // Helpers such as fetch_url return a dictionary without an `ok` field and
+  // report failures through a non-empty `error` string.
+  if (/["']?error["']?\s*:\s*["'](?!["'])[^\r\n]*["']/i.test(output)) {
+    return false;
+  }
+  return true;
 }
 
 function formatPlanUiMarkdown(event) {
@@ -5443,7 +6129,20 @@ function buildToolResultPayload(result) {
     }
     const joinedHistory = historyParts.length > 0 ? historyParts.join("\n") : "(no output)";
     const historyText = capToolHistoryText(joinedHistory, getToolOutputTokenLimit());
-    return { displayText, historyText, uiKind: planUiMarkdown ? "plan" : "" };
+    const uiSections = !planUiMarkdown && editEvents.length > 0 && outputText.length > 0 &&
+      !(editEvents.length > 0 && looksLikeEditResultDict)
+      ? [
+          ...editEvents.map((text) => ({ kind: "edit", text })),
+          { kind: "result", text: output },
+        ]
+      : [];
+    return {
+      displayText,
+      historyText,
+      uiKind: planUiMarkdown ? "plan" : "",
+      uiSections,
+      toolOk: getToolUiOk(result),
+    };
   }
 
   const displayParts = [];
@@ -5473,6 +6172,7 @@ function buildToolResultPayload(result) {
       historyParts.length > 0 ? historyParts.join("\n") : "Tool execution failed.",
       getToolOutputTokenLimit()
     ),
+    toolOk: false,
   };
 }
 
@@ -5644,7 +6344,24 @@ function getToolResultLinesForDisplay(text) {
     /(^|\n)\+\+\+\s+b\//.test(normalized) &&
     /(^|\n)@@\s/.test(normalized);
   if (hasUnifiedDiffMarkers) {
-    return addUnifiedDiffLineNumbers(originalLines);
+    const firstDiffHeader = originalLines.findIndex((line) => /^---\s+a\//.test(line));
+    const nonDiffPrefix = firstDiffHeader > 0
+      ? originalLines.slice(0, firstDiffHeader).filter((line, index, values) => {
+          if (line.trim().length > 0) return true;
+          return index > 0 && index < values.length - 1;
+        })
+      : [];
+    const diffLines = addUnifiedDiffLineNumbers(originalLines);
+    if (nonDiffPrefix.length === 0) {
+      return diffLines;
+    }
+    // Execute blocks can edit a file and then print a run result. Keep that
+    // non-diff output after the compact diff so it remains visible at the
+    // bottom of the completed tool entry.
+    const formattedOutput = nonDiffPrefix.map((line, index) =>
+      index === 0 ? `\u2514 ${line}` : `  ${line}`
+    );
+    return [...diffLines, "", ...formattedOutput];
   }
 
   const wrapCols = Math.max(20, TOOL_RESULT_TRUNCATE_WRAP_COLS);
@@ -5731,7 +6448,8 @@ function appendToolMessages(
   toolCallId,
   toolOk,
   generation,
-  uiKind = ""
+  uiKind = "",
+  uiSections = null
 ) {
   if (generation !== chatGeneration) {
     return;
@@ -5742,10 +6460,44 @@ function appendToolMessages(
   const normalizedCode = String(executedCode ?? "");
   const normalizedResult = String(resultText ?? "");
   const normalizedHistoryResult = String(historyResultText ?? "");
-  const safeResult = normalizedResult.trim().length > 0 ? normalizedResult : "(no output)";
+  const normalizedUiSections = Array.isArray(uiSections)
+    ? uiSections.filter((section) =>
+        section && typeof section.text === "string" && section.text.trim().length > 0
+      )
+    : [];
+  const finalUiSection = normalizedUiSections.length > 1
+    ? normalizedUiSections[normalizedUiSections.length - 1]
+    : null;
+  const safeResult = finalUiSection
+    ? finalUiSection.text
+    : normalizedResult.trim().length > 0 ? normalizedResult : "(no output)";
   const safeHistoryResult =
     normalizedHistoryResult.trim().length > 0 ? normalizedHistoryResult : "(no output)";
   const normalizedUiKind = uiKind === "plan" ? "plan" : "";
+  if (normalizedUiSections.length > 1) {
+    for (const section of normalizedUiSections.slice(0, -1)) {
+      messages.push({
+        role: "tool",
+        name: normalizedToolName,
+        toolCallId,
+        toolInput: normalizedInput,
+        toolCode: normalizedCode,
+        toolOk: Boolean(toolOk),
+        content: section.text,
+        uiContent: section.text,
+        excludeFromRequest: true,
+      });
+      appendHistoryEntry("tool", section.text, {
+        name: normalizedToolName,
+        toolCallId: typeof toolCallId === "string" ? toolCallId : "",
+        toolInput: normalizedInput,
+        toolCode: normalizedCode,
+        toolOk: Boolean(toolOk),
+        uiContent: section.text,
+        excludeFromRequest: true,
+      });
+    }
+  }
   messages.push({
     role: "tool",
     name: normalizedToolName,
@@ -5769,9 +6521,9 @@ function appendToolMessages(
     ...(normalizedUiKind ? { uiKind: normalizedUiKind, uiContent: safeResult } : {}),
   });
   scrollChatToBottom();
-  if (!APPEND_CHAT_TO_SCROLLBACK) {
-    forceFullClearOnNextRender = true;
-  }
+  // Replace the live tool register with the permanent result in place. A full
+  // clear here visibly replays colored history (especially red diff removals)
+  // for one frame during the Running -> Ran transition.
   markDirty();
   renderFrame(true);
   scheduleViewportMainRefresh();
@@ -6016,6 +6768,62 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
           done: false,
           ok: false,
         };
+        let liveToolEntry = null;
+        let liveToolOutput = "";
+        let liveRenderTimer = null;
+        const renderLiveToolOutput = () => {
+          liveRenderTimer = null;
+          if (!liveToolOutput || generation !== chatGeneration) return;
+          let visibleOutput = String(liveToolOutput)
+            .replace(/\r\n/g, "\n")
+            .replace(/\r/g, "\n");
+          let liveOutputTruncated = false;
+          const liveLines = visibleOutput.split("\n");
+          if (liveLines.length > EXECUTE_LIVE_MAX_LINES) {
+            visibleOutput = liveLines.slice(-EXECUTE_LIVE_MAX_LINES).join("\n");
+            liveOutputTruncated = true;
+          }
+          if (visibleOutput.length > EXECUTE_LIVE_MAX_OUTPUT_CHARS) {
+            visibleOutput = visibleOutput.slice(-EXECUTE_LIVE_MAX_OUTPUT_CHARS);
+            liveOutputTruncated = true;
+          }
+          if (liveOutputTruncated) {
+            visibleOutput = `... [live output truncated; showing latest ${EXECUTE_LIVE_MAX_LINES} lines / ${EXECUTE_LIVE_MAX_OUTPUT_CHARS} chars] ...\n${visibleOutput}`;
+          }
+          if (!liveToolEntry) {
+            liveToolEntry = {
+              role: "tool",
+              name: "code_execution",
+              toolInput: pythonCode,
+              toolCode: pythonCode,
+              content: visibleOutput,
+              uiContent: visibleOutput,
+              ephemeral: true,
+              live: true,
+            };
+            messages.push(liveToolEntry);
+          } else {
+            liveToolEntry.content = visibleOutput;
+            liveToolEntry.uiContent = visibleOutput;
+          }
+          // The live entry object is updated in place. The transcript cache
+          // keys on its object identity, so explicitly invalidate it or the
+          // first streamed frame will remain frozen for the rest of the run.
+          cachedChatLines = null;
+          // The render scheduler normally repaints chat only when its layout
+          // or entry count changes. Streaming mutates one entry in place, so
+          // request an explicit in-place repaint for every throttled frame.
+          forceChatRefreshFlag = true;
+          scrollChatToBottom();
+          markDirty();
+          renderFrame(false);
+        };
+        const handleLiveToolOutput = (_chunk, cumulative) => {
+          liveToolOutput = String(cumulative || "");
+          if (!liveRenderTimer) {
+            liveRenderTimer = setTimeout(renderLiveToolOutput, EXECUTE_LIVE_REFRESH_MS);
+          }
+        };
         // PreToolUse hook: can block (exit 2) or inject context before a tool run.
         let execResult = null;
         if (!pythonBlock.complete) {
@@ -6053,8 +6861,19 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
             if (preToolRun.additionalContext) {
               pendingHookContext = preToolRun.additionalContext;
             }
-            execResult = await executeCodeWithPythonTool(pythonCode);
+            execResult = await executeCodeWithPythonTool(pythonCode, {
+              onOutput: handleLiveToolOutput,
+            });
           }
+        }
+        if (liveRenderTimer) {
+          clearTimeout(liveRenderTimer);
+          liveRenderTimer = null;
+        }
+        if (liveToolEntry) {
+          const liveIndex = messages.indexOf(liveToolEntry);
+          if (liveIndex >= 0) messages.splice(liveIndex, 1);
+          liveToolEntry = null;
         }
         if (stopRequested) {
           // User pressed Esc while the process was running: per request,
@@ -6062,7 +6881,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
           activeToolRun = { ...activeToolRun, done: true, ok: false, cancelled: true };
         } else if (activeToolRun) {
           activeToolRun.done = true;
-          activeToolRun.ok = Boolean(execResult?.ok);
+          activeToolRun.ok = getToolUiOk(execResult);
         }
         // PostToolUse / PostToolUseFailure: deterministic follow-up (format,
         // notify, audit). Exit code 2 on PostToolUse blocks the tool result.
@@ -6113,10 +6932,12 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
           toolResultPayload.displayText,
           toolResultPayload.historyText,
           undefined,
-          Boolean(execResult?.ok),
+          toolResultPayload.toolOk,
           generation,
-          toolResultPayload.uiKind
+          toolResultPayload.uiKind,
+          toolResultPayload.uiSections
         );
+        markBackgroundShellJobsDelivered(execResult?.backgroundJobEvents);
 
         if (generation !== chatGeneration) {
           return;
@@ -6215,8 +7036,12 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
   }
 }
 
-function queueAssistantReply(modelId) {
+function queueAssistantReply(modelId, options = {}) {
   const wasThinking = pendingAssistantRequests > 0;
+  const deferredUserMessage = options?.deferredUserMessage || null;
+  const queuedPromptEntry = wasThinking && options?.queuedPrompt
+    ? addQueuedBusyPrompt(options.queuedPrompt)
+    : null;
   if (!wasThinking) {
     stopRequested = false;
   }
@@ -6226,9 +7051,26 @@ function queueAssistantReply(modelId) {
   }
   updateThinkingAnimationState();
   const generation = chatGeneration;
-  const pendingIndex = createPendingAssistantMessage(generation);
+  let pendingIndex = deferredUserMessage ? -1 : createPendingAssistantMessage(generation);
   assistantRequestChain = assistantRequestChain
-    .then(() => requestAssistantReply(modelId, pendingIndex, generation))
+    .then(() => {
+      if (queuedPromptEntry) {
+        removeQueuedBusyPrompt(queuedPromptEntry);
+      }
+      if (deferredUserMessage && generation === chatGeneration) {
+        appendSubmittedUserMessage(deferredUserMessage);
+        if (options?.deferredHookContext) {
+          pendingHookContext = options.deferredHookContext;
+        }
+        pendingIndex = createPendingAssistantMessage(generation);
+        markDirty();
+        renderFrame(true);
+      } else if (queuedPromptEntry) {
+        markDirty();
+        renderFrame(false);
+      }
+      return requestAssistantReply(modelId, pendingIndex, generation);
+    })
     .catch((error) => {
       const message = getOpenRouterErrorMessage(error);
       finalizePendingAssistantMessage(
@@ -7769,6 +8611,10 @@ function getMainFooterText() {
   const thinkingState = getReasoningEnabledForModel(selectedModel) ? "thinking on" : "thinking off";
   const modeState = collaborationMode === "plan" ? "PLAN" : "BUILD";
   let text = `${modeState} | Current model: ${modelLabel} | ${safeContextLeft}% context left | ${thinkingState}`;
+  const cacheTelemetry = getCacheTelemetry(selectedModel);
+  if (Number.isFinite(cacheTelemetry?.cachePercent)) {
+    text += ` | cache ${cacheTelemetry.cachePercent}%`;
+  }
   if (loopTasks.length > 0) {
     text += ` | ${loopTasks.length} loop${loopTasks.length === 1 ? "" : "s"} active`;
   }
@@ -8158,12 +9004,6 @@ async function clearCurrentChat() {
   refreshMainBufferAfterCommand();
 }
 
-async function clearAllMemory() {
-  await ensureSessionFileReady();
-  await fs.writeFile(NEXUS_MEMORY_FILE, "", "utf8");
-  refreshMainBufferAfterCommand();
-}
-
 async function resumeCurrentChat() {
   await ensureSystemPromptReady();
   await loadSessionFileIntoChat(sessionFilePath);
@@ -8423,6 +9263,15 @@ async function runSlashCommand(commandName, commandArgs = "") {
     return true;
   }
 
+  if (commandName === "/cache") {
+    appendAssistantMessage(formatCacheTelemetry(selectedModel), {
+      excludeFromRequest: true,
+      persistHistory: false,
+    });
+    refreshMainBufferAfterCommand();
+    return true;
+  }
+
   if (commandName === "/set") {
     const args = String(commandArgs ?? "").trim();
     const [keyToken = ""] = args.split(/\s+/);
@@ -8527,19 +9376,6 @@ async function runSlashCommand(commandName, commandArgs = "") {
       return true;
     }
     await clearCurrentChat();
-    return true;
-  }
-
-  if (commandName === "/clear-memory") {
-    if (pendingAssistantRequests > 0) {
-      appendTuiErrorMessage("/clear-memory");
-      return true;
-    }
-    try {
-      await clearAllMemory();
-    } catch {
-      appendTuiErrorMessage("/clear-memory", "failed");
-    }
     return true;
   }
 
@@ -9783,7 +10619,11 @@ function highlightMarkdownText(text, allowBlockMarkers) {
 }
 
 function isRenderableChatEntry(entry) {
-  if (!entry || entry.hidden === true || entry.ephemeral === true) {
+  if (
+    !entry ||
+    entry.hidden === true ||
+    (entry.ephemeral === true && entry.live !== true)
+  ) {
     return false;
   }
 
@@ -10018,7 +10858,9 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
       ? entry.toolCode
       : "";
     let resultSource = message;
-    let toolHeader = `\u2022 Ran ${toolName}`;
+    let toolHeader = entry?.live === true
+      ? `\u2022 Running ${toolName}`
+      : `\u2022 Ran ${toolName}`;
     if (toolName === "code_execution") {
       const editSummary = extractEditSummaryFromToolOutput(message);
       if (editSummary) {
@@ -10187,8 +11029,8 @@ function getMainFrameTopForCurrentLayout(rows, cols) {
   const inputVisualLines = buildInputVisualLines(cols);
   const menuLines = getCommandMenuVisualLines(cols);
   const menuHeight = menuLines.length;
-  const statusVisible = isAssistantThinking() || isMcpStartupStatusVisible();
-  const statusRows = statusVisible ? STATUS_BAR_ROWS : 0;
+  const statusRows = getMainStatusRowCount();
+  const statusVisible = statusRows > 0;
   const statusChatGapRows = statusVisible ? STATUS_CHAT_GAP : 0;
   const statusInputGapRows = statusVisible ? STATUS_INPUT_GAP : 0;
   if (APPEND_CHAT_TO_SCROLLBACK) {
@@ -10231,8 +11073,8 @@ function getAppendReservedBottomRowsFromLayout(inputRowsCount, menuHeight, inclu
   // In append mode keep the composer compact and avoid appending footer artifacts.
   const footerRows = Number(menuHeight) > 0 ? 0 : MAIN_FOOTER_GAP + 1;
   const chatGapRows = CHAT_INPUT_GAP;
-  const statusVisible = includeStatus && isAssistantThinking();
-  const statusRows = statusVisible ? STATUS_BAR_ROWS : 0;
+  const statusRows = includeStatus ? getMainStatusRowCount() : 0;
+  const statusVisible = statusRows > 0;
   const statusChatGapRows = statusVisible ? STATUS_CHAT_GAP : 0;
   const statusInputGapRows = statusVisible ? STATUS_INPUT_GAP : 0;
   return Math.max(
@@ -10255,6 +11097,54 @@ function getAppendReservedBottomRows(cols, includeStatus = true) {
 
 function isAssistantThinking() {
   return pendingAssistantRequests > 0;
+}
+
+function addQueuedBusyPrompt(text) {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return null;
+  const entry = {
+    id: ++queuedBusyPromptSequence,
+    text: normalized,
+    sessionUid: currentSessionUid,
+  };
+  queuedBusyPrompts.push(entry);
+  return entry;
+}
+
+function removeQueuedBusyPrompt(entry) {
+  if (!entry) return;
+  const index = queuedBusyPrompts.indexOf(entry);
+  if (index >= 0) queuedBusyPrompts.splice(index, 1);
+}
+
+function getQueuedBusyPromptStatusLines(cols) {
+  if (!isAssistantThinking() || queuedBusyPrompts.length === 0) return [];
+  const sessionPrompts = queuedBusyPrompts.filter(
+    (entry) => entry.sessionUid === currentSessionUid
+  );
+  if (sessionPrompts.length === 0) return [];
+  const width = Math.max(20, Number(cols) || process.stdout.columns || 80);
+  const clip = (value) => {
+    const text = String(value || "");
+    if (text.length <= width) return text;
+    return `${text.slice(0, Math.max(1, width - 3))}...`;
+  };
+  const visible = sessionPrompts.slice(0, 3);
+  const lines = [clip("• Queued for the next turn")];
+  for (const entry of visible) {
+    lines.push(clip(`  ↳ ${entry.text}`));
+  }
+  if (sessionPrompts.length > visible.length) {
+    lines.push(clip(`  ... and ${sessionPrompts.length - visible.length} more`));
+  }
+  return lines;
+}
+
+function getMainStatusRowCount() {
+  const baseVisible = isAssistantThinking() || isMcpStartupStatusVisible() || solveStartupActive;
+  if (!baseVisible) return 0;
+  const queuedRows = getQueuedBusyPromptStatusLines(process.stdout.columns || 80).length;
+  return STATUS_BAR_ROWS + (queuedRows > 0 ? 1 + queuedRows : 0);
 }
 
 function isMcpStartupStatusVisible() {
@@ -10342,13 +11232,13 @@ function emitStopNotice() {
   renderFrame(true);
 }
 
-function getViewportChatInputGapRows(statusVisible) {
+function getViewportChatInputGapRows(statusVisible, statusRows = STATUS_BAR_ROWS) {
   if (!statusVisible) {
     return CHAT_INPUT_GAP_NO_STATUS;
   }
 
   // Reserve the status bar block so chat content shifts upward while thinking.
-  return CHAT_INPUT_GAP + STATUS_CHAT_GAP + STATUS_BAR_ROWS + STATUS_INPUT_GAP;
+  return CHAT_INPUT_GAP + STATUS_CHAT_GAP + statusRows + STATUS_INPUT_GAP;
 }
 
 function getStatusBarText() {
@@ -10985,8 +11875,9 @@ function getChatViewportInfo(cols, rows) {
   const footerHeight = menuHeight > 0 ? 0 : 1;
   const activeBottomPadding = menuHeight > 0 ? BOTTOM_PADDING : INPUT_BOTTOM_PADDING_NO_MENU;
   const frameHeight = inputVisualLines.length;
-  const statusVisible = isAssistantThinking() || isMcpStartupStatusVisible();
-  const chatInputGapRows = getViewportChatInputGapRows(statusVisible);
+  const statusRows = getMainStatusRowCount();
+  const statusVisible = statusRows > 0;
+  const chatInputGapRows = getViewportChatInputGapRows(statusVisible, statusRows);
   const footerBlockHeight = menuHeight > 0 ? 0 : MAIN_FOOTER_GAP + footerHeight;
   const menuBlockHeight = footerBlockHeight + (menuHeight > 0 ? MENU_INPUT_GAP + menuHeight : 0);
   const frameTop = Math.max(0, rows - activeBottomPadding - menuBlockHeight - frameHeight);
@@ -11936,11 +12827,15 @@ function renderFrame(forceChatRefresh = false) {
   const frameHeight = inputVisualLines.length;
   const cursorMetrics = getInputCursorMetrics(cols);
   const statusText = getStatusBarText();
-  const statusVisible = statusText.length > 0 || isMcpStartupStatusVisible();
-  const statusRows = statusVisible ? STATUS_BAR_ROWS : 0;
+  const queuedStatusLines = getQueuedBusyPromptStatusLines(cols);
+  const statusLines = statusText
+    ? [statusText, ...(queuedStatusLines.length > 0 ? ["", ...queuedStatusLines] : [])]
+    : [];
+  const statusRows = statusLines.length;
+  const statusVisible = statusRows > 0;
   const statusChatGapRows = statusVisible ? STATUS_CHAT_GAP : 0;
   const statusInputGapRows = statusVisible ? STATUS_INPUT_GAP : 0;
-  const chatInputGapRows = getViewportChatInputGapRows(statusVisible);
+  const chatInputGapRows = getViewportChatInputGapRows(statusVisible, statusRows);
   const footerBlockHeight = menuHeight > 0 ? 0 : MAIN_FOOTER_GAP + footerHeight;
   const menuBlockHeight = footerBlockHeight + (menuHeight > 0 ? MENU_INPUT_GAP + menuHeight : 0);
   const neededReservedRows = getAppendReservedBottomRowsFromLayout(
@@ -12175,8 +13070,8 @@ function renderFrame(forceChatRefresh = false) {
     }
     for (let i = 0; i < statusRows; i += 1) {
       rowMap.set(statusTop + i, {
-        type: "status",
-        text: i === statusRows - 1 ? statusText : "",
+        type: i === 0 ? "status" : i === 1 && queuedStatusLines.length > 0 ? "plain" : "muted",
+        text: statusLines[i] || "",
       });
     }
     for (let i = 0; i < statusInputGapRows; i += 1) {
@@ -12473,7 +13368,18 @@ function breakSubmittedInputHistoryNavigation() {
   }
 }
 
-function submit() {
+function appendSubmittedUserMessage(submission) {
+  if (!submission || typeof submission.resolvedContent !== "string") {
+    return false;
+  }
+  ensureSystemMessageAtTop();
+  messages.push({ role: "user", content: submission.resolvedContent });
+  appendHistoryEntry("user", submission.resolvedContent);
+  scrollChatToBottom();
+  return true;
+}
+
+function submit(options = {}) {
   if (!input || input.length === 0) {
     return false;
   }
@@ -12486,9 +13392,10 @@ function submit() {
     return false;
   }
 
-  ensureSystemMessageAtTop();
-  messages.push({ role: "user", content: resolvedContent });
-  appendHistoryEntry("user", resolvedContent);
+  const submission = { submittedInput, resolvedContent };
+  if (options?.deferAppend !== true) {
+    appendSubmittedUserMessage(submission);
+  }
   commitSubmittedInputHistory(submittedInput);
   input = "";
   inputCursorIndex = 0;
@@ -12496,8 +13403,7 @@ function submit() {
   commandMenuSelected = 0;
   commandMenuScroll = 0;
   syncImagePasteCounter();
-  scrollChatToBottom();
-  return true;
+  return submission;
 }
 
 function appendText(chunk) {
@@ -12902,6 +13808,57 @@ async function runExecuteTransportSelfTest() {
     out(`EXECUTE_FAIL: ${JSON.stringify(result)}\n`);
     return 1;
   }
+  const streamStartedAt = Date.now();
+  let firstStreamAt = 0;
+  let streamedText = "";
+  const streamedResult = await executeCodeWithPythonTool(
+    "import time\nprint('STREAM_ONE', flush=True)\ntime.sleep(0.35)\nprint('STREAM_TWO', flush=True)",
+    {
+      onOutput: (chunk) => {
+        if (!firstStreamAt) firstStreamAt = Date.now();
+        streamedText += chunk;
+      },
+    }
+  );
+  const streamFinishedAt = Date.now();
+  if (
+    !streamedResult?.ok ||
+    !streamedText.includes("STREAM_ONE") ||
+    !streamedText.includes("STREAM_TWO") ||
+    !String(streamedResult.output || "").includes("STREAM_TWO") ||
+    !firstStreamAt ||
+    streamFinishedAt - firstStreamAt < 200
+  ) {
+    out(`EXECUTE_FAIL: live output did not stream before completion: ${JSON.stringify({ streamedResult, streamedText, firstDelayMs: firstStreamAt - streamStartedAt, leadMs: streamFinishedAt - firstStreamAt })}\n`);
+    return 1;
+  }
+  const shellStreamCommand = `python -c "import time; print('SHELL_STREAM_ONE'); time.sleep(0.35); print('SHELL_STREAM_TWO')"`;
+  let firstShellStreamAt = 0;
+  let shellStreamedText = "";
+  const shellStreamStartedAt = Date.now();
+  const shellStreamResult = await executeCodeWithPythonTool(
+    `result = run_shell(${JSON.stringify(shellStreamCommand)}, timeout=5)\nprint(result)`,
+    {
+      onOutput: (chunk) => {
+        if (!firstShellStreamAt && String(chunk).includes("SHELL_STREAM_ONE")) {
+          firstShellStreamAt = Date.now();
+        }
+        shellStreamedText += chunk;
+      },
+    }
+  );
+  const shellStreamFinishedAt = Date.now();
+  if (
+    !shellStreamResult?.ok ||
+    !shellStreamedText.includes("SHELL_STREAM_ONE") ||
+    !shellStreamedText.includes("SHELL_STREAM_TWO") ||
+    !String(shellStreamResult.output || "").includes("'exit_code': 0") ||
+    !firstShellStreamAt ||
+    shellStreamFinishedAt - firstShellStreamAt < 200
+  ) {
+    out(`EXECUTE_FAIL: run_shell output did not stream before completion: ${JSON.stringify({ shellStreamResult, shellStreamedText, firstDelayMs: firstShellStreamAt - shellStreamStartedAt, leadMs: shellStreamFinishedAt - firstShellStreamAt })}\n`);
+    return 1;
+  }
   try {
     collaborationMode = "plan";
     const readResult = await executeCodeWithPythonTool(
@@ -12909,6 +13866,37 @@ async function runExecuteTransportSelfTest() {
     );
     if (!readResult?.ok || !String(readResult.output || "").includes("{")) {
       out(`EXECUTE_FAIL: plan mode blocked read-only inspection: ${JSON.stringify(readResult)}\n`);
+      return 1;
+    }
+    const searchResult = await executeCodeWithPythonTool(
+      "print(tool_search('android app build', limit=3))"
+    );
+    if (!searchResult?.ok || !String(searchResult.output || "").includes("android_build")) {
+      out(`EXECUTE_FAIL: deferred helper search failed: ${JSON.stringify(searchResult)}\n`);
+      return 1;
+    }
+    const memorySearchResult = await executeCodeWithPythonTool(
+      "print(tool_search('persistent memory', limit=10))"
+    );
+    const memorySearchOutput = String(memorySearchResult?.output || "");
+    if (
+      !memorySearchResult?.ok ||
+      !memorySearchOutput.includes("harness_memory") ||
+      /insert_memory|retrieve_memory|memory_keywords|remove_memory|update_memory/.test(memorySearchOutput)
+    ) {
+      out(`EXECUTE_FAIL: harness is not the sole memory API: ${JSON.stringify(memorySearchResult)}\n`);
+      return 1;
+    }
+    const skillManagementSearch = await executeCodeWithPythonTool(
+      "print(tool_search('create update delete personal skill', limit=10))"
+    );
+    const skillManagementOutput = String(skillManagementSearch?.output || "");
+    if (
+      !skillManagementSearch?.ok ||
+      !skillManagementOutput.includes("manage_skill") ||
+      skillManagementOutput.includes("harness_skill")
+    ) {
+      out(`EXECUTE_FAIL: skill management APIs are not unified: ${JSON.stringify(skillManagementSearch)}\n`);
       return 1;
     }
     const writeResult = await executeCodeWithPythonTool(
@@ -12935,6 +13923,20 @@ async function runExecuteTransportSelfTest() {
 function runFormatSelfTest() {
   const out = process.stdout.write.bind(process.stdout);
   try {
+    const savedPendingAssistantRequests = pendingAssistantRequests;
+    pendingAssistantRequests = Math.max(1, pendingAssistantRequests);
+    const queuedPreview = addQueuedBusyPrompt("queued preview message");
+    const queuedStatusLines = getQueuedBusyPromptStatusLines(80);
+    removeQueuedBusyPrompt(queuedPreview);
+    pendingAssistantRequests = savedPendingAssistantRequests;
+    if (
+      queuedStatusLines.length !== 2 ||
+      !queuedStatusLines[0].includes("Queued for the next turn") ||
+      !queuedStatusLines[1].includes("queued preview message")
+    ) {
+      out(`FORMAT_FAIL: queued busy prompt status is incorrect: ${JSON.stringify(queuedStatusLines)}\n`);
+      return 1;
+    }
     if (
       shouldTransitionCommandDirectlyToAltBuffer("/loop", "") ||
       !shouldTransitionCommandDirectlyToAltBuffer("/loops", "")
@@ -13103,17 +14105,121 @@ function runFormatSelfTest() {
       out("FORMAT_FAIL: build system prompt must not depend on model, skills, or MCP runtime state\n");
       return 1;
     }
+    const deferredPrompt = buildSystemPromptFromDescriptions(FALLBACK_TOOL_DESCRIPTIONS, {
+      collaborationMode: "build",
+    });
+    if (
+      !deferredPrompt.includes("tool_search") ||
+      !deferredPrompt.includes("list_skills()") ||
+      !deferredPrompt.includes("get_skill(name") ||
+      !deferredPrompt.includes("SKILL USE (MUST FOLLOW)") ||
+      !deferredPrompt.includes("before other implementation actions, package installation") ||
+      !deferredPrompt.includes("Do not install dependencies for a specialized task until skill discovery is complete") ||
+      !deferredPrompt.includes("MCP USE (MUST FOLLOW)") ||
+      !deferredPrompt.includes("first call mcp_search(action='list')") ||
+      !deferredPrompt.includes("before trying web or direct HTTP") ||
+      !deferredPrompt.includes("Deferred MCP schemas are not a reason to skip MCP discovery") ||
+      !deferredPrompt.includes("manage_skill(name") ||
+      !deferredPrompt.includes("harness_overview()") ||
+      !deferredPrompt.includes("harness_memory(key") ||
+      !deferredPrompt.includes("harness_prompt_note(name") ||
+      !deferredPrompt.includes("harness_subagent(name") ||
+      !deferredPrompt.includes("record_refinement(summary") ||
+      !deferredPrompt.includes("refine_reflection(auto") ||
+      !deferredPrompt.includes("set_reminder(when") ||
+      !deferredPrompt.includes("web_search(query") ||
+      !deferredPrompt.includes("fetch_url(url") ||
+      !deferredPrompt.includes("run_shell(..., background=True)") ||
+      !deferredPrompt.includes("fixed 10-minute (600-second) process-tree timeout") ||
+      !deferredPrompt.includes("completion or timeout arrives later") ||
+      !deferredPrompt.includes("Never confuse 'not configured locally' with 'not available'") ||
+      !deferredPrompt.includes("supports stdio and HTTP MCP servers") ||
+      deferredPrompt.includes("mcp_list()") ||
+      deferredPrompt.includes("android_build(project_path") ||
+      deferredPrompt.includes("kernel_exec(code")
+    ) {
+      out("FORMAT_FAIL: default discovery helpers or deferred operational helpers are incorrect\n");
+      return 1;
+    }
+    const framingProbe = { jsonrpc: "2.0", id: 7, result: { ok: true } };
+    const newlineFrame = mcpMessageFrame(framingProbe);
+    const contentLengthFrame = mcpMessageFrame(framingProbe, "content-length");
+    const parsedNewlineFrame = mcpParseFrame(Buffer.from(newlineFrame, "utf8"));
+    const parsedContentLengthFrame = mcpParseFrame(Buffer.from(contentLengthFrame, "utf8"));
+    if (
+      !newlineFrame.endsWith("\n") ||
+      newlineFrame.startsWith("Content-Length:") ||
+      parsedNewlineFrame?.message?.id !== 7 ||
+      parsedContentLengthFrame?.message?.id !== 7
+    ) {
+      out("FORMAT_FAIL: MCP stdio framing compatibility failed\n");
+      return 1;
+    }
+    const cacheUsage = extractCacheTokenUsage({
+      usage: { prompt_tokens: 1000, prompt_tokens_details: { cached_tokens: 800 } },
+    });
+    if (cacheUsage.promptTokens !== 1000 || cacheUsage.cachedTokens !== 800) {
+      out(`FORMAT_FAIL: cache token telemetry parsing failed: ${JSON.stringify(cacheUsage)}\n`);
+      return 1;
+    }
+    const savedMessagesForDiscovery = [...messages];
+    messages.length = 0;
+    ensureSystemMessageAtTop();
+    messages.push({
+      role: "tool",
+      name: "code_execution",
+      toolCode: "print(tool_search('android app build'))",
+      content: "{'matches': [{'name': 'android_build', 'description': 'FULL_DYNAMIC_SCHEMA'}]}",
+    });
+    const immediateDiscoveryRequest = buildOpenRouterMessagesFromHistory("self-test");
+    messages.push({ role: "assistant", content: "I found the Android helper." });
+    const compactedDiscoveryRequest = buildOpenRouterMessagesFromHistory("self-test");
+    messages.length = 0;
+    messages.push(...savedMessagesForDiscovery);
+    const immediateText = immediateDiscoveryRequest.map((entry) => String(entry.content || "")).join("\n");
+    const compactedText = compactedDiscoveryRequest.map((entry) => String(entry.content || "")).join("\n");
+    if (
+      !immediateText.includes("FULL_DYNAMIC_SCHEMA") ||
+      compactedText.includes("FULL_DYNAMIC_SCHEMA") ||
+      !compactedText.includes("discovery schema compacted after use") ||
+      !compactedText.includes("android_build")
+    ) {
+      out("FORMAT_FAIL: deferred discovery schemas were not compacted after their immediate use\n");
+      return 1;
+    }
     const planModePrompt = buildSystemPromptFromDescriptions(
       {
         get_file_content: FALLBACK_TOOL_DESCRIPTIONS.get_file_content,
         write_file: FALLBACK_TOOL_DESCRIPTIONS.write_file,
+        harness_overview: toolDescriptions.harness_overview,
+        harness_memory: toolDescriptions.harness_memory,
+        manage_skill: toolDescriptions.manage_skill,
+        harness_prompt_note: toolDescriptions.harness_prompt_note,
+        harness_subagent: toolDescriptions.harness_subagent,
+        record_refinement: toolDescriptions.record_refinement,
+        refine_reflection: toolDescriptions.refine_reflection,
+        set_reminder: toolDescriptions.set_reminder,
+        web_search: toolDescriptions.web_search,
+        fetch_url: toolDescriptions.fetch_url,
       },
       { collaborationMode: "plan" }
     );
     if (
       !planModePrompt.includes("PLAN MODE (MANDATORY)") ||
+      !planModePrompt.includes("SKILL USE (MUST FOLLOW)") ||
+      !planModePrompt.includes("Do not substitute an ad-hoc library workflow without checking skills first") ||
       !planModePrompt.includes("get_file_content") ||
+      !planModePrompt.includes("harness_overview()") ||
+      !planModePrompt.includes("web_search(query") ||
+      !planModePrompt.includes("fetch_url(url") ||
       planModePrompt.includes("write_file") ||
+      planModePrompt.includes("harness_memory(key") ||
+      planModePrompt.includes("manage_skill(name") ||
+      planModePrompt.includes("harness_prompt_note(name") ||
+      planModePrompt.includes("harness_subagent(name") ||
+      planModePrompt.includes("record_refinement(summary") ||
+      planModePrompt.includes("refine_reflection(auto") ||
+      planModePrompt.includes("set_reminder(when") ||
       /context (?:remaining|left)/i.test(planModePrompt)
     ) {
       out("FORMAT_FAIL: plan-mode prompt did not filter mutating tools\n");
@@ -13137,6 +14243,49 @@ function runFormatSelfTest() {
       !planPayload.historyText.includes("created_count")
     ) {
       out("FORMAT_FAIL: plan UI must preserve raw JSON only in tool history\n");
+      return 1;
+    }
+    const mixedEditRunLines = getToolResultLinesForDisplay(
+      "{'ok': True, 'stdout': '0\\n1\\n'}\n--- a/loop_demo.py\n+++ b/loop_demo.py\n@@ -1 +1 @@\n-print('old')\n+print('new')"
+    );
+    if (
+      !mixedEditRunLines.some((line) => line.includes("stdout")) ||
+      mixedEditRunLines.findIndex((line) => line.includes("stdout")) <=
+        mixedEditRunLines.findIndex((line) => /\d+ [+-] /.test(line))
+    ) {
+      out("FORMAT_FAIL: mixed edit and run output must remain visible after the compact diff\n");
+      return 1;
+    }
+    const mixedEditRunPayload = buildToolResultPayload({
+      ok: true,
+      output: "File written. Now running...\n{'ok': False, 'exit_code': 9009}",
+      editEvents: [
+        "Edited loop.py (+1 -1)\n--- a/loop.py\n+++ b/loop.py\n@@ -1 +1 @@\n-old\n+new",
+      ],
+    });
+    if (
+      mixedEditRunPayload.uiSections?.length !== 2 ||
+      mixedEditRunPayload.uiSections[0]?.kind !== "edit" ||
+      mixedEditRunPayload.uiSections[1]?.kind !== "result" ||
+      !mixedEditRunPayload.uiSections[1]?.text.includes("exit_code")
+    ) {
+      out("FORMAT_FAIL: mixed edit and execution output must render as separate UI sections\n");
+      return 1;
+    }
+    const nestedShellFailurePayload = buildToolResultPayload({
+      ok: true,
+      output: "{'ok': False, 'exit_code': 1, 'stderr': 'ModuleNotFoundError'}",
+    });
+    if (nestedShellFailurePayload.toolOk !== false) {
+      out("FORMAT_FAIL: a failed nested run_shell result must render as a failed tool\n");
+      return 1;
+    }
+    const nestedFetchFailurePayload = buildToolResultPayload({
+      ok: true,
+      output: "{'url': 'https://example.test', 'text': '', 'error': 'HTTP 403: Blocked'}",
+    });
+    if (nestedFetchFailurePayload.toolOk !== false) {
+      out("FORMAT_FAIL: a non-empty nested helper error must render as a failed tool\n");
       return 1;
     }
     const styledRenderedPlan = buildTranscriptLinesForEntry(
@@ -14131,24 +15280,17 @@ async function runMcpSelfTest() {
     // tools/list, and tools/call with a static "ping" tool.
     const serverScript = [
       "function frame(msg) {",
-      "  const body = JSON.stringify(msg);",
-      "  const crlf = String.fromCharCode(13, 10);",
-      "  process.stdout.write('Content-Length: ' + Buffer.byteLength(body, 'utf8') + crlf + crlf + body);",
+      "  process.stdout.write(JSON.stringify(msg) + String.fromCharCode(10));",
       "}",
-      "let buf = Buffer.alloc(0);",
-      "const CRLFCRLF = Buffer.from([13, 10, 13, 10]);",
+      "let buf = '';",
       "process.stdin.on('data', (chunk) => {",
-      "  buf = Buffer.concat([buf, chunk]);",
+      "  buf += String(chunk);",
       "  for (;;) {",
-      "    const idx = buf.indexOf(CRLFCRLF);",
+      "    const idx = buf.indexOf(String.fromCharCode(10));",
       "    if (idx === -1) return;",
-      "    const header = buf.slice(0, idx).toString('utf8');",
-      "    const m = /Content-Length: *(\\d+)/i.exec(header);",
-      "    if (!m) return;",
-      "    const len = Number(m[1]);",
-      "    if (buf.length < idx + 4 + len) return;",
-      "    const raw = buf.slice(idx + 4, idx + 4 + len).toString('utf8');",
-      "    buf = buf.slice(idx + 4 + len);",
+      "    const raw = buf.slice(0, idx).trim();",
+      "    buf = buf.slice(idx + 1);",
+      "    if (!raw) continue;",
       "    const msg = JSON.parse(raw);",
       "    if (msg.method === 'initialize') {",
       "      frame({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'mock', version: '1.0.0' } } });",
@@ -14167,9 +15309,9 @@ async function runMcpSelfTest() {
     const scriptPath = path.join(os.tmpdir(), `nexus-mcp-mock-${process.pid}.js`);
     fsSync.writeFileSync(scriptPath, serverScript, "utf8");
 
-    // When running as a SEA binary, process.execPath is sea.exe, which cannot
+    // When running as a SEA binary, process.execPath is nexus.exe, which cannot
     // execute a JS script as an MCP server. Resolve a real node executable.
-    // Never use a SEA binary (sea.exe) as the mock runner: it cannot execute
+    // Never use a SEA binary (nexus.exe) as the mock runner: it cannot execute
     // a JS script. Only accept process.execPath when it is an actual node
     // binary (running the source tree); otherwise prefer a sibling node.exe,
     // the standard install path, or PATH lookup.
@@ -14351,7 +15493,7 @@ async function runMcpSelfTest() {
       }
       const promptWithCatalog = buildSystemPromptFromDescriptions(toolDescriptions, { collaborationMode: "build" });
       if (
-        !promptWithCatalog.includes("schemas stay outside this prompt") ||
+        !promptWithCatalog.includes("MCP schemas are also deferred") ||
         promptWithCatalog.includes("Ping test tool") ||
         promptWithCatalog.includes('"properties":{"value"') ||
         promptWithCatalog.includes("remoteMock") ||
@@ -14452,6 +15594,11 @@ if (process.argv.includes("--self-test-format")) {
 
 if (process.argv.includes("--self-test-mcp")) {
   runMcpSelfTest().then((code) => process.exit(code));
+  return;
+}
+
+if (process.argv.includes("--self-test-background")) {
+  runBackgroundShellSelfTest().then((code) => process.exit(code));
   return;
 }
 
@@ -15410,6 +16557,7 @@ process.stdin.on("keypress", async (str, key) => {
 
     cancelIdleFlush();
     burstMode = false;
+    const queueBehindActiveTurn = isAssistantThinking();
     // UserPromptSubmit hook: deterministic pre-prompt hooks (e.g. inject
     // context, block prompts). exit code 2 blocks the turn.
     const promptHookRun = await runHooks({
@@ -15426,23 +16574,30 @@ process.stdin.on("keypress", async (str, key) => {
       renderFrame(true);
       return;
     }
-    if (promptHookRun.additionalContext) {
+    const queuedHookContext = queueBehindActiveTurn
+      ? promptHookRun.additionalContext || ""
+      : "";
+    if (promptHookRun.additionalContext && !queueBehindActiveTurn) {
       pendingHookContext = promptHookRun.additionalContext;
     }
 
     // Reminders go through the model via the set_reminder tool, which the
     // agent calls when the user asks to be reminded ("remind me in 5 min").
     const modelAtSubmit = selectedModel;
-    const didAppend = submit();
-    if (didAppend) {
-      if (APPEND_CHAT_TO_SCROLLBACK) {
+    const submission = submit({ deferAppend: queueBehindActiveTurn });
+    if (submission) {
+      if (APPEND_CHAT_TO_SCROLLBACK && !queueBehindActiveTurn) {
         appendTranscriptNow();
       }
-      queueAssistantReply(modelAtSubmit);
+      queueAssistantReply(modelAtSubmit, {
+        queuedPrompt: queueBehindActiveTurn ? trimmedInput : "",
+        deferredUserMessage: queueBehindActiveTurn ? submission : null,
+        deferredHookContext: queuedHookContext,
+      });
     }
     markDirty();
     renderFrame(false);
-    if (didAppend && APPEND_CHAT_TO_SCROLLBACK) {
+    if (submission && APPEND_CHAT_TO_SCROLLBACK && !queueBehindActiveTurn) {
       markDirty();
       renderFrame(false);
     }

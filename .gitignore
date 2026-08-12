@@ -5,6 +5,7 @@ tests/
 .npmrc
 __pycache__/
 sea.exe
+nexus.exe
 sea-prep.blob
 dist/
 tools.exe

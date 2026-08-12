@@ -1,4 +1,4 @@
-"""Persistent Python kernel for simple-code-tui.
+"""Persistent Python kernel for Nexus.
 
 Reads newline-delimited JSON from stdin:  {"id": "1", "code": "x = 40"}
 Executes `code` in a long-lived scope (state persists across requests).

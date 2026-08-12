@@ -35,7 +35,7 @@ find_android_jar() {
 
 for command_name in javac jar keytool aapt d8 apksigner; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
-    echo "Missing $command_name. Run simple-code-tui/termux/setup-android-build.sh" >&2
+    echo "Missing $command_name. Run nexus/termux/setup-android-build.sh" >&2
     exit 1
   fi
 done
@@ -43,7 +43,7 @@ done
 ANDROID_JAR=$(find_android_jar || true)
 if [ -z "$ANDROID_JAR" ]; then
   echo "Missing Android framework (android.jar)." >&2
-  echo "Run simple-code-tui/termux/setup-android-build.sh" >&2
+  echo "Run nexus/termux/setup-android-build.sh" >&2
   exit 1
 fi
 
@@ -118,12 +118,12 @@ echo "APK: $SIGNED_APK"
 
 if [ "${1:-}" = "--deploy" ]; then
   if ! command -v adb >/dev/null 2>&1; then
-    echo "Missing adb. Run simple-code-tui/termux/setup-android-build.sh" >&2
+    echo "Missing adb. Run nexus/termux/setup-android-build.sh" >&2
     exit 1
   fi
   if [ "$(adb get-state 2>/dev/null || true)" != "device" ]; then
     echo "No paired Android debugging device is connected." >&2
-    echo "Reconnect with simple-code-tui/termux/connect-adb.sh" >&2
+    echo "Reconnect with nexus/termux/connect-adb.sh" >&2
     exit 1
   fi
   echo "Installing updated APK through on-phone ADB..."
