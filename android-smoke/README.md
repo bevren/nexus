@@ -4,7 +4,7 @@ This is an editable Android app that the TUI can build, update, and relaunch
 entirely on the phone. It deliberately uses the small native toolchain instead
 of Gradle: `AAPT -> javac -> D8 -> apksigner`.
 
-From the `simple-code-tui` repository in Termux:
+From the `nexus` repository in Termux:
 
 ```sh
 git pull --ff-only

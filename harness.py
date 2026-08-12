@@ -53,7 +53,7 @@ def _load_harness() -> dict:
                 return data
     except Exception:
         pass
-    return {"memories": {}, "skills": {}, "subagents": {}, "prompt_notes": {}, "refinements": []}
+    return {"memories": {}, "subagents": {}, "prompt_notes": {}, "refinements": []}
 
 
 def _save_harness(h: dict) -> bool:
@@ -244,52 +244,6 @@ class _Harness:
         _save_harness(h)
         return {"deleted": existed, "kind": "memory", "key": key}
 
-    def create_skill(self, name: str, description: str = "", body: str = "") -> dict:
-        from pathlib import Path as _P
-        base = _P.home() / ".nexus" / "skills" / str(name)
-        base.mkdir(parents=True, exist_ok=True)
-        md = "---\nname: %s\ndescription: %s\n---\n\n%s\n" % (name, description.replace("\n", " "), body)
-        (base / "SKILL.md").write_text(md, encoding="utf-8")
-        return {"ok": True, "kind": "skill", "name": name, "path": str(base)}
-
-    def update_skill(self, name: str, description: str | None = None, body: str | None = None) -> dict:
-        from pathlib import Path as _P
-        md_path = _P.home() / ".nexus" / "skills" / str(name) / "SKILL.md"
-        if not md_path.exists():
-            return {"ok": False, "error": "skill not found"}
-        text = md_path.read_text(encoding="utf-8")
-        front, sep, rest = text.partition("---\n\n")
-        if sep:
-            head = text[: text.index("---", 3)]
-            tail = text[text.index("---", 3) + 3 :]
-            if description is not None:
-                new_lines = []
-                for ln in head.split("\n"):
-                    if ln.startswith("description:"):
-                        new_lines.append("description: " + description.replace("\n", " "))
-                    else:
-                        new_lines.append(ln)
-                head = "\n".join(new_lines)
-            if body is not None:
-                out = head + tail
-                first_nl = out.find("\n", out.find("---"))
-                out = out[: first_nl + 1] + "\n" + body + "\n"
-                md_path.write_text(out, encoding="utf-8")
-            else:
-                md_path.write_text(head + tail, encoding="utf-8")
-        elif body is not None:
-            md_path.write_text(body, encoding="utf-8")
-        return {"ok": True, "kind": "skill", "name": name}
-
-    def delete_skill(self, name: str) -> dict:
-        from pathlib import Path as _P
-        import shutil
-        target = _P.home() / ".nexus" / "skills" / str(name)
-        if target.exists():
-            shutil.rmtree(target, ignore_errors=True)
-            return {"deleted": True, "kind": "skill", "name": name}
-        return {"deleted": False, "kind": "skill", "name": name}
-
     def create_subagent(self, name: str, prompt: str, model: str | None = None, system: str | None = None) -> dict:
         h = _load_harness()
         h.setdefault("subagents", {})[name] = {
@@ -338,7 +292,6 @@ class _Harness:
         h = _load_harness()
         return {
             "memories": sorted(h.get("memories", {}).keys()),
-            "skills": sorted(h.get("skills", {}).keys()),
             "subagents": sorted(h.get("subagents", {}).keys()),
             "prompt_notes": sorted(h.get("prompt_notes", {}).keys()),
             "refinements": len(h.get("refinements", [])),

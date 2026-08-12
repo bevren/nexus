@@ -3,35 +3,43 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 from pathlib import Path
 import re
+import signal
 import shutil
 import statistics
 import subprocess
 import sys
+import threading
 import difflib
 import textwrap
 import bisect
 import hashlib
 from datetime import datetime, timezone
-from collections import Counter
-from uuid import uuid4
 from typing import Iterable
 import harness
 import skills_deps
 
 WORKSPACE_ROOT = Path.cwd().resolve()
 NEXUS_DIR = Path.home() / ".nexus"
-MEMORY_STORE_FILE = NEXUS_DIR / "memory.jsonl"
 PLAN_STORE_DIR = NEXUS_DIR / "plans"
 SUMMARY_PREVIEW_CHARS = 2000
 MAX_DIFF_LINES = 600
-MAX_MEMORY_RESULTS = 5000
 MAX_HISTORY_EXCLUDE_MATCHES = 5000
 EDIT_EVENT_LOG: list[str] = []
 EDIT_SUMMARY_LOG: list[str] = []
 HISTORY_ACTION_LOG: list[dict[str, object]] = []
 PLAN_UI_EVENT_LOG: list[dict[str, object]] = []
+BACKGROUND_JOB_EVENT_LOG: list[dict[str, object]] = []
+SHELL_STREAM_WRITER = None
+
+
+def set_shell_stream_writer(writer) -> None:
+    """Set an execute-transport-only callback for live foreground shell output."""
+    global SHELL_STREAM_WRITER
+    SHELL_STREAM_WRITER = writer if callable(writer) else None
 
 
 def _resolve_workspace_path(path: str) -> Path:
@@ -122,6 +130,12 @@ def drain_plan_ui_events() -> list[dict[str, object]]:
     return events
 
 
+def drain_background_job_events() -> list[dict[str, object]]:
+    events = list(BACKGROUND_JOB_EVENT_LOG)
+    BACKGROUND_JOB_EVENT_LOG.clear()
+    return events
+
+
 def _record_plan_ui_event(entries: list[dict[str, object]]) -> None:
     PLAN_UI_EVENT_LOG.append(
         {
@@ -137,12 +151,6 @@ def _record_plan_ui_event(entries: list[dict[str, object]]) -> None:
             ],
         }
     )
-
-
-def _ensure_memory_store_ready() -> None:
-    NEXUS_DIR.mkdir(parents=True, exist_ok=True)
-    if not MEMORY_STORE_FILE.exists():
-        MEMORY_STORE_FILE.write_text("", encoding="utf-8")
 
 
 def _ensure_plan_store_ready() -> None:
@@ -271,117 +279,6 @@ def _format_plan_entries(entries: list[dict[str, object]]) -> str:
     return "\n".join(lines)
 
 
-def _normalize_keywords_input(value: object) -> list[str]:
-    if value is None:
-        return []
-
-    if isinstance(value, str):
-        source_items: list[object] = [value]
-    elif isinstance(value, (list, tuple, set)):
-        source_items = list(value)
-    else:
-        raise ValueError("keywords must be a string or a list of strings")
-
-    out: list[str] = []
-    seen: set[str] = set()
-    for item in source_items:
-        if not isinstance(item, str):
-            raise ValueError("keywords must contain only strings")
-        for part in re.split(r"[,;\n]", item):
-            keyword = part.strip().lower()
-            if not keyword:
-                continue
-            if keyword in seen:
-                continue
-            seen.add(keyword)
-            out.append(keyword)
-    return out
-
-
-def _iter_memory_records() -> list[dict[str, object]]:
-    _ensure_memory_store_ready()
-    text = MEMORY_STORE_FILE.read_text(encoding="utf-8", errors="replace")
-    records: list[dict[str, object]] = []
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            parsed = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(parsed, dict):
-            continue
-        memory = parsed.get("memory")
-        if not isinstance(memory, str) or not memory.strip():
-            continue
-        record_id = parsed.get("id")
-        if not isinstance(record_id, str) or not record_id:
-            record_id = uuid4().hex
-        created_at = parsed.get("created_at")
-        if not isinstance(created_at, str) or not created_at:
-            created_at = datetime.now(timezone.utc).isoformat()
-        keywords = _normalize_keywords_input(parsed.get("keywords"))
-        records.append(
-            {
-                "id": record_id,
-                "memory": memory,
-                "keywords": keywords,
-                "created_at": created_at,
-            }
-        )
-    return records
-
-
-def _normalize_preference_topic(topic: str) -> str:
-    cleaned = str(topic).strip().lower()
-    cleaned = re.sub(r'^[\'"`]+|[\'"`]+$', "", cleaned)
-    cleaned = re.sub(r"[.!?]+$", "", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned
-
-
-def _extract_preference_signature(
-    memory_text: str, keywords: list[str] | None = None
-) -> tuple[str, str] | None:
-    text = str(memory_text or "").strip()
-    if not text:
-        return None
-
-    normalized_keywords = _normalize_keywords_input(keywords)
-    has_preference_keyword = "preference" in set(normalized_keywords)
-
-    patterns: list[tuple[str, str]] = [
-        (
-            "dislike",
-            r"^\s*user\s+(?:now\s+)?(?:does\s+not\s+like|doesn't\s+like|dislikes?|hates?)\s+(.+?)\s*[.!?]*\s*$",
-        ),
-        (
-            "dislike",
-            r"^\s*i\s+(?:do\s+not\s+like|don't\s+like|dislike|hate)\s+(.+?)\s*[.!?]*\s*$",
-        ),
-        (
-            "like",
-            r"^\s*user\s+(?:now\s+)?(?:likes?|loves?|prefers?)\s+(.+?)\s*[.!?]*\s*$",
-        ),
-        ("like", r"^\s*i\s+(?:like|love|prefer)\s+(.+?)\s*[.!?]*\s*$"),
-    ]
-
-    for value, pattern in patterns:
-        match = re.match(pattern, text, re.IGNORECASE)
-        if not match:
-            continue
-        topic = _normalize_preference_topic(match.group(1))
-        if not topic:
-            return None
-        return (f"preference:{topic}", value)
-
-    if has_preference_keyword:
-        return None
-
-    return None
-
-
 def word_count(text: str) -> int:
     """Count words in a string."""
     return len(re.findall(r"\b\w+\b", text))
@@ -411,295 +308,6 @@ def average(values: Iterable[float]) -> float:
 def title_case(text: str) -> str:
     """Convert text to title case."""
     return text.title()
-
-
-def insert_memory(memory: str, keyword: str | list[str]) -> dict[str, object]:
-    """Insert persistent memory with one or more keywords."""
-    if not isinstance(memory, str) or not memory.strip():
-        raise ValueError("memory must be a non-empty string")
-
-    memory_text = memory.strip()
-    keywords = _normalize_keywords_input(keyword)
-    if not keywords:
-        raise ValueError("keyword must include at least one non-empty keyword")
-
-    record = {
-        "id": uuid4().hex,
-        "memory": memory_text,
-        "keywords": keywords,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    # Preference statements (e.g., likes/dislikes) are upserted by topic
-    # so we keep only one effective memory per preference key.
-    preference_sig = _extract_preference_signature(memory_text, keywords)
-    if preference_sig is not None:
-        pref_key, pref_value = preference_sig
-        existing_records = _iter_memory_records()
-        kept_records: list[dict[str, object]] = []
-        replaced_count = 0
-        exact_duplicate = None
-
-        for existing in existing_records:
-            existing_keywords = _normalize_keywords_input(existing.get("keywords"))
-            existing_sig = _extract_preference_signature(
-                str(existing.get("memory", "")), existing_keywords
-            )
-            if existing_sig is None or existing_sig[0] != pref_key:
-                kept_records.append(existing)
-                continue
-
-            same_text = str(existing.get("memory", "")).strip().casefold() == memory_text.casefold()
-            same_keywords = set(existing_keywords) == set(keywords)
-            same_value = existing_sig[1] == pref_value
-            if same_text and same_keywords and same_value:
-                exact_duplicate = existing
-                kept_records.append(existing)
-            else:
-                replaced_count += 1
-
-        if exact_duplicate is not None and replaced_count == 0:
-            existing_memory = str(exact_duplicate.get("memory", ""))
-            return {
-                "ok": True,
-                "id": str(exact_duplicate.get("id", "")),
-                "keywords": _normalize_keywords_input(exact_duplicate.get("keywords")),
-                "bytes_written": len(existing_memory.encode("utf-8")),
-                "upserted_preference": True,
-                "preference_key": pref_key,
-                "preference_value": pref_value,
-                "skipped": "already_exists",
-            }
-
-        _ensure_memory_store_ready()
-        with MEMORY_STORE_FILE.open("w", encoding="utf-8") as fp:
-            for existing in kept_records:
-                fp.write(json.dumps(existing, ensure_ascii=False) + "\n")
-            fp.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-        return {
-            "ok": True,
-            "id": record["id"],
-            "keywords": keywords,
-            "bytes_written": len(record["memory"].encode("utf-8")),
-            "upserted_preference": True,
-            "preference_key": pref_key,
-            "preference_value": pref_value,
-            "replaced_count": replaced_count,
-        }
-
-    _ensure_memory_store_ready()
-    with MEMORY_STORE_FILE.open("a", encoding="utf-8") as fp:
-        fp.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-    return {
-        "ok": True,
-        "id": record["id"],
-        "keywords": keywords,
-        "bytes_written": len(record["memory"].encode("utf-8")),
-    }
-
-
-def retrieve_memory(
-    query: str = "",
-    use_regex: bool = False,
-    case_sensitive: bool = False,
-    regex_flags: str = "",
-    keywords: str | list[str] | None = None,
-    max_results: int = 20,
-) -> list[dict[str, object]]:
-    """Retrieve persistent memory by string/regex query and optional keyword filtering."""
-    if not isinstance(query, str):
-        raise ValueError("query must be a string")
-    if not isinstance(use_regex, bool):
-        raise ValueError("use_regex must be a boolean")
-    if not isinstance(case_sensitive, bool):
-        raise ValueError("case_sensitive must be a boolean")
-    if not isinstance(regex_flags, str):
-        raise ValueError("regex_flags must be a string")
-    if not isinstance(max_results, int) or max_results < 1:
-        raise ValueError("max_results must be an integer >= 1")
-    if max_results > MAX_MEMORY_RESULTS:
-        raise ValueError(f"max_results must be <= {MAX_MEMORY_RESULTS}")
-
-    query_text = query.strip()
-    keyword_filter = _normalize_keywords_input(keywords)
-    if not query_text and not keyword_filter:
-        raise ValueError("provide query and/or keywords")
-
-    records = _iter_memory_records()
-    records = list(reversed(records))
-
-    matcher = None
-    if query_text:
-        if use_regex:
-            flags = _parse_regex_flags(regex_flags)
-            if not case_sensitive:
-                flags |= re.IGNORECASE
-            try:
-                matcher = re.compile(query_text, flags)
-            except re.error as exc:
-                raise ValueError(f"invalid regex pattern: {exc}") from exc
-        else:
-            matcher = query_text if case_sensitive else query_text.lower()
-
-    def _collect_results(apply_query_match: bool) -> list[dict[str, object]]:
-        collected: list[dict[str, object]] = []
-        for record in records:
-            record_keywords = _normalize_keywords_input(record.get("keywords"))
-            if keyword_filter and not any(key in record_keywords for key in keyword_filter):
-                continue
-
-            memory_text = str(record.get("memory", ""))
-            if apply_query_match and matcher is not None:
-                if use_regex:
-                    if not matcher.search(memory_text):
-                        continue
-                else:
-                    haystack = memory_text if case_sensitive else memory_text.lower()
-                    if matcher not in haystack:
-                        continue
-
-            collected.append(
-                {
-                    "id": record.get("id", ""),
-                    "memory": memory_text,
-                    "keywords": record_keywords,
-                    "created_at": record.get("created_at", ""),
-                }
-            )
-            if len(collected) >= max_results:
-                break
-
-        return collected
-
-    results = _collect_results(apply_query_match=True)
-    if results:
-        return results
-
-    # If a query produced no strict hits but keyword filters were provided,
-    # fall back to keyword-only matches instead of returning empty.
-    if query_text and keyword_filter:
-        return _collect_results(apply_query_match=False)
-
-    return results
-
-
-def memory_keywords() -> list[dict[str, object]]:
-    """Return all inserted memory keywords with usage counts."""
-    records = _iter_memory_records()
-    counter: Counter[str] = Counter()
-    for record in records:
-        counter.update(_normalize_keywords_input(record.get("keywords")))
-
-    items = [{"keyword": key, "count": int(count)} for key, count in counter.items()]
-    items.sort(key=lambda item: (-item["count"], item["keyword"]))
-    return items
-
-
-def remove_memory(id: str) -> dict[str, object]:
-    """Remove a memory record by its id."""
-    if not isinstance(id, str) or not id.strip():
-        raise ValueError("id must be a non-empty string")
-
-    target_id = id.strip()
-    records = _iter_memory_records()
-    kept_records: list[dict[str, object]] = []
-    removed_record: dict[str, object] | None = None
-
-    for record in records:
-        record_id = str(record.get("id", ""))
-        if removed_record is None and record_id == target_id:
-            removed_record = record
-            continue
-        kept_records.append(record)
-
-    if removed_record is None:
-        return {
-            "ok": False,
-            "id": target_id,
-            "removed": False,
-            "message": "memory id not found",
-        }
-
-    _ensure_memory_store_ready()
-    with MEMORY_STORE_FILE.open("w", encoding="utf-8") as fp:
-        for record in kept_records:
-            fp.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-    removed_memory = str(removed_record.get("memory", ""))
-    return {
-        "ok": True,
-        "id": target_id,
-        "removed": True,
-        "bytes_removed": len(removed_memory.encode("utf-8")),
-    }
-
-
-def update_memory(
-    id: str,
-    memory: str | None = None,
-    keyword: str | list[str] | None = None,
-) -> dict[str, object]:
-    """Update one memory record by id (memory text and/or keywords)."""
-    if not isinstance(id, str) or not id.strip():
-        raise ValueError("id must be a non-empty string")
-
-    target_id = id.strip()
-    has_memory_update = memory is not None
-    has_keyword_update = keyword is not None
-    if not has_memory_update and not has_keyword_update:
-        raise ValueError("provide memory and/or keyword to update")
-
-    next_memory = None
-    if has_memory_update:
-        if not isinstance(memory, str) or not memory.strip():
-            raise ValueError("memory must be a non-empty string when provided")
-        next_memory = memory.strip()
-
-    next_keywords = None
-    if has_keyword_update:
-        next_keywords = _normalize_keywords_input(keyword)
-        if not next_keywords:
-            raise ValueError("keyword must include at least one non-empty keyword when provided")
-
-    records = _iter_memory_records()
-    updated = False
-    bytes_written = 0
-
-    for record in records:
-        record_id = str(record.get("id", ""))
-        if record_id != target_id:
-            continue
-        if next_memory is not None:
-            record["memory"] = next_memory
-        if next_keywords is not None:
-            record["keywords"] = next_keywords
-        bytes_written = len(str(record.get("memory", "")).encode("utf-8"))
-        updated = True
-        break
-
-    if not updated:
-        return {
-            "ok": False,
-            "id": target_id,
-            "updated": False,
-            "message": "memory id not found",
-        }
-
-    _ensure_memory_store_ready()
-    with MEMORY_STORE_FILE.open("w", encoding="utf-8") as fp:
-        for record in records:
-            fp.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-    return {
-        "ok": True,
-        "id": target_id,
-        "updated": True,
-        "memory_updated": next_memory is not None,
-        "keywords_updated": next_keywords is not None,
-        "bytes_written": bytes_written,
-    }
 
 
 def exclude_history_messages(
@@ -1476,10 +1084,146 @@ def replace_in_file(
     }
 
 
-def run_shell(command: str, timeout: int | float = 10) -> dict[str, object]:
-    """Run a shell command in workspace with timeout (seconds)."""
+def _create_windows_kill_job(process: subprocess.Popen):
+    """Assign a child to a kill-on-close Windows Job Object using only stdlib ctypes."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        configured = kernel32.SetInformationJobObject(
+            job, 9, ctypes.byref(info), ctypes.sizeof(info)
+        )
+        assigned = configured and kernel32.AssignProcessToJobObject(
+            job, wintypes.HANDLE(int(process._handle))
+        )
+        if not assigned:
+            kernel32.CloseHandle(job)
+            return None
+        return job
+    except Exception:
+        return None
+
+
+def _close_windows_job(job, terminate: bool = False) -> None:
+    if not job or os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        if terminate:
+            kernel32.TerminateJobObject(job, 1)
+        kernel32.CloseHandle(job)
+    except Exception:
+        pass
+
+
+def _terminate_process_tree(process: subprocess.Popen, windows_job=None) -> None:
+    """Terminate a shell and all descendants without waiting indefinitely on inherited pipes."""
+    if os.name == "nt":
+        if windows_job:
+            _close_windows_job(windows_job, terminate=True)
+            return
+        try:
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+            process.wait(timeout=1)
+            return
+        except Exception:
+            pass
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                timeout=2,
+                check=False,
+            )
+            return
+        except Exception:
+            pass
+    else:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            return
+        except Exception:
+            pass
+    try:
+        process.kill()
+    except Exception:
+        pass
+
+
+def run_shell(
+    command: str,
+    timeout: int | float = 10,
+    background: bool = False,
+) -> dict[str, object]:
+    """Run synchronously with a timeout, or launch a TUI-owned background job capped at 10 minutes."""
     if not isinstance(command, str) or not command.strip():
         raise ValueError("command must be a non-empty string")
+    if not isinstance(background, bool):
+        raise ValueError("background must be a boolean")
+
+    if background:
+        result = _bridge_request(
+            "background_shell",
+            {"command": command.strip()},
+        )
+        if result.get("ok") and result.get("job_id"):
+            BACKGROUND_JOB_EVENT_LOG.append({"job_id": str(result["job_id"])})
+        return result
 
     try:
         timeout_seconds = float(timeout)
@@ -1491,31 +1235,93 @@ def run_shell(command: str, timeout: int | float = 10) -> dict[str, object]:
     if timeout_seconds > 600:
         raise ValueError("timeout must be <= 600 seconds")
 
+    popen_options: dict[str, object] = {}
+    if os.name == "nt":
+        popen_options["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_options["start_new_session"] = True
+    process = subprocess.Popen(
+        command,
+        shell=True,
+        cwd=str(WORKSPACE_ROOT),
+        # Python otherwise block-buffers stdout when it is connected to the
+        # execute transport pipe, so normal print() calls would only appear
+        # after the command exits. Other programs simply ignore this variable.
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        **popen_options,
+    )
+    windows_job = _create_windows_kill_job(process)
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+
+    def pump_stream(pipe, stream_name: str, chunks: list[str]) -> None:
+        if pipe is None:
+            return
+        try:
+            for value in iter(pipe.readline, ""):
+                chunks.append(value)
+                writer = SHELL_STREAM_WRITER
+                if writer is not None:
+                    try:
+                        writer(stream_name, value)
+                    except Exception:
+                        pass
+        finally:
+            try:
+                pipe.close()
+            except Exception:
+                pass
+
+    stdout_thread = threading.Thread(
+        target=pump_stream,
+        args=(process.stdout, "stdout", stdout_chunks),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=pump_stream,
+        args=(process.stderr, "stderr", stderr_chunks),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+
+    timed_out = False
     try:
-        completed = subprocess.run(
-            command,
-            shell=True,
-            cwd=str(WORKSPACE_ROOT),
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-        )
-        return {
-            "ok": completed.returncode == 0,
-            "exit_code": int(completed.returncode),
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-            "timed_out": False,
-        }
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "ok": False,
-            "exit_code": None,
-            "stdout": (exc.stdout or ""),
-            "stderr": (exc.stderr or ""),
-            "timed_out": True,
-            "error": f"Command timed out after {timeout_seconds:g}s",
-        }
+        process.wait(timeout=timeout_seconds)
+        _close_windows_job(windows_job)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _terminate_process_tree(process, windows_job)
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except Exception:
+                pass
+    finally:
+        for thread in (stdout_thread, stderr_thread):
+            thread.join(timeout=1)
+        for pipe in (process.stdout, process.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+
+    result = {
+        "ok": not timed_out and process.returncode == 0,
+        "exit_code": None if timed_out else int(process.returncode),
+        "stdout": "".join(stdout_chunks),
+        "stderr": "".join(stderr_chunks),
+        "timed_out": timed_out,
+    }
+    if timed_out:
+        result["error"] = f"Command timed out after {timeout_seconds:g}s"
+    return result
 
 
 def android_build(
@@ -2142,6 +1948,72 @@ def get_skill(name: str) -> dict[str, object]:
     }
 
 
+def manage_skill(
+    name: str,
+    description: str = "",
+    body: str = "",
+    delete: bool = False,
+) -> dict[str, object]:
+    """Create, update, or delete a personal skill in ~/.nexus/skills."""
+    key = str(name or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", key) or key in {".", ".."}:
+        return {"ok": False, "error": "skill name must use only letters, numbers, dot, underscore, or hyphen"}
+
+    personal_root = SKILLS_DIRS[0].resolve()
+    target = (personal_root / key).resolve()
+    try:
+        target.relative_to(personal_root)
+    except ValueError:
+        return {"ok": False, "error": "skill path must stay inside ~/.nexus/skills"}
+
+    if delete:
+        if not target.exists():
+            return {"ok": True, "deleted": False, "name": key, "scope": "personal"}
+        shutil.rmtree(target)
+        return {"ok": True, "deleted": True, "name": key, "scope": "personal"}
+
+    skill_file = target / "SKILL.md"
+    existing_description = ""
+    existing_body = ""
+    existing_frontmatter = ""
+    if skill_file.exists():
+        raw = skill_file.read_text(encoding="utf-8", errors="replace")
+        _old_name, existing_description, existing_frontmatter, existing_body = _parse_skill_frontmatter(raw)
+    elif not str(body or "").strip():
+        return {"ok": False, "error": "body is required when creating a skill", "name": key}
+
+    next_description = str(description).strip() if str(description).strip() else existing_description
+    next_body = str(body).strip() if str(body).strip() else existing_body.strip()
+    frontmatter_lines = []
+    saw_name = False
+    saw_description = False
+    for line in existing_frontmatter.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("name:"):
+            frontmatter_lines.append(f"name: {key}")
+            saw_name = True
+        elif stripped.startswith("description:"):
+            frontmatter_lines.append(f"description: {next_description.replace(chr(10), ' ')}")
+            saw_description = True
+        else:
+            frontmatter_lines.append(line)
+    if not saw_name:
+        frontmatter_lines.insert(0, f"name: {key}")
+    if not saw_description:
+        frontmatter_lines.append(f"description: {next_description.replace(chr(10), ' ')}")
+
+    target.mkdir(parents=True, exist_ok=True)
+    rendered = "---\n" + "\n".join(frontmatter_lines) + "\n---\n\n" + next_body + "\n"
+    skill_file.write_text(rendered, encoding="utf-8")
+    return {
+        "ok": True,
+        "created": not bool(existing_frontmatter or existing_body),
+        "name": key,
+        "scope": "personal",
+        "path": str(target),
+    }
+
+
 
 # --- RLM subagents + continual harness (Prime Agent-style interfaces) ---
 
@@ -2190,7 +2062,10 @@ def delete_subagent(handle_id: str) -> dict:
 def harness_overview() -> dict:
     """Continual harness overview: memories, skills, subagent templates, prompt notes, refinements."""
     try:
-        return harness.rlm.harness.overview()
+        overview = harness.rlm.harness.overview()
+        catalog = list_skills()
+        overview["skills"] = [item["name"] for item in catalog.get("skills", [])]
+        return overview
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -2226,19 +2101,6 @@ def harness_subagent(name: str, prompt: str = "", model: str = "", system: str =
         if prompt:
             return h.update_subagent(name, prompt=prompt, model=model or None, system=system or None)
         return h.create_subagent(name, prompt or name, model=model or None, system=system or None)
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
-
-
-def harness_skill(name: str, description: str = "", body: str = "", delete: bool = False) -> dict:
-    """Create/update/delete a skill in the continual harness (writes ~/.nexus/skills/<name>/SKILL.md)."""
-    try:
-        h = harness.rlm.harness
-        if delete:
-            return h.delete_skill(name)
-        if body:
-            return h.create_skill(name, description, body)
-        return h.update_skill(name, description=description or None, body=None)
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -2364,6 +2226,14 @@ def kernel_reset() -> dict:
 
 
 def _read_mcp_bridge_info() -> dict:
+    env_port = os.environ.get("NEXUS_TUI_BRIDGE_PORT", "").strip()
+    if env_port:
+        try:
+            port = int(env_port)
+            if port > 0:
+                return {"port": port, "pid": os.environ.get("NEXUS_TUI_BRIDGE_PID", "")}
+        except ValueError:
+            pass
     bridge_file = NEXUS_DIR / "mcp_bridge.json"
     try:
         if not bridge_file.exists():
@@ -2433,7 +2303,117 @@ def mcp_call(server: str, tool: str, args: dict | None = None) -> dict:
         return {"ok": False, "error": f"MCP bridge request failed: {exc}"}
 
 
+def mcp_search(
+    query: str = "",
+    action: str = "search",
+    server: str = "",
+    tool: str = "",
+    args: dict | None = None,
+    limit: int = 5,
+) -> dict:
+    """Search, describe, list, or call tools in the TUI's deferred MCP catalog."""
+    import urllib.request
+
+    info = _read_mcp_bridge_info()
+    if not info:
+        return {
+            "ok": False,
+            "error": "MCP bridge not available. Is the TUI running with MCP enabled, and are servers configured in ~/.nexus/mcp_config.json?",
+        }
+    action = str(action or "search").strip().lower()
+    if action not in {"list", "search", "describe", "call"}:
+        return {"ok": False, "error": "mcp_search: action must be list, search, describe, or call"}
+    if action == "search" and not str(query or "").strip():
+        return {"ok": False, "error": "mcp_search: query must be non-empty for search"}
+    if action in {"describe", "call"} and (not str(server or "").strip() or not str(tool or "").strip()):
+        return {"ok": False, "error": f"mcp_search: server and tool are required for {action}"}
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        return {"ok": False, "error": "mcp_search: args must be a dict"}
+
+    payload = json.dumps({
+        "method": "search",
+        "action": action,
+        "query": str(query or ""),
+        "server": str(server or ""),
+        "tool": str(tool or ""),
+        "arguments": args,
+        "limit": limit,
+    }).encode("utf-8")
+    url = f"http://127.0.0.1:{info['port']}/"
+    try:
+        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+        timeout = 60 if action == "call" else 15
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        return {"ok": False, "error": f"MCP bridge request failed: {exc}"}
+
+
+def _tool_search_tokens(value: object) -> list[str]:
+    return re.findall(r"[a-z0-9]+", str(value or "").lower())
+
+
+def tool_search(query: str, limit: int = 5) -> dict:
+    """Search deferred built-in helpers without placing every signature in the system prompt."""
+    query_text = str(query or "").strip().lower()
+    if not query_text:
+        return {"ok": False, "error": "tool_search: query must be non-empty"}
+    try:
+        result_limit = max(1, min(20, int(limit)))
+    except (TypeError, ValueError):
+        result_limit = 5
+
+    query_tokens = set(_tool_search_tokens(query_text))
+    documents = []
+    document_frequency: dict[str, int] = {}
+    for name, description in FUNCTION_DESCRIPTIONS.items():
+        if name == "tool_search":
+            continue
+        tokens = _tool_search_tokens(f"{name} {description}")
+        token_set = set(tokens)
+        documents.append((name, description, tokens, token_set))
+        for token in token_set:
+            document_frequency[token] = document_frequency.get(token, 0) + 1
+
+    count = max(1, len(documents))
+    average_length = max(1.0, sum(len(item[2]) for item in documents) / count)
+    ranked = []
+    for name, description, tokens, _token_set in documents:
+        raw_name = name.lower()
+        score = 0.0
+        if query_text == raw_name:
+            score += 1000.0
+        if query_text in raw_name:
+            score += 120.0
+        for token in query_tokens:
+            frequency = tokens.count(token)
+            if frequency <= 0:
+                continue
+            df = document_frequency.get(token, 0)
+            inverse_frequency = math.log(1.0 + (count - df + 0.5) / (df + 0.5))
+            normalized_length = 0.6 + 0.4 * (len(tokens) / average_length)
+            score += inverse_frequency * ((frequency * 1.9) / (frequency + 0.9 * normalized_length))
+            if token in raw_name:
+                score += 20.0
+        if score > 0:
+            ranked.append((score, name, description))
+
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return {
+        "ok": True,
+        "query": query_text,
+        "matches": [
+            {"name": name, "description": description}
+            for _score, name, description in ranked[:result_limit]
+        ],
+        "totalCatalogTools": len(documents),
+    }
+
+
 FUNCTIONS = {
+    "tool_search": tool_search,
     "create_plan": create_plan,
     "update_plan": update_plan,
     "get_current_plan": get_current_plan,
@@ -2459,6 +2439,7 @@ FUNCTIONS = {
     "fetch_url": fetch_url,
     "list_skills": list_skills,
     "get_skill": get_skill,
+    "manage_skill": manage_skill,
     "rlm_spawn": rlm_spawn,
     "list_subagents": list_subagents,
     "delete_subagent": delete_subagent,
@@ -2466,19 +2447,20 @@ FUNCTIONS = {
     "harness_memory": harness_memory,
     "harness_prompt_note": harness_prompt_note,
     "harness_subagent": harness_subagent,
-    "harness_skill": harness_skill,
     "record_refinement": record_refinement,
     "refine_reflection": refine_reflection,
     "skill_python_path": skill_python_path,
     "web_search": web_search,
     "mcp_list": mcp_list,
     "mcp_call": mcp_call,
+    "mcp_search": mcp_search,
     "set_reminder": set_reminder,
     "kernel_exec": kernel_exec,
     "kernel_reset": kernel_reset,
 }
 
 FUNCTION_DESCRIPTIONS = {
+    "tool_search": "tool_search(query: str, limit: int = 5) -> dict: Search deferred built-in helper names and descriptions. Returns the most relevant exact helper signatures; call a discovered helper in a later execute block.",
     "create_plan": "create_plan(entries: str|list[str]) -> dict: Create a new workspace to-do plan and return the full plan.",
     "update_plan": "update_plan(completed: int|str|list[int|str]|None = None, new_entries: str|list[str]|None = None) -> dict: Mark plan entries completed and/or add new plan entries, then return updated entries and current plan.",
     "get_current_plan": "get_current_plan() -> dict: Get current workspace plan with [ ]/[✓] style formatted output.",
@@ -2495,7 +2477,7 @@ FUNCTION_DESCRIPTIONS = {
     "find_in_file": "find_in_file(path: str, query: str, use_regex: bool = False, case_sensitive: bool = False, regex_flags: str = '', max_results: int = 200) -> list[dict]: Find matches in one file (literal or regex) with line/column locations.",
     "write_file": "write_file(path: str, content: str) -> dict: Write text file (create/overwrite) in workspace.",
     "replace_in_file": "replace_in_file(path: str, old: str, new: str, count: int = -1, use_regex: bool = False, regex_flags: str = '') -> dict: Replace text in a file (literal or regex).",
-    "run_shell": "run_shell(command: str, timeout: int|float = 10) -> dict: Run shell command with timeout seconds.",
+    "run_shell": "run_shell(command: str, timeout: int|float = 10, background: bool = False) -> dict: Run synchronously with a process-tree timeout. With background=True, use a fixed 600-second process-tree timeout, return {ok, job_id, pid, status, timeout} immediately, and add completion to chat later.",
     "android_build": "android_build(project_path: str = 'android-smoke', deploy: bool = True, timeout: int|float = 300) -> dict: Build an Android project locally in Termux. With deploy=true, install the APK over paired on-phone ADB, stop the old app, and launch the updated activity.",
     "get_git_status": "get_git_status() -> dict: Return git status summary.",
     "get_git_diff": "get_git_diff(path: str = '', staged: bool = False, context_lines: int = 3, max_chars: int = 60000) -> dict: Return git diff text.",
@@ -2505,6 +2487,7 @@ FUNCTION_DESCRIPTIONS = {
     "skill_python_path": "skill_python_path() -> str: Return the shared skill venv python executable (creates venv if needed). Use with run_shell to run skill scripts that depend on requirements.txt packages.",
     "list_skills": "list_skills() -> dict: List available skills. Returns {skills: [{name, description}], error}.",
     "get_skill": "get_skill(name: str) -> dict: Get a skill by name. Returns {name, description, path, body, error}. Load the body only when using the skill.",
+    "manage_skill": "manage_skill(name: str, description: str = '', body: str = '', delete: bool = False) -> dict: Create, update, or delete a personal skill under ~/.nexus/skills. Workspace and bundled skills are read-only.",
     "web_search": "web_search(query: str, max_results: int = 5) -> dict: Search the web via DuckDuckGo (Lite HTML with Instant Answer fallback). Returns {query, results: [{title, snippet, url}], error}.",
     "rlm_spawn": "rlm_spawn(prompt: str, model: str = '', system: str = '', timeout: int = 300, max_tokens: int = 2048, template: str = '') -> dict: Spawn a child sub-agent. Returns an admission handle {id, status, prompt} immediately; poll list_subagents() or delete_subagent(id).",
     "list_subagents": "list_subagents() -> list[dict]: List spawned child sub-agents with status, prompt, result, error.",
@@ -2513,11 +2496,11 @@ FUNCTION_DESCRIPTIONS = {
     "harness_memory": "harness_memory(key: str, content: str = '', delete: bool = False) -> dict: Create/update/delete a persistent harness memory by key.",
     "harness_prompt_note": "harness_prompt_note(name: str, content: str = '', delete: bool = False) -> dict: Create/update/delete a persistent harness prompt note by name.",
     "harness_subagent": "harness_subagent(name: str, prompt: str = '', model: str = '', system: str = '', delete: bool = False) -> dict: Persist a reusable subagent template.",
-    "harness_skill": "harness_skill(name: str, description: str = '', body: str = '', delete: bool = False) -> dict: Create/update/delete a skill in the continual harness.",
     "record_refinement": "record_refinement(summary: str, evidence: str = '') -> dict: Persist a reusable pattern into the continual harness with evidence.",
     "refine_reflection": "refine_reflection(auto: bool = True) -> dict: Auto-synthesize a refinement from recent subagent results and prompt notes.",
     "mcp_list": "mcp_list() -> dict: List all configured MCP servers and the tool names each exposes. Returns {ok: bool, servers?: {name: {status, error?, tools: [name]}}, error?: str}.",
     "mcp_call": "mcp_call(server: str, tool: str, args: dict | None = None) -> dict: Call a tool exposed by an MCP server (configured in ~/.nexus/mcp_config.json). Returns the server's result as {ok: bool, result?: object, text?: str, error?: str}.",
+    "mcp_search": "mcp_search(query: str = '', action: str = 'search', server: str = '', tool: str = '', args: dict | None = None, limit: int = 5) -> dict: Search the deferred MCP catalog without loading every schema into context. Actions: list returns server counts; search returns matching schemas; describe returns one exact schema; call invokes an exact discovered tool.",
     "set_reminder": "set_reminder(when: str, prompt: str) -> dict: Schedule a one-shot session reminder via the TUI bridge. when is a human phrase like 'in 5 minutes', 'in 2 hours', 'at 3pm', 'tomorrow 9am'. prompt is the exact action/message to run when it fires. Fires once as a normal user turn. Use whenever the user asks to be reminded or to remember something later.",
     "kernel_exec": "kernel_exec(code: str) -> dict: Execute Python in the session's persistent kernel. State persists across calls (variables/functions defined here are usable in later kernel_exec calls). Returns {ok, output, error, traceback}; print() surfaces results. Use for iterative/stateful computation where recomputing from scratch would be wasteful.",
     "kernel_reset": "kernel_reset() -> dict: Kill the persistent kernel so the next kernel_exec starts with a clean scope. Returns {ok, error}.",

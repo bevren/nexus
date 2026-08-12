@@ -51,6 +51,6 @@ at runtime on Android 6+.
   user explicitly requests them; the bundled phone toolchain does not resolve
   Maven dependencies.
 - If the Android toolchain is missing, direct the user to
-  `sh termux/setup-android-build.sh` from the simple-code-tui repository.
+  `sh termux/setup-android-build.sh` from the Nexus repository.
 - If ADB is disconnected, build successfully and explain how to reconnect with
   `sh termux/connect-adb.sh`; retain `--install` as the interactive fallback.

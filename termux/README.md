@@ -1,4 +1,4 @@
-# Run simple-code-tui on Android
+# Run Nexus on Android
 
 This first milestone runs the complete TUI, agent tools, Git workspace, and
 Python kernels locally on the phone through Termux. It does not use a PC
@@ -15,15 +15,15 @@ In Termux, run:
 pkg update -y
 pkg install -y git
 git clone --branch agent/kernel-tui-reliability \
-  https://github.com/bevren/simple-code-tui.git
-cd simple-code-tui
+  https://github.com/bevren/nexus.git
+cd nexus
 sh termux/setup.sh
 ```
 
 ## Launch
 
 ```sh
-cd "$HOME/simple-code-tui"
+cd "$HOME/nexus"
 sh termux/run.sh
 ```
 
@@ -48,7 +48,7 @@ Termux from battery optimization for unattended solve sessions.
 ## Update
 
 ```sh
-cd "$HOME/simple-code-tui"
+cd "$HOME/nexus"
 git pull --ff-only
 npm install --omit=dev
 sh termux/run.sh
