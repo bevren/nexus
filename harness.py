@@ -262,15 +262,27 @@ def _extract_execute_blocks(text: str) -> list[dict]:
             index += 1
             continue
         fence = opening.group(1)
+        # Any backtick/tilde run of 3+ is a potential closer. Runs at least as
+        # long as the opener are unambiguous and win; when only shorter runs
+        # exist (e.g. a 4-tick opener closed by a 3-tick run, a common
+        # mistake), fall back to the LAST such run instead of truncating.
         close_candidates = [
             position
             for position in range(index + 1, len(lines))
-            if _matching_fence(lines[position], fence[0], len(fence))
+            if _matching_fence(lines[position], fence[0], 3)
         ]
         if not close_candidates:
             blocks.append({"code": "\n".join(lines[index + 1 :]), "complete": False})
             break
-        close_index = close_candidates[-1] if len(fence) == 3 else close_candidates[0]
+        if len(fence) == 3:
+            close_index = close_candidates[-1]
+        else:
+            strong = [
+                position
+                for position in close_candidates
+                if len(lines[position].strip()) >= len(fence)
+            ]
+            close_index = strong[0] if strong else close_candidates[-1]
         blocks.append({"code": "\n".join(lines[index + 1 : close_index]), "complete": True})
         index = close_index + 1
     return blocks

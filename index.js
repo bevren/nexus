@@ -919,6 +919,8 @@ let focusReportingEnabled = false;
 let keyboardProtocolModeEnabled = false;
 let thinkingStartedAt = 0;
 let activeToolRun = null; // { label, startedAt, done, ok }
+let clarifyingActive = false;
+let clarifyingStartedAt = 0;
 let stopRequested = false;
 let queuedBusyPromptSequence = 0;
 const queuedBusyPrompts = [];
@@ -6401,12 +6403,24 @@ function extractAllPythonCodeBlockEntries(text) {
         closingIndex = lastNonEmptyIndex;
       }
     } else {
-      // Variable-length fences are unambiguous: shorter runs remain payload.
+      // Variable-length fences: prefer the first run at least as long as the
+      // opener (shorter runs remain payload). If no run qualifies - e.g. a
+      // 4-tick opener closed by a 3-tick run, a common mistake - fall back to
+      // the last 3+ run of the same character instead of truncating.
+      let fallbackClosingIndex = -1;
       for (let i = openingIndex + 1; i < lines.length; i += 1) {
-        if (isMatchingFenceClosing(lines[i], fence)) {
+        const candidate = String(lines[i]).match(/^ {0,3}(`{3,}|~{3,})[ \t]*$/);
+        if (!candidate || candidate[1][0] !== fence.character) {
+          continue;
+        }
+        if (candidate[1].length >= fence.length) {
           closingIndex = i;
           break;
         }
+        fallbackClosingIndex = i;
+      }
+      if (closingIndex < 0 && fallbackClosingIndex >= 0) {
+        closingIndex = fallbackClosingIndex;
       }
     }
 
@@ -12918,6 +12932,14 @@ function getStatusBarText() {
     return `${frame} ${solveStartupStatus || "Launching Kernel..."} (${elapsed}s) - Esc cancels`;
   }
 
+  if (clarifyingActive) {
+    const frame = SPINNER_FRAMES[spinnerFrameIndex % SPINNER_FRAMES.length];
+    const elapsed = clarifyingStartedAt > 0
+      ? Math.max(0, Math.floor((Date.now() - clarifyingStartedAt) / 1000))
+      : 0;
+    return `${frame} ${BOLD_WHITE}Clarifying${RESET_COLOR}${PLACEHOLDER_COLOR} (${elapsed}s)${RESET_COLOR}`;
+  }
+
   if (!isAssistantThinking()) {
     activeToolRun = null;
     return "";
@@ -12928,8 +12950,8 @@ function getStatusBarText() {
     const label = activeToolRun.label || "code execution";
     const elapsed = Math.floor((Date.now() - activeToolRun.startedAt) / 1000);
     if (!activeToolRun.done) {
-      const symbol = spinnerFrameIndex % 2 === 0 ? "\u2022" : "\u25e6";
-      return styleRunningToolStatus(symbol, label, elapsed);
+      const frame = SPINNER_FRAMES[spinnerFrameIndex % SPINNER_FRAMES.length];
+      return styleRunningToolStatus(frame, label, elapsed);
     }
     const mark = activeToolRun.ok ? "\u2713" : "\u2717";
     return `${mark} ${label} (${elapsed}s)`;
@@ -12942,9 +12964,9 @@ function getStatusBarText() {
   return `${symbol} ${applyShineEffect(thinkingText, shineFrameIndex, 5)}`;
 }
 
-function styleRunningToolStatus(symbol, command, elapsedSeconds) {
+function styleRunningToolStatus(spinner, command, elapsedSeconds) {
   const highlightedCommand = highlightPythonInline(command);
-  return `${symbol} ${BOLD_WHITE}Running${RESET_COLOR} ${highlightedCommand}${PLACEHOLDER_COLOR} (${elapsedSeconds}s)${RESET_COLOR}`;
+  return `${spinner} ${BOLD_WHITE}Running${RESET_COLOR} ${highlightedCommand}${PLACEHOLDER_COLOR} (${elapsedSeconds}s)${RESET_COLOR}`;
 }
 
 const SHINE_RESET = "\u001b[0m";
@@ -12972,7 +12994,7 @@ function applyShineEffect(text, frameIndex, windowWidth) {
 
 function isStatusAnimationNeeded() {
   if (activeBuffer === "main") {
-    return isAssistantThinking() || isMcpStartupStatusVisible() || solveStartupActive;
+    return isAssistantThinking() || clarifyingActive || isMcpStartupStatusVisible() || solveStartupActive;
   }
   if (activeBuffer === "kernels") {
     return solveStartupActive;
@@ -15147,8 +15169,90 @@ function appendSubmittedUserMessage(submission) {
   return true;
 }
 
+async function runClarify() {
+  if (!input || clarifyingActive) {
+    return false;
+  }
+  const raw = input;
+  const text = raw.replace(/-clarify\s*$/, "").replace(/\s+$/, "");
+  if (!/\S/.test(text)) {
+    return false;
+  }
+  clarifyingActive = true;
+  clarifyingStartedAt = Date.now();
+  updateThinkingAnimationState();
+  markDirty();
+  renderFrame(false);
+  try {
+    const client = getOpenRouterClient();
+    if (!client) {
+      input = `[clarify error] no provider configured. ${raw}`;
+      inputCursorIndex = input.length;
+      return false;
+    }
+    const payload = {
+      model: selectedModel,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Rewrite the user's message to be clearer, fixing grammar and spelling while keeping the original meaning and intent. Reply with only the clarified text: no quotes, no labels, no explanation.",
+        },
+        { role: "user", content: text },
+      ],
+      max_tokens: 1024,
+    };
+    const llmTimeoutMs = getLlmRequestTimeoutMs();
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(
+        () => reject(new Error(`Request timed out after ${Math.round(llmTimeoutMs / 1000)}s`)),
+        llmTimeoutMs
+      );
+    });
+    const completion = await Promise.race([
+      client.chat.completions.create(payload),
+      timeoutPromise,
+    ]);
+    const clarified = String(
+      completion?.choices?.[0]?.message?.content ||
+        completion?.choices?.[0]?.message?.reasoning_content ||
+        ""
+    ).trim();
+    if (!clarified) {
+      input = raw;
+      inputCursorIndex = input.length;
+      return false;
+    }
+    input = clarified;
+    inputCursorIndex = input.length;
+    syncImagePasteCounter();
+    markDirty();
+    renderFrame(false);
+    return true;
+  } catch (error) {
+    input = `${raw} [clarify error: ${String(error?.message || error).slice(0, 120)}]`;
+    inputCursorIndex = input.length;
+    markDirty();
+    renderFrame(false);
+    return false;
+  } finally {
+    clarifyingActive = false;
+    clarifyingStartedAt = 0;
+    updateThinkingAnimationState();
+    markDirty();
+    renderFrame(false);
+  }
+}
+
 function submit(options = {}) {
   if (!input || input.length === 0) {
+    return false;
+  }
+
+  // -clarify: intercept, rewrite the input via a separate LLM request, and
+  // leave the clarified text in the input box for review. Never submit.
+  if (/-clarify\s*$/.test(input)) {
+    runClarify();
     return false;
   }
 
