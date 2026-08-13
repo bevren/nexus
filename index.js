@@ -14,6 +14,42 @@ const qrcodeTerminal = require("qrcode-terminal");
 
 const PACKAGE_ROOT = __dirname;
 const TOOLS_SCRIPT_PATH = path.join(PACKAGE_ROOT, "tools.py");
+const WORKSPACE_GUIDE_FILENAMES = ["AGENTS.md", "AGENT.md"];
+const WORKSPACE_GUIDE_MAX_CHARS = 32 * 1024;
+const INIT_CONTRIBUTOR_GUIDE_PROMPT = `Generate a file named AGENTS.md that serves as a contributor guide for this repository.
+Before writing, check whether AGENTS.md already exists in the current working directory. If it does, do not overwrite or modify it.
+Your goal is to produce a clear, concise, and well-structured document with descriptive headings and actionable explanations for each section.
+Follow the outline below, but adapt as needed - add sections if relevant, and omit those that do not apply to this project.
+
+Document Requirements
+
+- Title the document "Repository Guidelines".
+- Use Markdown headings (#, ##, etc.) for structure.
+- Keep the document concise. 200-400 words is optimal.
+- Keep explanations short, direct, and specific to this repository.
+- Provide examples where helpful (commands, directory paths, naming patterns).
+- Maintain a professional, instructional tone.
+
+Recommended Sections
+
+Project Structure & Module Organization
+
+Build, Test, and Development Commands
+
+- List key commands for building, testing, and running locally (e.g., npm test, make build).
+- Include any formatting or linting tools used.
+
+Testing Guidelines
+
+- Identify testing frameworks and coverage requirements.
+- State test naming conventions and how to run tests.
+
+Commit & Pull Request Guidelines
+
+- Summarize commit message conventions found in the project's Git history.
+- Outline pull request requirements (descriptions, linked issues, screenshots, etc.).
+
+(Optional) Add other sections if relevant, such as Security & Configuration Tips, Architecture Overview, or Agent-Specific Instructions.`;
 
 function getPythonRuntimeEnvironment() {
   const existingPythonPath = String(process.env.PYTHONPATH || "").trim();
@@ -587,6 +623,7 @@ const COMMANDS = [
   { name: "/skills", description: "use skills to improve how Codex performs specific tasks" },
   { name: "/review", description: "review my current changes and find issues" },
   { name: "/rename", description: "rename the current thread" },
+  { name: "/init", description: "create AGENTS.md contributor guidance for this workspace" },
   { name: "/new", description: "start a new chat with a new uid" },
   { name: "/mcp", description: "manage MCP servers: start, stop, and reload configuration" },
   { name: "/remote-control", description: "connect a phone to this session over the local network" },
@@ -879,6 +916,8 @@ let pendingAssistantRequests = 0;
 let chatGeneration = 0;
 let toolDescriptions = { ...FALLBACK_TOOL_DESCRIPTIONS };
 let systemPromptText = "";
+let workspaceGuideText = "";
+let workspaceGuideFileName = "";
 let skillsCatalog = [];
 let systemPromptLoadPromise = null;
 let mcpBridgeServer = null;
@@ -1570,6 +1609,47 @@ function spawnPythonCommandStreaming(args, options = {}) {
   })();
 }
 
+async function findWorkspaceGuide() {
+  for (const fileName of WORKSPACE_GUIDE_FILENAMES) {
+    const filePath = path.join(WORKSPACE_ROOT, fileName);
+    try {
+      const stat = await fs.stat(filePath);
+      if (stat.isFile()) return { fileName, filePath };
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+  return null;
+}
+
+async function loadWorkspaceGuide() {
+  const guide = await findWorkspaceGuide();
+  if (!guide) {
+    workspaceGuideText = "";
+    workspaceGuideFileName = "";
+    return null;
+  }
+  const raw = await fs.readFile(guide.filePath, "utf8");
+  workspaceGuideText = raw.length > WORKSPACE_GUIDE_MAX_CHARS
+    ? `${raw.slice(0, WORKSPACE_GUIDE_MAX_CHARS)}\n\n[Workspace guide truncated by Nexus]`
+    : raw;
+  workspaceGuideFileName = guide.fileName;
+  return guide;
+}
+
+function getWorkspaceGuidePromptLines(runtime = {}) {
+  const content = String(runtime?.workspaceGuideText || "").trim();
+  if (!content) return [];
+  const fileName = String(runtime?.workspaceGuideFileName || "AGENTS.md").trim() || "AGENTS.md";
+  return [
+    "",
+    "WORKSPACE GUIDE (MUST FOLLOW):",
+    `- The following workspace-specific instructions were loaded from ${fileName} when this session started. Follow them for work in this repository.`,
+    "",
+    content,
+  ];
+}
+
 function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
   const planModeActive = (runtime?.collaborationMode || collaborationMode) === "plan";
   const externalThinkingActive = typeof runtime?.externalThinkingActive === "boolean"
@@ -1590,6 +1670,7 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
       "",
       "CONTEXT USE (MUST FOLLOW):",
       "- Avoid repetition and re-reading unchanged files; inspect targeted context.",
+      ...getWorkspaceGuidePromptLines(runtime),
       "",
       "SKILL USE (MUST FOLLOW):",
       "- Before planning specialized or artifact work (including PDF, PowerPoint/slides, Word documents, spreadsheets, Android apps, or service integrations), call list_skills() to discover applicable workflows.",
@@ -1638,6 +1719,7 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "",
     "CONTEXT USE (MUST FOLLOW):",
     "- Use context effectively: avoid unnecessary repetition, avoid re-reading unchanged large files, and prefer targeted edits/tool calls.",
+    ...getWorkspaceGuidePromptLines(runtime),
     ...(externalThinkingActive
       ? [
           "",
@@ -3269,7 +3351,11 @@ async function ensureSystemPromptReady(forceReload = false) {
 
   systemPromptLoadPromise = (async () => {
     toolDescriptions = await loadToolDescriptionsFromPython();
-    systemPromptText = buildSystemPromptFromDescriptions(toolDescriptions, { collaborationMode });
+    systemPromptText = buildSystemPromptFromDescriptions(toolDescriptions, {
+      collaborationMode,
+      workspaceGuideText,
+      workspaceGuideFileName,
+    });
   })();
 
   await systemPromptLoadPromise;
@@ -3278,6 +3364,8 @@ async function ensureSystemPromptReady(forceReload = false) {
 function ensureSystemMessageAtTop() {
   systemPromptText = buildSystemPromptFromDescriptions(toolDescriptions, {
     collaborationMode,
+    workspaceGuideText,
+    workspaceGuideFileName,
   });
 
   if (messages.length === 0) {
@@ -6419,7 +6507,11 @@ function extractAllPythonCodeBlockEntries(text) {
         }
         fallbackClosingIndex = i;
       }
-      if (closingIndex < 0 && fallbackClosingIndex >= 0) {
+      let lastNonEmptyIndex = lines.length - 1;
+      while (lastNonEmptyIndex > openingIndex && !lines[lastNonEmptyIndex].trim()) {
+        lastNonEmptyIndex -= 1;
+      }
+      if (closingIndex < 0 && fallbackClosingIndex === lastNonEmptyIndex) {
         closingIndex = fallbackClosingIndex;
       }
     }
@@ -9808,7 +9900,8 @@ function refreshMainBufferAfterCommand() {
 }
 
 async function startNewChat() {
-  await ensureSystemPromptReady();
+  await loadWorkspaceGuide();
+  await ensureSystemPromptReady(true);
   chatGeneration += 1;
   currentSessionUid = createSessionUid();
   sessionFilePath = getSessionFilePath(currentSessionUid);
@@ -10046,7 +10139,61 @@ async function loadModelsFromProvider(force = false) {
   }
 }
 
+async function runInitCommand() {
+  if (pendingAssistantRequests > 0) {
+    appendTuiErrorMessage("/init", "wait for the current turn to finish");
+    return true;
+  }
+
+  let existingGuide = null;
+  try {
+    existingGuide = await findWorkspaceGuide();
+  } catch (error) {
+    appendTuiErrorMessage("/init", `could not inspect the workspace: ${error?.message || String(error)}`);
+    return true;
+  }
+  if (existingGuide) {
+    appendAssistantMessage(
+      `${existingGuide.fileName} already exists in this workspace. /init did not modify it.`,
+      { excludeFromRequest: true, persistHistory: false }
+    );
+    refreshMainBufferAfterCommand();
+    return true;
+  }
+
+  const promptHookRun = await runHooks({
+    eventName: "UserPromptSubmit",
+    input: { prompt: INIT_CONTRIBUTOR_GUIDE_PROMPT, source: "/init" },
+    timeoutMs: 30000,
+  });
+  if (promptHookRun.blocked) {
+    appendTuiErrorMessage(
+      "/init",
+      `prompt blocked by hook${promptHookRun.blockReason ? `: ${promptHookRun.blockReason}` : ""}`
+    );
+    return true;
+  }
+  if (promptHookRun.additionalContext) {
+    pendingHookContext = promptHookRun.additionalContext;
+  }
+
+  const submission = {
+    submittedInput: INIT_CONTRIBUTOR_GUIDE_PROMPT,
+    resolvedContent: INIT_CONTRIBUTOR_GUIDE_PROMPT,
+  };
+  appendSubmittedUserMessage(submission);
+  if (APPEND_CHAT_TO_SCROLLBACK) appendTranscriptNow();
+  queueAssistantReply(selectedModel);
+  markDirty();
+  renderFrame(false);
+  return true;
+}
+
 async function runSlashCommand(commandName, commandArgs = "") {
+  if (commandName === "/init") {
+    return runInitCommand();
+  }
+
   if (commandName === "/plan") {
     if (pendingAssistantRequests > 0) {
       appendTuiErrorMessage("/plan");
@@ -15977,7 +16124,11 @@ function runFormatSelfTest() {
     const runtimeSettingKeys = getRuntimeSettings().map((setting) => setting.key);
     if (
       !COMMANDS.some((command) => command.name === "/settings") ||
+      !COMMANDS.some((command) => command.name === "/init") ||
       COMMANDS.some((command) => command.name === "/set") ||
+      !INIT_CONTRIBUTOR_GUIDE_PROMPT.includes("Generate a file named AGENTS.md") ||
+      !INIT_CONTRIBUTOR_GUIDE_PROMPT.includes('Title the document "Repository Guidelines"') ||
+      !INIT_CONTRIBUTOR_GUIDE_PROMPT.includes("200-400 words") ||
       runtimeSettingKeys.join(",") !== "thinking,thinking_blocks,external_thinking,thinking_effort,context_window,request_timeout" ||
       typeof getRuntimeSettings().find((setting) => setting.key === "thinking")?.value !== "boolean" ||
       typeof getRuntimeSettings().find((setting) => setting.key === "thinking_blocks")?.value !== "boolean" ||
@@ -16348,6 +16499,11 @@ function runFormatSelfTest() {
     const deferredPrompt = buildSystemPromptFromDescriptions(FALLBACK_TOOL_DESCRIPTIONS, {
       collaborationMode: "build",
     });
+    const workspaceGuidePrompt = buildSystemPromptFromDescriptions(FALLBACK_TOOL_DESCRIPTIONS, {
+      collaborationMode: "build",
+      workspaceGuideFileName: "AGENTS.md",
+      workspaceGuideText: "# Repository Guidelines\n\nRun `npm test` before submitting changes.",
+    });
     if (
       !deferredPrompt.includes("tool_search") ||
       !deferredPrompt.includes("list_skills()") ||
@@ -16380,6 +16536,9 @@ function runFormatSelfTest() {
       !deferredPrompt.includes("A spawn execute block must only launch workers") ||
       !deferredPrompt.includes("Never call join/await/wait_subagents, sleep, poll files") ||
       !deferredPrompt.includes("Workers continue in the background after the block ends") ||
+      !workspaceGuidePrompt.includes("WORKSPACE GUIDE (MUST FOLLOW)") ||
+      !workspaceGuidePrompt.includes("loaded from AGENTS.md when this session started") ||
+      !workspaceGuidePrompt.includes("Run `npm test` before submitting changes.") ||
       deferredPrompt.includes("These workers are process-local") ||
       deferredPrompt.includes("mcp_list()") ||
       deferredPrompt.includes("android_build(project_path") ||
@@ -19162,7 +19321,8 @@ async function initializeApp() {
       }
     });
 
-  await ensureSystemPromptReady();
+  await loadWorkspaceGuide();
+  await ensureSystemPromptReady(true);
   await ensureSessionFileReady();
   await loadSkillsCatalog();
   await loadNexusConfig();
