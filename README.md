@@ -23,6 +23,12 @@ Nexus stores user configuration, sessions, skills, and kernel state under
 
 ## Agent orchestration
 
+Create a persistent named agent with `/agent <name> [task]`. Omitting the task
+creates an idle session. `/list-agents` shows the main and named sessions with
+running, idle, or stopped status; select one to switch chats. Named agents keep
+working in detached processes when another session is selected, and additional
+messages submitted to a busy agent are queued for its next turn.
+
 Nexus can launch concurrent child agents for independent work. Child agents
 inherit the active provider/model, parent system prompt, execute-block loop,
 workspace, and tools. They run as persistent child processes and may edit their

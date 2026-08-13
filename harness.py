@@ -2,6 +2,7 @@
 import ast
 import asyncio
 import builtins
+import errno
 import hashlib
 import inspect
 import io
@@ -28,6 +29,15 @@ _AGENT_RUNTIME: dict[str, object] = {
     "reasoning_enabled": False,
     "reasoning_effort": "low",
     "session_id": "",
+    "collaboration_mode": "build",
+}
+
+_PLAN_ALLOWED_TOOLS = {
+    "tool_search", "create_plan", "update_plan", "get_current_plan",
+    "get_current_working_directory", "get_file_list", "get_file_content",
+    "find_files", "list_directory", "path_exists", "find_in_file",
+    "get_git_status", "get_git_diff", "get_git_log", "read_file_summary",
+    "fetch_url", "list_skills", "get_skill", "harness_overview", "web_search",
 }
 
 HARNESS_FILE = Path.home() / ".nexus" / "harness.json"
@@ -104,6 +114,7 @@ def configure_agent_runtime(
     reasoning_enabled: bool = False,
     reasoning_effort: str = "low",
     session_id: str = "",
+    collaboration_mode: str = "build",
 ) -> None:
     """Install the parent Nexus runtime inherited by subsequently spawned agents."""
     _AGENT_RUNTIME.update(
@@ -113,8 +124,14 @@ def configure_agent_runtime(
             "reasoning_enabled": bool(reasoning_enabled),
             "reasoning_effort": str(reasoning_effort or "low"),
             "session_id": str(session_id or ""),
+            "collaboration_mode": "plan" if collaboration_mode == "plan" else "build",
         }
     )
+
+
+def get_agent_runtime_session_id() -> str:
+    """Return the Nexus session identity inherited by this agent runtime."""
+    return str(_AGENT_RUNTIME.get("session_id") or "")
 
 
 def _runtime_scope_id() -> str:
@@ -146,8 +163,25 @@ def _job_payload(entry: dict) -> dict:
 def _write_job(path: Path, entry: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(json.dumps(_job_payload(entry), ensure_ascii=False), encoding="utf-8")
-    os.replace(temporary, path)
+    try:
+        temporary.write_text(json.dumps(_job_payload(entry), ensure_ascii=False), encoding="utf-8")
+        for attempt in range(10):
+            try:
+                os.replace(temporary, path)
+                return
+            except OSError as exc:
+                transient = (
+                    exc.errno in {errno.EACCES, errno.EPERM, errno.EBUSY}
+                    or getattr(exc, "winerror", None) in {5, 32, 33}
+                )
+                if not transient or attempt == 9:
+                    raise
+                time.sleep(min(0.4, 0.02 * (2 ** attempt)))
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _read_job(path: Path) -> dict | None:
@@ -208,6 +242,9 @@ def launch_subagent_job(job_path: str, self_test: bool = False) -> int:
     if not entry:
         raise FileNotFoundError(f"subagent job not found: {path}")
     extra_env = {"NEXUS_SUBAGENT_SELF_TEST": "1"} if self_test else None
+    # The worker publishes its own PID with its first running-state update.
+    # Do not rewrite the same job file from the launcher after spawning: on
+    # Windows that races the detached worker's atomic replacement.
     return _launch_subagent_process(path, str(entry.get("workspace") or Path.cwd()), extra_env)
 
 
@@ -245,6 +282,44 @@ def _assistant_text(response: dict) -> str:
             if isinstance(part, dict)
         )
     return ""
+
+
+def _assistant_reasoning_details(response: dict) -> list[dict]:
+    choices = response.get("choices") or []
+    choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    candidates = (
+        message.get("reasoning_details"),
+        choice.get("reasoning_details"),
+        response.get("reasoning_details"),
+        message.get("reasoning"),
+        choice.get("reasoning"),
+        response.get("reasoning"),
+        message.get("reasoning_content"),
+        choice.get("reasoning_content"),
+        response.get("reasoning_content"),
+    )
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return [{"type": "reasoning.text", "text": candidate.strip(), "format": "unknown"}]
+        if isinstance(candidate, dict):
+            candidate = [candidate]
+        if isinstance(candidate, list):
+            details: list[dict] = []
+            for part in candidate:
+                if isinstance(part, str) and part.strip():
+                    details.append({"type": "reasoning.text", "text": part.strip(), "format": "unknown"})
+                elif isinstance(part, dict):
+                    text = part.get("text") or part.get("content") or part.get("reasoning_content")
+                    if isinstance(text, str) and text.strip():
+                        details.append({
+                            "type": str(part.get("type") or "reasoning.text"),
+                            "text": text.strip(),
+                            "format": str(part.get("format") or "unknown"),
+                        })
+            if details:
+                return details
+    return []
 
 
 def _matching_fence(line: str, character: str, minimum: int) -> bool:
@@ -299,18 +374,51 @@ def _execute_nexus_code(code: str) -> dict:
         options.setdefault("file", output)
         return builtins.print(*args, **options)
 
-    scope: dict[str, object] = {}
-    if isinstance(getattr(tools, "FUNCTIONS", None), dict):
-        scope.update(tools.FUNCTIONS)
-    maybe_functions = tools.get_functions() if hasattr(tools, "get_functions") else None
-    if isinstance(maybe_functions, dict):
-        scope.update(maybe_functions)
-    safe_builtins = dict(vars(builtins))
-    safe_builtins["print"] = local_print
-    scope["__builtins__"] = safe_builtins
-    scope["__name__"] = "__main__"
-
     try:
+        scope: dict[str, object] = {}
+        if isinstance(getattr(tools, "FUNCTIONS", None), dict):
+            scope.update(tools.FUNCTIONS)
+        maybe_functions = tools.get_functions() if hasattr(tools, "get_functions") else None
+        if isinstance(maybe_functions, dict):
+            scope.update(maybe_functions)
+        plan_mode = _AGENT_RUNTIME.get("collaboration_mode") == "plan"
+        if plan_mode:
+            scope = {name: value for name, value in scope.items() if name in _PLAN_ALLOWED_TOOLS}
+            safe_builtins = {
+                name: getattr(builtins, name)
+                for name in (
+                    "print", "len", "range", "enumerate", "sorted", "reversed", "zip",
+                    "str", "int", "float", "bool", "list", "dict", "set", "tuple",
+                    "min", "max", "sum", "any", "all", "abs", "round", "isinstance",
+                )
+            }
+            parsed = ast.parse(str(code or ""), mode="exec")
+            local_callables = {
+                node.name
+                for node in ast.walk(parsed)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            safe_names = set(scope) | local_callables | set(safe_builtins)
+            safe_methods = {
+                "append", "casefold", "count", "endswith", "get", "index", "items",
+                "join", "keys", "lower", "replace", "split", "startswith", "strip",
+                "upper", "values",
+            }
+            for node in ast.walk(parsed):
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    raise PermissionError("Plan mode blocks imports; use the provided read-only tools")
+                if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
+                    raise PermissionError("Plan mode blocks private runtime access")
+                if isinstance(node, ast.Call):
+                    if isinstance(node.func, ast.Name) and node.func.id not in safe_names:
+                        raise PermissionError(f"Plan mode blocks call: {node.func.id}")
+                    if isinstance(node.func, ast.Attribute) and node.func.attr not in safe_methods:
+                        raise PermissionError(f"Plan mode blocks method call: {node.func.attr}")
+        else:
+            safe_builtins = dict(vars(builtins))
+        safe_builtins["print"] = local_print
+        scope["__builtins__"] = safe_builtins
+        scope["__name__"] = "__main__"
         compiled = compile(
             str(code or ""),
             "<subagent-execute>",
@@ -357,15 +465,28 @@ def _run_with_hard_timeout(operation, timeout_seconds: float, label: str):
 
 
 def _perform_subagent_request(entry: dict) -> dict:
+    provider_messages = []
+    for item in entry.get("messages") or []:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        if isinstance(role, str) and isinstance(content, str):
+            provider_messages.append({"role": role, "content": content})
     payload = {
         "model": entry.get("model") or "",
-        "messages": entry.get("messages") or [],
-        "max_tokens": entry.get("max_tokens", 2048),
+        "messages": provider_messages,
     }
+    max_tokens = entry.get("max_tokens", 2048)
+    if isinstance(max_tokens, (int, float)) and max_tokens > 0:
+        payload["max_tokens"] = int(max_tokens)
     if entry.get("reasoning_enabled"):
         payload["reasoning_effort"] = entry.get("reasoning_effort") or "low"
         payload["reasoning"] = {"enabled": True}
         payload["thinking"] = {"type": "enabled"}
+    else:
+        payload["reasoning"] = {"enabled": False}
+        payload["thinking"] = {"type": "disabled"}
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         entry["url"].rstrip("/") + "/chat/completions",
@@ -396,6 +517,98 @@ def _request_subagent(entry: dict) -> dict:
     )
 
 
+def _finite_nonnegative(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number < 0 or number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
+
+def _update_subagent_telemetry(entry: dict, response: dict) -> None:
+    if not isinstance(response, dict):
+        return
+    runtime = entry.setdefault("session_runtime", {})
+    if not isinstance(runtime, dict):
+        runtime = {}
+        entry["session_runtime"] = runtime
+    settings = runtime.get("settings") if isinstance(runtime.get("settings"), dict) else {}
+    requested_model = str(runtime.get("model") or entry.get("model") or "").strip()
+    model = str(response.get("model") or requested_model).strip()
+    if not model:
+        return
+    usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+    timings = response.get("timings") if isinstance(response.get("timings"), dict) else {}
+    cached_candidates = [
+        (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+        if isinstance(usage.get("prompt_tokens_details"), dict) else None,
+        (usage.get("input_tokens_details") or {}).get("cached_tokens")
+        if isinstance(usage.get("input_tokens_details"), dict) else None,
+        usage.get("cached_tokens"),
+        usage.get("cache_read_input_tokens"),
+        timings.get("cache_n"),
+    ]
+    cached_tokens = next(
+        (number for number in map(_finite_nonnegative, cached_candidates) if number is not None),
+        None,
+    )
+    prompt_tokens = _finite_nonnegative(usage.get("prompt_tokens"))
+    if prompt_tokens is None:
+        input_tokens = _finite_nonnegative(usage.get("input_tokens"))
+        cache_read = _finite_nonnegative(usage.get("cache_read_input_tokens")) or 0
+        if input_tokens is not None:
+            prompt_tokens = input_tokens + cache_read
+    if prompt_tokens is None:
+        prompt_n = _finite_nonnegative(timings.get("prompt_n"))
+        cache_n = _finite_nonnegative(timings.get("cache_n")) or 0
+        if prompt_n is not None:
+            prompt_tokens = prompt_n + cache_n
+
+    cache_map = runtime.setdefault("cache_telemetry_by_model", {})
+    if not isinstance(cache_map, dict):
+        cache_map = {}
+        runtime["cache_telemetry_by_model"] = cache_map
+    system_prompt = str((entry.get("runtime") or {}).get("system_prompt") or "")
+    fingerprint = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()[:12]
+    previous = cache_map.get(model) if isinstance(cache_map.get(model), dict) else {}
+    cache_percent = None
+    if prompt_tokens and cached_tokens is not None:
+        cache_percent = max(0, min(100, round((cached_tokens / prompt_tokens) * 100)))
+    cache_map[model] = {
+        "fingerprint": fingerprint,
+        "promptTokens": prompt_tokens,
+        "cachedTokens": cached_tokens,
+        "cachePercent": cache_percent,
+        "prefixChanged": bool(previous.get("fingerprint") and previous.get("fingerprint") != fingerprint),
+        "updatedAt": round(time.time() * 1000),
+    }
+    if requested_model and requested_model != model:
+        cache_map[requested_model] = dict(cache_map[model])
+
+    window = _finite_nonnegative(settings.get("context_window")) or 128000
+    timing_context = sum(
+        number or 0
+        for number in (
+            _finite_nonnegative(timings.get("cache_n")),
+            _finite_nonnegative(timings.get("prompt_n")),
+            _finite_nonnegative(timings.get("predicted_n")),
+        )
+    )
+    used_tokens = timing_context
+    if used_tokens <= 0:
+        used_tokens = _finite_nonnegative(usage.get("total_tokens")) or prompt_tokens or 0
+    if used_tokens > 0:
+        context_map = runtime.setdefault("context_left_by_model", {})
+        if not isinstance(context_map, dict):
+            context_map = {}
+            runtime["context_left_by_model"] = context_map
+        context_map[model] = max(0, min(100, ((window - used_tokens) / window) * 100))
+        if requested_model and requested_model != model:
+            context_map[requested_model] = context_map[model]
+
+
 def _subagent_worker(entry: dict, on_update=None) -> None:
     notify = on_update if callable(on_update) else (lambda _entry: None)
     entry["status"] = "running"
@@ -417,15 +630,23 @@ def _subagent_worker(entry: dict, on_update=None) -> None:
         while True:
             turn += 1
             entry["turn"] = turn
-            notify(entry)
             response = _request_subagent(entry)
+            _update_subagent_telemetry(entry, response)
             content = _assistant_text(response)
+            reasoning_details = (
+                _assistant_reasoning_details(response)
+                if entry.get("reasoning_enabled")
+                else []
+            )
             if not content.strip():
                 entry["status"] = "error"
                 entry["error"] = "subagent returned no content"
                 notify(entry)
                 return
-            entry["messages"].append({"role": "assistant", "content": content})
+            assistant_message = {"role": "assistant", "content": content}
+            if reasoning_details:
+                assistant_message["reasoning_details"] = reasoning_details
+            entry["messages"].append(assistant_message)
             blocks = _extract_execute_blocks(content)
             if not blocks:
                 if _looks_like_unfinished_response(content):
@@ -447,6 +668,11 @@ def _subagent_worker(entry: dict, on_update=None) -> None:
                 entry["status"] = "done"
                 notify(entry)
                 return
+
+            # Execute turns remain visible while their tools run. Final turns
+            # are persisted only once above with status=done, avoiding two
+            # immediate Windows atomic replacements of the same job file.
+            notify(entry)
 
             results = []
             for block in blocks:
@@ -487,6 +713,8 @@ def run_subagent_job(job_path: str) -> int:
     entry = _read_job(path)
     if not entry:
         return 2
+    if str(entry.get("status") or "").lower() not in {"admitted", "running"}:
+        return 1
     workspace = str(entry.get("workspace") or "")
     if workspace:
         os.chdir(workspace)
@@ -497,6 +725,7 @@ def run_subagent_job(job_path: str) -> int:
         reasoning_enabled=bool(runtime.get("reasoning_enabled")),
         reasoning_effort=str(runtime.get("reasoning_effort") or "low"),
         session_id=str(runtime.get("session_id") or entry.get("scope_id") or ""),
+        collaboration_mode=str(runtime.get("collaboration_mode") or "build"),
     )
     _subagent_worker(entry, on_update=lambda current: _write_job(path, current))
     return 0 if entry.get("status") == "done" else 1
@@ -688,6 +917,83 @@ def run_subagent_self_test() -> dict:
     if time.monotonic() - timeout_started >= 0.2:
         raise AssertionError("hard request watchdog waited for the blocking operation")
 
+    previous_runtime = dict(_AGENT_RUNTIME)
+    try:
+        configure_agent_runtime(
+            system_prompt="PLAN TEST",
+            model="plan-model",
+            session_id="plan-self-test",
+            collaboration_mode="plan",
+        )
+        plan_read = _execute_nexus_code("print(get_file_list('.'))")
+        plan_write = _execute_nexus_code("print(write_file('plan-worker-should-not-exist.tmp', 'blocked'))")
+        if not plan_read.get("ok"):
+            raise AssertionError(f"named-agent plan mode blocked read-only tools: {plan_read}")
+        if plan_write.get("ok") or "Plan mode blocks call" not in str(plan_write.get("error") or ""):
+            raise AssertionError(f"named-agent plan mode allowed a write helper: {plan_write}")
+    finally:
+        _AGENT_RUNTIME.clear()
+        _AGENT_RUNTIME.update(previous_runtime)
+
+    telemetry_entry = {
+        "model": "telemetry-model",
+        "runtime": {"system_prompt": "stable worker prompt"},
+        "session_runtime": {
+            "model": "telemetry-model",
+            "settings": {"context_window": 2000},
+        },
+    }
+    _update_subagent_telemetry(
+        telemetry_entry,
+        {
+            "model": "telemetry-model",
+            "usage": {
+                "prompt_tokens": 1000,
+                "total_tokens": 1200,
+                "prompt_tokens_details": {"cached_tokens": 800},
+            },
+        },
+    )
+    telemetry_runtime = telemetry_entry["session_runtime"]
+    if telemetry_runtime["context_left_by_model"]["telemetry-model"] != 40:
+        raise AssertionError("named-agent context telemetry was not session-scoped")
+    if telemetry_runtime["cache_telemetry_by_model"]["telemetry-model"]["cachePercent"] != 80:
+        raise AssertionError("named-agent cache telemetry was not session-scoped")
+
+    disabled_reasoning_entry = {
+        "model": "disabled-reasoning-model",
+        "timeout": 5,
+        "reasoning_enabled": False,
+        "messages": [{"role": "user", "content": "say hello"}],
+        "status": "admitted",
+        "result": None,
+        "error": None,
+        "turn": 0,
+        "self_test_responses": [{
+            "choices": [{
+                "message": {
+                    "content": "Hello.",
+                    "reasoning_content": "provider trace that must stay hidden",
+                }
+            }]
+        }],
+    }
+    previous_self_test_mode = os.environ.get("NEXUS_SUBAGENT_SELF_TEST")
+    os.environ["NEXUS_SUBAGENT_SELF_TEST"] = "1"
+    try:
+        _subagent_worker(disabled_reasoning_entry)
+    finally:
+        if previous_self_test_mode is None:
+            os.environ.pop("NEXUS_SUBAGENT_SELF_TEST", None)
+        else:
+            os.environ["NEXUS_SUBAGENT_SELF_TEST"] = previous_self_test_mode
+    if any(
+        message.get("reasoning_details")
+        for message in disabled_reasoning_entry.get("messages", [])
+        if isinstance(message, dict)
+    ):
+        raise AssertionError("thinking-off named agent retained provider reasoning traces")
+
     test_root = Path(tempfile.mkdtemp(prefix="nexus-subagent-test-", dir=Path.cwd()))
     previous_root = os.environ.get("NEXUS_SUBAGENT_ROOT")
     os.environ["NEXUS_SUBAGENT_ROOT"] = str(test_root)
@@ -706,7 +1012,7 @@ def run_subagent_self_test() -> dict:
         "model": "inherited-model",
         "timeout": 5,
         "max_tokens": 256,
-        "reasoning_enabled": False,
+        "reasoning_enabled": True,
         "reasoning_effort": "low",
         "messages": [
             {"role": "system", "content": _with_subagent_contract("PARENT NEXUS SYSTEM PROMPT")},
@@ -739,7 +1045,16 @@ def run_subagent_self_test() -> dict:
                     }
                 ]
             },
-            {"choices": [{"message": {"content": "Child tool loop complete."}}]},
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Child tool loop complete.",
+                            "reasoning_content": "child reasoning trace",
+                        }
+                    }
+                ]
+            },
         ],
     }
     job_path = _job_path(entry_id)
@@ -776,6 +1091,16 @@ def run_subagent_self_test() -> dict:
             raise AssertionError("child did not retry unfinished narration before its tool turn")
         if current.get("unfinished_response_retries") != 1:
             raise AssertionError("child did not record the unfinished-response retry")
+        if not any(
+            isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and any(
+                isinstance(detail, dict) and detail.get("text") == "child reasoning trace"
+                for detail in message.get("reasoning_details", [])
+            )
+            for message in current.get("messages", [])
+        ):
+            raise AssertionError("persistent child did not retain provider reasoning details")
         tool_context = "\n".join(
             str(message.get("content") or "")
             for message in current.get("messages", [])

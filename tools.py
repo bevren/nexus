@@ -2196,7 +2196,12 @@ def set_reminder(when: str, prompt: str) -> dict:
 
     url = f"http://127.0.0.1:{info['port']}/"
     payload = json.dumps(
-        {"method": "reminder", "when": when.strip(), "prompt": prompt.strip()}
+        {
+            "method": "reminder",
+            "when": when.strip(),
+            "prompt": prompt.strip(),
+            "session_id": harness.get_agent_runtime_session_id(),
+        }
     ).encode("utf-8")
     try:
         req = urllib.request.Request(
@@ -2574,10 +2579,23 @@ def get_descriptions() -> dict[str, str]:
 
 
 def main() -> int:
-    if len(sys.argv) > 2 and sys.argv[1] == "--run-subagent":
-        return harness.run_subagent_job(sys.argv[2])
-    if len(sys.argv) > 2 and sys.argv[1] == "--launch-subagent-test":
-        print(harness.launch_subagent_job(sys.argv[2], self_test=True))
+    args = sys.argv[1:]
+    if "--run-subagent" in args:
+        index = args.index("--run-subagent")
+        if index + 1 >= len(args):
+            return 2
+        return harness.run_subagent_job(args[index + 1])
+    if "--launch-subagent" in args:
+        index = args.index("--launch-subagent")
+        if index + 1 >= len(args):
+            return 2
+        print(harness.launch_subagent_job(args[index + 1]))
+        return 0
+    if "--launch-subagent-test" in args:
+        index = args.index("--launch-subagent-test")
+        if index + 1 >= len(args):
+            return 2
+        print(harness.launch_subagent_job(args[index + 1], self_test=True))
         return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--self-test-subagents":
         result = harness.run_subagent_self_test()

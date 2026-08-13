@@ -50,6 +50,44 @@ Commit & Pull Request Guidelines
 - Outline pull request requirements (descriptions, linked issues, screenshots, etc.).
 
 (Optional) Add other sections if relevant, such as Security & Configuration Tips, Architecture Overview, or Agent-Specific Instructions.`;
+const EXECUTION_RESULT_BOUNDARY_PROMPT_LINES = [
+  "",
+  "EXECUTION RESULT BOUNDARY (MANDATORY):",
+  "- Writing an execute block only requests execution. It is never evidence that the block ran or succeeded.",
+  "- End the assistant response immediately after the closing execute fence. Never predict, narrate, or claim the block's result in that same response.",
+  "- Wait for the subsequent code_execution tool result before describing any output or claiming that a read, edit, command, MCP call, subagent action, or other operation worked.",
+  "- Judge success from the actual result, including nested fields such as ok, exit_code, error, stderr, timed_out, and tool-specific failure payloads. A successful wrapper does not make an inner {ok: false} operation successful.",
+  "- If no code_execution result appears, treat the block as not executed and its outcome as unknown. Do not invent output; retry with a valid complete execute block when appropriate.",
+];
+const NEXUS_START_DATE = (() => {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+})();
+const NEXUS_OPERATING_SYSTEM = (() => {
+  const platformNames = {
+    win32: "Windows",
+    darwin: "macOS",
+    linux: "Linux",
+    android: "Android",
+    freebsd: "FreeBSD",
+    openbsd: "OpenBSD",
+  };
+  const platformName = platformNames[process.platform] || os.type() || process.platform;
+  const systemName = process.platform === "win32"
+    ? String(os.version() || platformName).replace(/\s+/g, " ").trim()
+    : platformName;
+  const release = String(os.release() || "").trim();
+  return `${systemName}${release ? ` ${release}` : ""} (${process.arch})`;
+})();
+const CURRENT_ENVIRONMENT_PROMPT_LINES = [
+  "",
+  "CURRENT ENVIRONMENT:",
+  `- Current date: ${NEXUS_START_DATE}`,
+  `- Operating system: ${NEXUS_OPERATING_SYSTEM}`,
+];
 
 function getPythonRuntimeEnvironment() {
   const existingPythonPath = String(process.env.PYTHONPATH || "").trim();
@@ -251,18 +289,72 @@ const REMOTE_CONTROL_HTML = String.raw`<!doctype html>
     #queued { display:none; padding:7px 12px; color:var(--dim); border-top:1px solid var(--line); background:var(--panel); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
     footer { position:relative; z-index:2; padding:0 max(10px,env(safe-area-inset-right)) max(10px,env(safe-area-inset-bottom)) max(10px,env(safe-area-inset-left)); background:var(--bg); }
     .composer { display:grid; grid-template-columns:1fr auto; align-items:end; gap:8px; padding-top:10px; border-top:1px solid var(--line); }
+    .composer-actions { position:relative; display:flex; align-items:flex-end; }
     textarea { width:100%; min-height:44px; max-height:150px; resize:none; border:1px solid var(--line); border-radius:10px; padding:10px 12px; background:var(--panel); color:var(--text); font:inherit; outline:none; }
     textarea:focus { border-color:#66531b; }
     button { min-height:44px; border:0; border-radius:10px; padding:0 16px; background:var(--gold); color:#111; font:700 14px inherit; }
     button:disabled { opacity:.45; }
-    #stop { display:none; background:#57282b; color:#ffb5b5; }
+    #menu-button { width:36px; min-width:36px; height:36px; min-height:36px; margin:-4px 0 -4px -6px; padding:0; display:flex; align-items:center; justify-content:center; border-radius:50%; background:transparent; color:var(--text); }
+    #menu-button:active { background:#252525; }
+    #menu-button svg { width:21px; height:21px; fill:currentColor; }
+    #drawer-backdrop { position:fixed; inset:0; z-index:20; background:#0009; opacity:0; pointer-events:none; transition:opacity .18s ease; }
+    #drawer-backdrop.open { opacity:1; pointer-events:auto; }
+    #drawer { position:fixed; inset:0 auto 0 0; z-index:21; width:min(88vw,380px); display:flex; flex-direction:column; overflow:hidden; border-right:1px solid var(--line); background:#111; box-shadow:10px 0 28px #0008; transform:translateX(-102%); transition:transform .2s ease; }
+    #drawer.open { transform:translateX(0); }
+    .drawer-header { height:61px; flex:none; display:flex; align-items:center; gap:9px; padding:0 12px; border-bottom:1px solid var(--line); }
+    .drawer-icon-button { width:38px; min-width:38px; height:38px; min-height:38px; padding:0; display:flex; align-items:center; justify-content:center; border-radius:50%; background:transparent; color:var(--text); font-size:22px; }
+    .drawer-icon-button:active { background:#292929; }
+    .drawer-heading { font-weight:700; color:#f0f0f0; }
+    .drawer-view { min-height:0; flex:1; overflow:hidden; }
+    #drawer-menu-view { padding:10px 8px; }
+    #sessions-view, #agents-view, #loops-view { display:none; flex-direction:column; }
+    #sessions-view.active, #agents-view.active, #loops-view.active { display:flex; }
+    .drawer-item { width:100%; display:flex; align-items:center; justify-content:space-between; padding:0 14px; background:transparent; color:var(--text); text-align:left; font-weight:600; }
+    .drawer-item:active { background:#252525; }
+    .drawer-chevron { color:var(--dim); font-size:20px; }
+    #session-search, #agent-search { flex:none; width:calc(100% - 20px); height:42px; margin:10px; padding:0 12px; border:1px solid var(--line); border-radius:9px; outline:none; background:#191919; color:var(--text); font:inherit; }
+    #session-search:focus, #agent-search:focus { border-color:#66531b; }
+    #sessions-state, #agents-state, #loops-state { padding:18px 14px; color:var(--dim); }
+    #sessions-list, #agents-list, #loops-list { min-height:0; overflow-y:auto; padding:0 8px 12px; -webkit-overflow-scrolling:touch; }
+    .session-row, .agent-row { width:100%; min-height:46px; display:grid; grid-template-columns:72px minmax(0,1fr); align-items:center; gap:8px; padding:0 10px; border-radius:0; background:transparent; color:var(--text); font-weight:400; text-align:left; }
+    .session-row:nth-child(even), .agent-row:nth-child(even) { background:#191919; }
+    .session-row.current, .agent-row.current { border-left:3px solid var(--gold); padding-left:7px; background:#3a300f; color:#e4ad25; }
+    .session-row:active, .agent-row:active { filter:brightness(1.25); }
+    .session-time { color:#777; white-space:nowrap; }
+    .session-row.current .session-time { color:#aa8524; }
+    .session-title { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .agent-status { color:#777; white-space:nowrap; text-transform:capitalize; }
+    .agent-status.running { color:#d6a522; }
+    .agent-status.stopped { color:#c66; }
+    .agent-row.current .agent-status { color:#aa8524; }
+    .agent-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .loop-row { min-height:64px; display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:8px; padding:8px 10px; }
+    .loop-row:nth-child(even) { background:#191919; }
+    .loop-copy { min-width:0; }
+    .loop-prompt { overflow:hidden; color:var(--text); text-overflow:ellipsis; white-space:nowrap; }
+    .loop-meta { color:var(--dim); font-size:12px; }
+    .loop-row.paused .loop-prompt { color:#888; }
+    .loop-actions { display:flex; gap:6px; }
+    .loop-action { width:38px; min-width:38px; height:38px; min-height:38px; padding:0; border:1px solid #343434; border-radius:50%; background:#232323; color:var(--text); font-size:16px; }
+    .loop-action.delete { color:#ff9d9d; }
+    #stop { position:absolute; right:50%; bottom:calc(100% + 10px); display:none; width:44px; min-width:44px; height:44px; min-height:44px; padding:0; align-items:center; justify-content:center; border:1px solid #804247; border-radius:50%; background:#57282b; color:#ffb5b5; box-shadow:0 4px 14px #0009; transform:translateX(50%); }
+    #stop:active { background:#71353a; transform:translateX(50%) scale(.94); }
+    #stop svg { width:18px; height:18px; fill:currentColor; }
   </style>
 </head>
 <body>
-  <header><span class="brand">NEXUS</span><span id="dot"></span><span id="status">Connecting...</span></header>
+  <header><button id="menu-button" type="button" aria-label="Open navigation" title="Open navigation"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6.5h16v2H4zm0 4.5h16v2H4zm0 4.5h16v2H4z"></path></svg></button><span class="brand">NEXUS</span><span id="dot"></span><span id="status">Connecting...</span></header>
   <main id="messages"><div class="empty">Connecting to the terminal session...</div></main>
   <div id="queued"></div>
-  <footer><div class="composer"><textarea id="input" rows="1" placeholder="Message Nexus"></textarea><button id="send">Send</button><button id="stop">Stop</button></div></footer>
+  <footer><div class="composer"><textarea id="input" rows="1" placeholder="Message Nexus"></textarea><div class="composer-actions"><button id="stop" type="button" aria-label="Stop response" title="Stop response"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5"></rect></svg></button><button id="send" type="button">Send</button></div></div></footer>
+  <div id="drawer-backdrop"></div>
+  <aside id="drawer" aria-hidden="true">
+    <div class="drawer-header"><button id="drawer-close" class="drawer-icon-button" type="button" aria-label="Close navigation">&times;</button><span id="drawer-title" class="drawer-heading">Nexus</span></div>
+    <div id="drawer-menu-view" class="drawer-view"><button id="sessions-menu" class="drawer-item" type="button"><span>Sessions</span><span class="drawer-chevron">&#8250;</span></button><button id="agents-menu" class="drawer-item" type="button"><span>Agents</span><span class="drawer-chevron">&#8250;</span></button><button id="loops-menu" class="drawer-item" type="button"><span>Loops</span><span class="drawer-chevron">&#8250;</span></button></div>
+    <div id="sessions-view" class="drawer-view"><input id="session-search" type="search" placeholder="Search sessions" autocomplete="off"><div id="sessions-state">Loading sessions...</div><div id="sessions-list"></div></div>
+    <div id="agents-view" class="drawer-view"><input id="agent-search" type="search" placeholder="Search agents" autocomplete="off"><div id="agents-state">Loading agents...</div><div id="agents-list"></div></div>
+    <div id="loops-view" class="drawer-view"><div id="loops-state">Loading loops...</div><div id="loops-list"></div></div>
+  </aside>
   <script>
     (function () {
       var token = location.hash.slice(1);
@@ -273,12 +365,271 @@ const REMOTE_CONTROL_HTML = String.raw`<!doctype html>
       var inputEl = document.getElementById('input');
       var sendEl = document.getElementById('send');
       var stopEl = document.getElementById('stop');
+      var menuButtonEl = document.getElementById('menu-button');
+      var drawerEl = document.getElementById('drawer');
+      var drawerBackdropEl = document.getElementById('drawer-backdrop');
+      var drawerCloseEl = document.getElementById('drawer-close');
+      var drawerTitleEl = document.getElementById('drawer-title');
+      var drawerMenuViewEl = document.getElementById('drawer-menu-view');
+      var sessionsMenuEl = document.getElementById('sessions-menu');
+      var sessionsViewEl = document.getElementById('sessions-view');
+      var sessionSearchEl = document.getElementById('session-search');
+      var sessionsStateEl = document.getElementById('sessions-state');
+      var sessionsListEl = document.getElementById('sessions-list');
+      var agentsMenuEl = document.getElementById('agents-menu');
+      var agentsViewEl = document.getElementById('agents-view');
+      var agentSearchEl = document.getElementById('agent-search');
+      var agentsStateEl = document.getElementById('agents-state');
+      var agentsListEl = document.getElementById('agents-list');
+      var loopsMenuEl = document.getElementById('loops-menu');
+      var loopsViewEl = document.getElementById('loops-view');
+      var loopsStateEl = document.getElementById('loops-state');
+      var loopsListEl = document.getElementById('loops-list');
       var socket = null;
       var reconnectTimer = null;
       var latestState = null;
       var lastSession = '';
+      var remoteSessions = [];
+      var remoteSessionsAgent = 'main';
+      var switchingSession = '';
+      var remoteAgents = [];
+      var switchingAgent = '';
+      var agentsRefreshTimer = null;
+      var remoteLoops = [];
+      var remoteLoopsAgent = 'main';
+      var updatingLoop = '';
+      var loopsRefreshTimer = null;
       var stickToBottom = true;
       var programmaticScroll = false;
+
+      function setDrawerOpen(open) {
+        drawerEl.classList.toggle('open', open);
+        drawerBackdropEl.classList.toggle('open', open);
+        drawerEl.setAttribute('aria-hidden', open ? 'false' : 'true');
+        if (!open) {
+          clearTimeout(agentsRefreshTimer);
+          agentsRefreshTimer = null;
+          clearTimeout(loopsRefreshTimer);
+          loopsRefreshTimer = null;
+          drawerTitleEl.textContent = 'Nexus';
+          drawerMenuViewEl.style.display = 'block';
+          sessionsViewEl.classList.remove('active');
+          agentsViewEl.classList.remove('active');
+          loopsViewEl.classList.remove('active');
+          sessionSearchEl.value = '';
+          agentSearchEl.value = '';
+        }
+      }
+
+      function formatRemoteSessionTime(updatedAt) {
+        var elapsed = Math.max(0, Date.now() - Number(updatedAt || 0));
+        var seconds = Math.floor(elapsed / 1000);
+        if (seconds < 60) return seconds + 's ago';
+        var minutes = Math.floor(seconds / 60);
+        if (minutes < 60) return minutes + 'm ago';
+        var hours = Math.floor(minutes / 60);
+        if (hours < 24) return hours + 'h ago';
+        var days = Math.floor(hours / 24);
+        if (days < 30) return days + 'd ago';
+        var months = Math.floor(days / 30);
+        if (months < 12) return months + 'mo ago';
+        return Math.floor(days / 365) + 'y ago';
+      }
+
+      function renderRemoteSessions() {
+        var query = sessionSearchEl.value.trim().toLowerCase();
+        var filtered = remoteSessions.filter(function (session) {
+          return !query || String(session.title || '').toLowerCase().indexOf(query) >= 0;
+        });
+        sessionsListEl.textContent = '';
+        sessionsStateEl.style.display = switchingSession || !filtered.length ? 'block' : 'none';
+        sessionsStateEl.textContent = switchingSession
+          ? 'Switching session...'
+          : remoteSessions.length ? 'No matching sessions' : 'No sessions found';
+        filtered.forEach(function (session) {
+          var row = document.createElement('button');
+          row.type = 'button';
+          row.className = 'session-row' + (session.current ? ' current' : '');
+          row.disabled = Boolean(switchingSession);
+          var updated = document.createElement('span');
+          updated.className = 'session-time';
+          updated.textContent = formatRemoteSessionTime(session.updatedAt);
+          var title = document.createElement('span');
+          title.className = 'session-title';
+          title.textContent = session.title || 'Untitled session';
+          row.appendChild(updated);
+          row.appendChild(title);
+          row.onclick = function () {
+            if (session.current) { setDrawerOpen(false); return; }
+            if (!socket || socket.readyState !== WebSocket.OPEN || switchingSession) return;
+            switchingSession = session.id;
+            renderRemoteSessions();
+            socket.send(JSON.stringify({
+              type:'switch-session',
+              agent:remoteSessionsAgent,
+              session:session.id
+            }));
+          };
+          sessionsListEl.appendChild(row);
+        });
+      }
+
+      function showSessionsDrawer() {
+        drawerTitleEl.textContent = 'Sessions';
+        drawerMenuViewEl.style.display = 'none';
+        sessionsViewEl.classList.add('active');
+        sessionsStateEl.style.display = 'block';
+        sessionsStateEl.textContent = 'Loading sessions...';
+        sessionsListEl.textContent = '';
+        if (socket && socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({type:'sessions'}));
+        } else {
+          sessionsStateEl.textContent = 'Remote connection is unavailable';
+        }
+      }
+
+      function renderRemoteAgents() {
+        var query = agentSearchEl.value.trim().toLowerCase();
+        var filtered = remoteAgents.filter(function (agent) {
+          return !query || String(agent.name || '').toLowerCase().indexOf(query) >= 0;
+        });
+        agentsListEl.textContent = '';
+        agentsStateEl.style.display = switchingAgent || !filtered.length ? 'block' : 'none';
+        agentsStateEl.textContent = switchingAgent
+          ? 'Switching agent...'
+          : remoteAgents.length ? 'No matching agents' : 'No agents found';
+        filtered.forEach(function (agent) {
+          var row = document.createElement('button');
+          row.type = 'button';
+          row.className = 'agent-row' + (agent.current ? ' current' : '');
+          row.disabled = Boolean(switchingAgent);
+          var status = document.createElement('span');
+          status.className = 'agent-status ' + String(agent.status || 'idle').toLowerCase();
+          status.textContent = agent.status || 'idle';
+          var name = document.createElement('span');
+          name.className = 'agent-name';
+          name.textContent = agent.name || 'Unnamed agent';
+          row.appendChild(status);
+          row.appendChild(name);
+          row.onclick = function () {
+            if (agent.current) { setDrawerOpen(false); return; }
+            if (!socket || socket.readyState !== WebSocket.OPEN || switchingAgent) return;
+            switchingAgent = agent.name;
+            renderRemoteAgents();
+            socket.send(JSON.stringify({type:'switch-agent',agent:agent.name}));
+          };
+          agentsListEl.appendChild(row);
+        });
+      }
+
+      function showAgentsDrawer() {
+        drawerTitleEl.textContent = 'Agents';
+        drawerMenuViewEl.style.display = 'none';
+        agentsViewEl.classList.add('active');
+        agentsStateEl.style.display = 'block';
+        agentsStateEl.textContent = 'Loading agents...';
+        agentsListEl.textContent = '';
+        requestRemoteAgents();
+      }
+
+      function requestRemoteAgents() {
+        clearTimeout(agentsRefreshTimer);
+        agentsRefreshTimer = null;
+        if (!agentsViewEl.classList.contains('active')) return;
+        if (socket && socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({type:'agents'}));
+        } else {
+          agentsStateEl.textContent = 'Remote connection is unavailable';
+        }
+      }
+
+      function scheduleRemoteAgentsRefresh() {
+        clearTimeout(agentsRefreshTimer);
+        if (!agentsViewEl.classList.contains('active')) return;
+        agentsRefreshTimer = setTimeout(requestRemoteAgents, 1200);
+      }
+
+      function formatRemoteLoopNext(nextFireAt) {
+        var remaining = Math.max(0, Number(nextFireAt || 0) - Date.now());
+        var seconds = Math.ceil(remaining / 1000);
+        if (seconds < 60) return 'next in ' + seconds + 's';
+        var minutes = Math.ceil(seconds / 60);
+        if (minutes < 60) return 'next in ' + minutes + 'm';
+        return 'next in ' + Math.ceil(minutes / 60) + 'h';
+      }
+
+      function sendRemoteLoopAction(loop, action) {
+        if (!socket || socket.readyState !== WebSocket.OPEN || updatingLoop) return;
+        updatingLoop = loop.id;
+        renderRemoteLoops();
+        socket.send(JSON.stringify({
+          type:'loop-action',
+          agent:remoteLoopsAgent,
+          loop:loop.id,
+          action:action
+        }));
+      }
+
+      function renderRemoteLoops() {
+        loopsListEl.textContent = '';
+        loopsStateEl.style.display = remoteLoops.length ? 'none' : 'block';
+        loopsStateEl.textContent = remoteLoops.length
+          ? ''
+          : 'No scheduled loops for ' + remoteLoopsAgent;
+        remoteLoops.forEach(function (loop) {
+          var row = document.createElement('div');
+          row.className = 'loop-row' + (loop.paused ? ' paused' : '');
+          var copy = document.createElement('div'); copy.className = 'loop-copy';
+          var prompt = document.createElement('div'); prompt.className = 'loop-prompt'; prompt.textContent = loop.prompt || 'Untitled loop';
+          var meta = document.createElement('div'); meta.className = 'loop-meta';
+          meta.textContent = loop.paused
+            ? 'paused - ' + loop.interval
+            : loop.interval + ' - ' + formatRemoteLoopNext(loop.nextFireAt);
+          copy.appendChild(prompt); copy.appendChild(meta);
+          var actions = document.createElement('div'); actions.className = 'loop-actions';
+          var toggle = document.createElement('button');
+          toggle.type = 'button'; toggle.className = 'loop-action';
+          toggle.disabled = Boolean(updatingLoop);
+          toggle.setAttribute('aria-label', loop.paused ? 'Resume loop' : 'Pause loop');
+          toggle.title = loop.paused ? 'Resume loop' : 'Pause loop';
+          toggle.textContent = loop.paused ? '▶' : 'Ⅱ';
+          toggle.onclick = function () { sendRemoteLoopAction(loop, 'toggle'); };
+          var remove = document.createElement('button');
+          remove.type = 'button'; remove.className = 'loop-action delete';
+          remove.disabled = Boolean(updatingLoop);
+          remove.setAttribute('aria-label', 'Delete loop'); remove.title = 'Delete loop'; remove.textContent = '×';
+          remove.onclick = function () { sendRemoteLoopAction(loop, 'delete'); };
+          actions.appendChild(toggle); actions.appendChild(remove);
+          row.appendChild(copy); row.appendChild(actions); loopsListEl.appendChild(row);
+        });
+      }
+
+      function requestRemoteLoops() {
+        clearTimeout(loopsRefreshTimer);
+        loopsRefreshTimer = null;
+        if (!loopsViewEl.classList.contains('active')) return;
+        if (socket && socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({type:'loops'}));
+        } else {
+          loopsStateEl.textContent = 'Remote connection is unavailable';
+        }
+      }
+
+      function scheduleRemoteLoopsRefresh() {
+        clearTimeout(loopsRefreshTimer);
+        if (!loopsViewEl.classList.contains('active')) return;
+        loopsRefreshTimer = setTimeout(requestRemoteLoops, 1200);
+      }
+
+      function showLoopsDrawer() {
+        drawerTitleEl.textContent = 'Loops';
+        drawerMenuViewEl.style.display = 'none';
+        loopsViewEl.classList.add('active');
+        loopsStateEl.style.display = 'block';
+        loopsStateEl.textContent = 'Loading loops...';
+        loopsListEl.textContent = '';
+        requestRemoteLoops();
+      }
 
       function isNearBottom() {
         return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 96;
@@ -521,10 +872,64 @@ const REMOTE_CONTROL_HTML = String.raw`<!doctype html>
           try {
             var payload = JSON.parse(event.data);
             if (payload.type === 'snapshot') render(payload);
-            if (payload.type === 'error') statusEl.textContent = payload.message || 'Remote error';
+            if (payload.type === 'sessions') {
+              remoteSessions = Array.isArray(payload.sessions) ? payload.sessions : [];
+              remoteSessionsAgent = payload.agent || (latestState && latestState.agent) || 'main';
+              drawerTitleEl.textContent = remoteSessionsAgent === 'main'
+                ? 'Sessions'
+                : 'Sessions - ' + remoteSessionsAgent;
+              switchingSession = '';
+              renderRemoteSessions();
+            }
+            if (payload.type === 'session-switched') {
+              switchingSession = '';
+              setDrawerOpen(false);
+            }
+            if (payload.type === 'agents') {
+              remoteAgents = Array.isArray(payload.agents) ? payload.agents : [];
+              switchingAgent = '';
+              renderRemoteAgents();
+              scheduleRemoteAgentsRefresh();
+            }
+            if (payload.type === 'loops') {
+              remoteLoops = Array.isArray(payload.loops) ? payload.loops : [];
+              remoteLoopsAgent = payload.agent || (latestState && latestState.agent) || 'main';
+              drawerTitleEl.textContent = remoteLoopsAgent === 'main'
+                ? 'Loops'
+                : 'Loops - ' + remoteLoopsAgent;
+              updatingLoop = '';
+              renderRemoteLoops();
+              scheduleRemoteLoopsRefresh();
+            }
+            if (payload.type === 'agent-switched') {
+              remoteSessions = [];
+              remoteSessionsAgent = payload.agent || 'main';
+              remoteLoops = [];
+              remoteLoopsAgent = payload.agent || 'main';
+              switchingAgent = '';
+              setDrawerOpen(false);
+            }
+            if (payload.type === 'error') {
+              switchingSession = '';
+              switchingAgent = '';
+              updatingLoop = '';
+              statusEl.textContent = payload.message || 'Remote error';
+              if (sessionsViewEl.classList.contains('active')) {
+                renderRemoteSessions();
+                sessionsStateEl.style.display = 'block';
+                sessionsStateEl.textContent = payload.message || 'Could not load sessions';
+              }
+              if (agentsViewEl.classList.contains('active')) {
+                renderRemoteAgents();
+                agentsStateEl.style.display = 'block';
+                agentsStateEl.textContent = payload.message || 'Could not load agents';
+              }
+            }
           } catch (_) {}
         };
         socket.onclose = function () {
+          clearTimeout(agentsRefreshTimer);
+          agentsRefreshTimer = null;
           statusEl.textContent = 'Disconnected - reconnecting...';
           dotEl.className = '';
           clearTimeout(reconnectTimer);
@@ -536,6 +941,21 @@ const REMOTE_CONTROL_HTML = String.raw`<!doctype html>
         latestState = state;
         if (state.session !== lastSession) stickToBottom = true;
         lastSession = state.session || '';
+        if (remoteSessions.length) {
+          var sessionsMatchAgent = String(remoteSessionsAgent || 'main').toLowerCase() ===
+            String(state.agent || 'main').toLowerCase();
+          remoteSessions.forEach(function (session) {
+            if (!sessionsMatchAgent) session.current = false;
+            else if (remoteSessionsAgent === 'main') session.current = session.id === lastSession;
+          });
+          if (sessionsViewEl.classList.contains('active')) renderRemoteSessions();
+        }
+        if (remoteAgents.length) {
+          remoteAgents.forEach(function (agent) {
+            agent.current = String(agent.name || '').toLowerCase() === String(state.agent || 'main').toLowerCase();
+          });
+          if (agentsViewEl.classList.contains('active')) renderRemoteAgents();
+        }
         messagesEl.textContent = '';
         if (!state.messages || !state.messages.length) {
           var empty = document.createElement('div'); empty.className = 'empty'; empty.textContent = 'Start a conversation from your phone.'; messagesEl.appendChild(empty);
@@ -549,7 +969,7 @@ const REMOTE_CONTROL_HTML = String.raw`<!doctype html>
         var busy = state.status && state.status.phase !== 'idle';
         dotEl.className = busy ? 'busy' : 'online';
         statusEl.textContent = busy ? state.status.label : 'Connected';
-        stopEl.style.display = busy ? 'block' : 'none';
+        stopEl.style.display = busy ? 'flex' : 'none';
         sendEl.style.display = 'block';
         var queued = state.queued || [];
         queuedEl.style.display = queued.length ? 'block' : 'none';
@@ -560,11 +980,25 @@ const REMOTE_CONTROL_HTML = String.raw`<!doctype html>
       function sendPrompt() {
         var text = inputEl.value;
         if (!text.trim() || !socket || socket.readyState !== WebSocket.OPEN) return;
+        if (text.trim().toLowerCase() === '/loops') {
+          inputEl.value = ''; inputEl.style.height = 'auto';
+          setDrawerOpen(true); showLoopsDrawer();
+          return;
+        }
         socket.send(JSON.stringify({type:'prompt',text:text}));
         inputEl.value = ''; inputEl.style.height = 'auto'; stickToBottom = true; scrollToBottom(); inputEl.focus();
       }
       sendEl.onclick = sendPrompt;
       stopEl.onclick = function () { if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({type:'stop'})); };
+      menuButtonEl.onclick = function () { setDrawerOpen(true); };
+      drawerCloseEl.onclick = function () { setDrawerOpen(false); };
+      drawerBackdropEl.onclick = function () { setDrawerOpen(false); };
+      sessionsMenuEl.onclick = showSessionsDrawer;
+      sessionSearchEl.oninput = renderRemoteSessions;
+      agentsMenuEl.onclick = showAgentsDrawer;
+      agentSearchEl.oninput = renderRemoteAgents;
+      loopsMenuEl.onclick = showLoopsDrawer;
+      document.addEventListener('keydown', function (event) { if (event.key === 'Escape') setDrawerOpen(false); });
       inputEl.oninput = function () { this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight,150) + 'px'; };
       inputEl.onkeydown = function (event) { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendPrompt(); } };
       inputEl.onfocus = function () { stickToBottom = isNearBottom(); setTimeout(syncVisualViewport, 50); };
@@ -586,6 +1020,9 @@ const WORKSPACE_ROOT = path.resolve(process.cwd());
 const HOME_DIR = os.homedir();
 const NEXUS_DIR = path.join(HOME_DIR, ".nexus");
 const SESSIONS_DIR = path.join(NEXUS_DIR, "sessions");
+const WORKSPACE_AGENT_SCOPE = createHash("sha256").update(WORKSPACE_ROOT).digest("hex").slice(0, 16);
+const AGENT_SESSIONS_DIR = path.join(NEXUS_DIR, "agents", WORKSPACE_AGENT_SCOPE);
+const NAMED_AGENT_LOOPS_FILE = path.join(AGENT_SESSIONS_DIR, "named-loops.json");
 const NEXUS_CONFIG_FILE = path.join(NEXUS_DIR, "config.json");
 const NEXUS_PROVIDERS_FILE = path.join(NEXUS_DIR, "providers.json");
 const DEFAULT_PROVIDERS = [
@@ -624,6 +1061,8 @@ const COMMANDS = [
   { name: "/review", description: "review my current changes and find issues" },
   { name: "/rename", description: "rename the current thread" },
   { name: "/init", description: "create AGENTS.md contributor guidance for this workspace" },
+  { name: "/agent", description: "create or task an async agent: /agent <name> [task]" },
+  { name: "/list-agents", description: "view agents, statuses, and switch agent sessions" },
   { name: "/new", description: "start a new chat with a new uid" },
   { name: "/mcp", description: "manage MCP servers: start, stop, and reload configuration" },
   { name: "/remote-control", description: "connect a phone to this session over the local network" },
@@ -817,6 +1256,7 @@ let lastRemoteControlRenderedCols = 0;
 let lastRemoteControlRenderedHeight = 0;
 let selectedModel = "";
 let reasoningEnabledByModel = {};
+let sessionRuntimeSettings = {};
 let modelSearch = "";
 let modelSelected = 0;
 let modelScroll = 0;
@@ -833,6 +1273,7 @@ let lastModelRenderedRows = [];
 let lastModelRenderedCols = 0;
 let lastModelRenderedHeight = 0;
 let sessionFiles = [];
+let sessionsOwnerAgent = "main";
 let sessionsSelected = 0;
 let sessionsScroll = 0;
 let sessionsSearch = "";
@@ -841,6 +1282,18 @@ let sessionsLoadError = "";
 let lastSessionsRenderedRows = [];
 let lastSessionsRenderedCols = 0;
 let lastSessionsRenderedHeight = 0;
+let namedAgents = [];
+let activeAgentName = "main";
+let activeNamedAgentMessages = [];
+const namedAgentUiNotices = new Map();
+let agentsSelected = 0;
+let agentsScroll = 0;
+let agentsSearch = "";
+let agentsMessage = "";
+let agentsRefreshTimer = null;
+let lastAgentsRenderedRows = [];
+let lastAgentsRenderedCols = 0;
+let lastAgentsRenderedHeight = 0;
 let providers = [];
 let selectedProviderName = DEFAULT_PROVIDERS[0].name;
 let nexusConfig = {};
@@ -961,12 +1414,17 @@ let activeToolRun = null; // { label, startedAt, done, ok }
 let clarifyingActive = false;
 let clarifyingStartedAt = 0;
 let stopRequested = false;
+let stopNoticeEmitted = false;
+let stopNoticeOverride = "";
+let activeLlmAbortController = null;
+let activeSessionCompaction = null;
 let queuedBusyPromptSequence = 0;
 const queuedBusyPrompts = [];
 let pendingAssistantMessageIndex = -1;
 let contextLeftPercentByModel = {};
 let cacheTelemetryByModel = {};
 let currentSessionUid = createSessionUid();
+let currentSessionTitle = "";
 let sessionFilePath = getSessionFilePath(currentSessionUid);
 let sessionInitPromise = null;
 let sessionWriteChain = Promise.resolve();
@@ -1164,7 +1622,7 @@ function getModelContextLength(modelId = selectedModel) {
   // Optional per-session window override beats everything: providers often
   // omit context_length from /models, and a 128k fallback is wrong for
   // models with e.g. a 1M window.
-  const override = Number(nexusConfig?.model_context_window_override);
+  const override = Number(getMainSessionRuntimeSettings().context_window);
   if (Number.isFinite(override) && override > 0) {
     return Math.floor(override);
   }
@@ -1328,6 +1786,35 @@ function updateCacheTelemetryFromCompletion(completion, modelId = selectedModel)
 
 function getCacheTelemetry(modelId = selectedModel) {
   return cacheTelemetryByModel[String(modelId || "").trim()] || null;
+}
+
+function getActiveSessionContextLength(modelId = getActiveSessionModel()) {
+  const runtime = getActiveNamedAgentRuntime();
+  if (!runtime) return getModelContextLength(modelId);
+  const override = Number(runtime.settings?.context_window);
+  if (Number.isFinite(override) && override > 0) return Math.floor(override);
+  const model = getModelEntryForContext(modelId);
+  const raw = Number(model?.contextLength || 0);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+}
+
+function getActiveContextLeftPercent(modelId = getActiveSessionModel()) {
+  const runtime = getActiveNamedAgentRuntime();
+  if (!runtime) return getContextLeftPercent(modelId);
+  const key = String(modelId || "").trim();
+  const stored = Number(runtime.context_left_by_model?.[key]);
+  if (Number.isFinite(stored)) return Math.max(0, Math.min(100, stored));
+  const contextLength = getActiveSessionContextLength(modelId) || 128000;
+  const agent = getNamedAgentByName(activeAgentName);
+  const estimatedTokens = estimateMessagesInChatTokens(Array.isArray(agent?.messages) ? agent.messages : []);
+  if (estimatedTokens <= 0) return 100;
+  return Math.max(0, Math.min(100, Math.round(((contextLength - estimatedTokens) / contextLength) * 100)));
+}
+
+function getActiveCacheTelemetry(modelId = getActiveSessionModel()) {
+  const runtime = getActiveNamedAgentRuntime();
+  if (!runtime) return getCacheTelemetry(modelId);
+  return runtime.cache_telemetry_by_model?.[String(modelId || "").trim()] || null;
 }
 
 function formatCacheTelemetry(modelId = selectedModel) {
@@ -1609,6 +2096,31 @@ function spawnPythonCommandStreaming(args, options = {}) {
   })();
 }
 
+function formatActiveCacheTelemetry() {
+  const modelId = getActiveSessionModel();
+  const telemetry = getActiveCacheTelemetry(modelId);
+  const namedRuntime = getActiveNamedAgentRuntime();
+  const activePrompt = namedRuntime
+    ? buildNamedAgentSystemPrompt(getNamedAgentByName(activeAgentName), namedRuntime)
+    : systemPromptText;
+  const fingerprint = telemetry?.fingerprint ||
+    createHash("sha256").update(String(activePrompt || ""), "utf8").digest("hex").slice(0, 12);
+  const lines = [
+    "Prompt cache telemetry",
+    `- System prompt fingerprint: ${fingerprint}`,
+    `- Prefix changed since previous response: ${telemetry?.prefixChanged ? "yes" : "no"}`,
+  ];
+  if (Number.isFinite(telemetry?.cachedTokens)) {
+    lines.push(`- Provider-reported cached input: ${telemetry.cachedTokens} tokens`);
+  } else {
+    lines.push("- Provider-reported cached input: unavailable");
+  }
+  if (Number.isFinite(telemetry?.promptTokens)) lines.push(`- Prompt input: ${telemetry.promptTokens} tokens`);
+  if (Number.isFinite(telemetry?.cachePercent)) lines.push(`- Cache hit ratio: ${telemetry.cachePercent}%`);
+  lines.push("- Note: identical fingerprints confirm a stable system prompt; cache reuse still depends on provider support and the complete request prefix.");
+  return lines.join("\n");
+}
+
 async function findWorkspaceGuide() {
   for (const fileName of WORKSPACE_GUIDE_FILENAMES) {
     const filePath = path.join(WORKSPACE_ROOT, fileName);
@@ -1667,6 +2179,7 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     return [
       "Your name is Nexus developed by duxx.",
       "You are a terminal coding assistant operating in read-only Plan mode.",
+      ...CURRENT_ENVIRONMENT_PROMPT_LINES,
       "",
       "CONTEXT USE (MUST FOLLOW):",
       "- Avoid repetition and re-reading unchanged files; inspect targeted context.",
@@ -1690,6 +2203,7 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
       "- Use four backticks by default. If the Python contains four consecutive backticks, use an outer fence longer than any backtick run inside the code.",
       "- Call the provided helpers directly. Imports, raw file access, arbitrary functions, and unlisted helpers are blocked.",
       "- Keep each execute block compact; if truncated, retry with a smaller complete block.",
+      ...EXECUTION_RESULT_BOUNDARY_PROMPT_LINES,
       "",
       "EXAMPLE:",
       "````execute",
@@ -1716,6 +2230,7 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
   return [
     "Your name is Nexus developed by duxx.",
     "You are a terminal coding assistant. You can spawn agents and orchestrate them.",
+    ...CURRENT_ENVIRONMENT_PROMPT_LINES,
     "",
     "CONTEXT USE (MUST FOLLOW):",
     "- Use context effectively: avoid unnecessary repetition, avoid re-reading unchanged large files, and prefer targeted edits/tool calls.",
@@ -1775,6 +2290,7 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "- Call helper functions directly in Python code.",
     "- For tool-use replies, include no prose before or after the execute block.",
     "- Keep execute blocks compact. If an execute block is reported as truncated, retry with a smaller complete block.",
+    ...EXECUTION_RESULT_BOUNDARY_PROMPT_LINES,
     "",
     "FILE EDIT STRATEGY (MANDATORY):",
     "- For existing files, prefer incremental edits with replace_in_file instead of rewriting the full file.",
@@ -2965,19 +3481,23 @@ async function handleMcpBridgeRequest(parsed) {
   if (parsed.method === "reminder") {
     const when = typeof parsed.when === "string" ? parsed.when.trim() : "";
     const prompt = typeof parsed.prompt === "string" ? parsed.prompt.trim() : "";
+    const runtimeSessionId = String(parsed.session_id || "").trim();
+    const reminderOwner = runtimeSessionId.toLowerCase().startsWith("named-")
+      ? normalizeLoopOwnerAgent(runtimeSessionId.slice("named-".length))
+      : "main";
     if (!when || !prompt) {
       return { ok: false, error: "set_reminder requires 'when' and 'prompt' strings" };
     }
-    if (loopTasks.length >= LOOP_MAX_TASKS) {
-      return { ok: false, error: `this session already has ${LOOP_MAX_TASKS} scheduled loops` };
+    if (getLoopTaskCountForAgent(reminderOwner) >= LOOP_MAX_TASKS) {
+      return { ok: false, error: `agent ${reminderOwner} already has ${LOOP_MAX_TASKS} scheduled loops` };
     }
     // Recurring reminder: "every 5 seconds", "every 10 minutes", "every 2 hours".
     // This schedules a repeating loop (not a one-shot). Sub-minute intervals are
     // allowed here so quick polling reminders work ("every 5 seconds").
     const everyPhrase = parseEveryPhrase(when);
     if (everyPhrase) {
-      if (loopTasks.length >= LOOP_MAX_TASKS) {
-        return { ok: false, error: `this session already has ${LOOP_MAX_TASKS} scheduled loops` };
+      if (getLoopTaskCountForAgent(reminderOwner) >= LOOP_MAX_TASKS) {
+        return { ok: false, error: `agent ${reminderOwner} already has ${LOOP_MAX_TASKS} scheduled loops` };
       }
       const task = scheduleLoopTask(null, prompt, {
         oneshot: false,
@@ -2985,7 +3505,9 @@ async function handleMcpBridgeRequest(parsed) {
         intervalMs: everyPhrase.intervalMs,
         subMinute: everyPhrase.intervalMs < LOOP_MIN_INTERVAL_MS,
         displayLabel: `${prompt} (${everyPhrase.label})`,
+        ownerAgent: reminderOwner,
       });
+      if (reminderOwner !== "main") await persistNamedAgentLoops();
       startLoopScheduler();
       if (process.stdout.isTTY) {
         markDirty();
@@ -3013,7 +3535,9 @@ async function handleMcpBridgeRequest(parsed) {
       dynamic: false,
       fireAt: extracted.when,
       displayLabel: extracted.display,
+      ownerAgent: reminderOwner,
     });
+    if (reminderOwner !== "main") await persistNamedAgentLoops();
     startLoopScheduler();
     if (process.stdout.isTTY) {
       markDirty();
@@ -3424,8 +3948,12 @@ async function rewriteSessionWithCurrentMessages() {
         payload.sessionModel = selectedModel.trim();
       }
       payload.sessionWorkspace = WORKSPACE_ROOT;
+      payload.sessionTitle = currentSessionTitle || getFirstSessionTitle(messages);
       payload.sessionReasoningByModel = getSessionReasoningConfig();
       payload.sessionMode = collaborationMode;
+      payload.sessionRuntimeSettings = getMainSessionRuntimeSettings();
+      payload.sessionContextLeftByModel = normalizeContextLeftMap(contextLeftPercentByModel);
+      payload.sessionCacheTelemetryByModel = normalizeCacheTelemetryMap(cacheTelemetryByModel);
       payload.excludeFromRequest = entry?.excludeFromRequest === true;
       if (Array.isArray(entry?.reasoningDetails) && entry.reasoningDetails.length > 0) {
         payload.reasoning_details = entry.reasoningDetails;
@@ -3461,21 +3989,10 @@ async function rewriteSessionWithCurrentMessages() {
   const loopPayload = {
     role: "loop",
     content: "",
-    loops: loopTasks.map((task) => ({
-      id: task.id,
-      prompt: task.prompt,
-      intervalMs: task.intervalMs,
-      dynamic: task.dynamic === true,
-      oneshot: task.oneshot === true,
-      paused: task.paused === true,
-      subMinute: task.subMinute === true,
-      createdAt: task.createdAt,
-      nextFireAt: task.nextFireAt,
-      lastDelayMs: task.lastDelayMs,
-      display: task.displayLabel || "",
-    })),
+    loops: getLoopTasksForAgent("main").map(serializeLoopTask),
   };
-  const fullLines = loopTasks.length > 0
+  const mainLoopCount = loopPayload.loops.length;
+  const fullLines = mainLoopCount > 0
     ? `${lines}${lines.length > 0 ? "\n" : ""}${JSON.stringify(loopPayload)}\n`
     : lines.length > 0 ? `${lines}\n` : "";
 
@@ -3531,6 +4048,11 @@ function cleanupTerminal(options = {}) {
     clearInterval(answerRevealTimer);
     answerRevealTimer = null;
   }
+  if (agentsRefreshTimer) {
+    clearTimeout(agentsRefreshTimer);
+    agentsRefreshTimer = null;
+  }
+  persistNamedAgentLoopsSync();
   stopLoopScheduler();
   stopKernelProcess();
   for (const job of backgroundShellProcesses) {
@@ -3636,7 +4158,7 @@ function setTerminalTitle(spinnerFrame = "") {
 }
 
 function updateTerminalTitleAnimationState() {
-  if (!isAssistantThinking()) {
+  if (!isAnyAgentWorking()) {
     if (terminalTitleSpinnerTimer) {
       clearInterval(terminalTitleSpinnerTimer);
       terminalTitleSpinnerTimer = null;
@@ -3652,7 +4174,7 @@ function updateTerminalTitleAnimationState() {
 
   setTerminalTitle(SPINNER_FRAMES[terminalTitleSpinnerFrameIndex]);
   terminalTitleSpinnerTimer = setInterval(() => {
-    if (!isAssistantThinking()) {
+    if (!isAnyAgentWorking()) {
       updateTerminalTitleAnimationState();
       return;
     }
@@ -3876,16 +4398,130 @@ function normalizeThinkingEffort(value) {
   return THINKING_EFFORT_OPTIONS.includes(normalized) ? normalized : DEFAULT_THINKING_EFFORT;
 }
 
+function getDefaultSessionRuntimeSettings() {
+  return {
+    thinking_blocks: nexusConfig?.show_thinking_blocks !== false,
+    external_thinking: nexusConfig?.external_thinking === true,
+    thinking_effort: normalizeThinkingEffort(nexusConfig?.thinking_effort),
+    context_window: normalizeModelContextWindow(nexusConfig?.model_context_window_override),
+    request_timeout_ms: normalizeLlmRequestTimeoutMs(nexusConfig?.llm_request_timeout_ms),
+  };
+}
+
+function normalizeSessionRuntimeSettings(raw, defaults = getDefaultSessionRuntimeSettings()) {
+  const source = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  return {
+    thinking_blocks: Object.prototype.hasOwnProperty.call(source, "thinking_blocks")
+      ? source.thinking_blocks !== false
+      : defaults.thinking_blocks !== false,
+    external_thinking: Object.prototype.hasOwnProperty.call(source, "external_thinking")
+      ? source.external_thinking === true
+      : defaults.external_thinking === true,
+    thinking_effort: normalizeThinkingEffort(source.thinking_effort ?? defaults.thinking_effort),
+    context_window: normalizeModelContextWindow(source.context_window ?? defaults.context_window),
+    request_timeout_ms: normalizeLlmRequestTimeoutMs(
+      source.request_timeout_ms ?? defaults.request_timeout_ms
+    ),
+  };
+}
+
+function getMainSessionRuntimeSettings() {
+  sessionRuntimeSettings = normalizeSessionRuntimeSettings(sessionRuntimeSettings);
+  return sessionRuntimeSettings;
+}
+
+function normalizeContextLeftMap(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const normalized = {};
+  for (const [key, value] of Object.entries(raw)) {
+    const percent = Number(value);
+    if (key.trim() && Number.isFinite(percent)) {
+      normalized[key.trim()] = Math.max(0, Math.min(100, percent));
+    }
+  }
+  return normalized;
+}
+
+function normalizeCacheTelemetryMap(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const normalized = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (!key.trim() || !value || typeof value !== "object" || Array.isArray(value)) continue;
+    normalized[key.trim()] = { ...value };
+  }
+  return normalized;
+}
+
+function normalizeNamedAgentSessionRuntime(record) {
+  const source = record?.session_runtime && typeof record.session_runtime === "object"
+    ? record.session_runtime
+    : {};
+  const model = String(source.model || record?.model || selectedModel || "").trim();
+  const reasoningByModel = normalizeReasoningConfigMap(source.reasoning_by_model);
+  if (
+    model &&
+    !Object.prototype.hasOwnProperty.call(reasoningByModel, model) &&
+    typeof record?.reasoning_enabled === "boolean"
+  ) {
+    reasoningByModel[model] = record.reasoning_enabled;
+  }
+  const sessionMode = source.collaboration_mode === "plan" || source.collaboration_mode === "build"
+    ? source.collaboration_mode
+    : null;
+  return {
+    model,
+    collaboration_mode: sessionMode || (record?.collaboration_mode === "plan" ? "plan" : "build"),
+    reasoning_by_model: reasoningByModel,
+    settings: normalizeSessionRuntimeSettings(source.settings),
+    context_left_by_model: normalizeContextLeftMap(source.context_left_by_model),
+    cache_telemetry_by_model: normalizeCacheTelemetryMap(source.cache_telemetry_by_model),
+  };
+}
+
+function getActiveNamedAgentRuntime() {
+  if (activeAgentName === "main") return null;
+  const agent = getNamedAgentByName(activeAgentName);
+  return agent ? normalizeNamedAgentSessionRuntime(agent) : null;
+}
+
+function getActiveSessionModel() {
+  return getActiveNamedAgentRuntime()?.model || selectedModel;
+}
+
+function getActiveCollaborationMode() {
+  return getActiveNamedAgentRuntime()?.collaboration_mode || collaborationMode;
+}
+
+function getNamedAgentReasoningEnabled(runtime, modelId = runtime?.model) {
+  const key = String(modelId || "").trim();
+  if (!key) return true;
+  if (Object.prototype.hasOwnProperty.call(runtime?.reasoning_by_model || {}, key)) {
+    return Boolean(runtime.reasoning_by_model[key]);
+  }
+  return true;
+}
+
+function getActiveReasoningEnabled() {
+  const runtime = getActiveNamedAgentRuntime();
+  return runtime
+    ? getNamedAgentReasoningEnabled(runtime, runtime.model)
+    : getReasoningEnabledForModel(selectedModel);
+}
+
+function getActiveSessionRuntimeSettings() {
+  return getActiveNamedAgentRuntime()?.settings || getMainSessionRuntimeSettings();
+}
+
 function getThinkingEffort() {
-  return normalizeThinkingEffort(nexusConfig?.thinking_effort);
+  return getMainSessionRuntimeSettings().thinking_effort;
 }
 
 function shouldShowThinkingBlocks() {
-  return nexusConfig?.show_thinking_blocks !== false;
+  return getActiveReasoningEnabled() && getActiveSessionRuntimeSettings().thinking_blocks !== false;
 }
 
 function isExternalThinkingEnabled() {
-  return nexusConfig?.external_thinking === true;
+  return getMainSessionRuntimeSettings().external_thinking === true;
 }
 
 function shouldUseExternalThinking(modelId = selectedModel) {
@@ -3893,7 +4529,13 @@ function shouldUseExternalThinking(modelId = selectedModel) {
 }
 
 function applyThinkingRequestSettings(payload, modelId = selectedModel, enabled = true) {
-  if (!payload || !enabled || !getReasoningEnabledForModel(modelId)) return payload;
+  if (!payload) return payload;
+  if (!getReasoningEnabledForModel(modelId)) {
+    payload.reasoning = { enabled: false };
+    payload.thinking = { type: "disabled" };
+    return payload;
+  }
+  if (!enabled) return payload;
   payload.reasoning_effort = getThinkingEffort();
   payload.reasoning = { enabled: true };
   // Python's OpenAI `extra_body={"thinking": ...}` is serialized as this
@@ -3903,7 +4545,7 @@ function applyThinkingRequestSettings(payload, modelId = selectedModel, enabled 
 }
 
 function getLlmRequestTimeoutMs() {
-  return normalizeLlmRequestTimeoutMs(nexusConfig?.llm_request_timeout_ms);
+  return getMainSessionRuntimeSettings().request_timeout_ms;
 }
 
 async function ensureNexusConfigFileReady() {
@@ -4177,8 +4819,12 @@ function appendHistoryEntry(role, content, extra = null) {
     payload.sessionModel = selectedModel.trim();
   }
   payload.sessionWorkspace = WORKSPACE_ROOT;
+  payload.sessionTitle = currentSessionTitle || getFirstSessionTitle(messages);
   payload.sessionReasoningByModel = getSessionReasoningConfig();
   payload.sessionMode = collaborationMode;
+  payload.sessionRuntimeSettings = getMainSessionRuntimeSettings();
+  payload.sessionContextLeftByModel = normalizeContextLeftMap(contextLeftPercentByModel);
+  payload.sessionCacheTelemetryByModel = normalizeCacheTelemetryMap(cacheTelemetryByModel);
   payload.excludeFromRequest = false;
   if (extra && typeof extra === "object") {
     if (Array.isArray(extra.reasoningDetails) && extra.reasoningDetails.length > 0) {
@@ -4341,7 +4987,8 @@ function getToolOutputTokenLimit() {
 // Scheduled loops (/loop, /loops): session-scoped recurring prompts that fire
 // between turns, in the spirit of Claude Code's /loop skill. Tasks ride the
 // session JSONL (role:"loop" lines) and are restored on resume. A fresh
-// conversation (/new, /clear) clears them.
+// conversation (/new) clears them. /clear only clears transcript content, so
+// active schedules continue running and remain visible in /loops.
 // ---------------------------------------------------------------------------
 const LOOP_DEFAULT_INTERVAL_MS = 60 * 1000; // 1 minute
 const LOOP_MIN_INTERVAL_MS = 60 * 1000; // cron-like floor: 1 minute
@@ -4355,6 +5002,10 @@ const LOOP_MAINTENANCE_PROMPT =
 let loopTasks = [];
 let loopSchedulerTimer = null;
 let loopFiring = false;
+let activeMainLoopTaskId = "";
+let namedLoopPersistenceSuspended = false;
+let namedLoopPersistenceChain = Promise.resolve();
+let namedLoopsLoaded = false;
 let solveActive = false;
 let solveStartupActive = false;
 let solveStartupStatus = "";
@@ -4445,7 +5096,223 @@ function normalizeLoopTask(entry) {
     lastRunMessageCount: 0,
     lastDelayMs: normalizedInterval,
     displayLabel: typeof entry.display === "string" && entry.display ? entry.display : "",
+    ownerAgent: normalizeLoopOwnerAgent(entry.ownerAgent),
   };
+}
+
+function normalizeLoopOwnerAgent(value) {
+  const name = String(value || "main").trim();
+  if (!name || name.toLowerCase() === "main") return "main";
+  return normalizeNamedAgentName(name) || "main";
+}
+
+function getLoopTasksForAgent(name = activeAgentName) {
+  const owner = normalizeLoopOwnerAgent(name).toLowerCase();
+  return loopTasks.filter(
+    (task) => normalizeLoopOwnerAgent(task?.ownerAgent).toLowerCase() === owner
+  );
+}
+
+function isSessionTitleUserEntry(entry) {
+  if (!entry || entry.role !== "user" || typeof entry.content !== "string") return false;
+  const content = entry.content.trim();
+  return Boolean(
+    content &&
+    !isCompactionSummaryEntry(entry) &&
+    !content.startsWith("[orchestrator]") &&
+    !content.startsWith("[tool ")
+  );
+}
+
+function normalizeSessionTitle(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function getFirstSessionTitle(entries, fallback = "") {
+  const first = (Array.isArray(entries) ? entries : []).find(isSessionTitleUserEntry);
+  return normalizeSessionTitle(first?.content || fallback);
+}
+
+function getLoopTaskCountForAgent(name = activeAgentName) {
+  return getLoopTasksForAgent(name).length;
+}
+
+function serializeLoopTask(task) {
+  return {
+    id: task.id,
+    prompt: task.prompt,
+    intervalMs: task.intervalMs,
+    dynamic: task.dynamic === true,
+    oneshot: task.oneshot === true,
+    paused: task.paused === true,
+    subMinute: task.subMinute === true,
+    createdAt: task.createdAt,
+    nextFireAt: task.nextFireAt,
+    lastDelayMs: task.lastDelayMs,
+    display: task.displayLabel || "",
+    ownerAgent: normalizeLoopOwnerAgent(task.ownerAgent),
+  };
+}
+
+function getNamedAgentLoopTasks() {
+  return loopTasks.filter((task) => normalizeLoopOwnerAgent(task.ownerAgent) !== "main");
+}
+
+function serializeNamedAgentLoopNotices() {
+  const serialized = {};
+  for (const [owner, notices] of namedAgentUiNotices.entries()) {
+    const durable = Array.from(notices || [])
+      .filter((notice) => notice?.persisted === true)
+      .map((notice) => ({
+        role: notice.role === "error" ? "error" : "assistant",
+        content: String(notice.content || ""),
+        excludeFromRequest: true,
+        afterMessageCount: Number.isFinite(Number(notice.afterMessageCount))
+          ? Math.max(0, Math.floor(Number(notice.afterMessageCount)))
+          : 0,
+        persisted: true,
+      }))
+      .filter((notice) => notice.content);
+    if (durable.length > 0) serialized[owner] = durable;
+  }
+  return serialized;
+}
+
+function restoreNamedAgentLoopNotices(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return;
+  for (const [owner, storedNotices] of Object.entries(value)) {
+    const key = normalizeLoopOwnerAgent(owner).toLowerCase();
+    if (key === "main" || !Array.isArray(storedNotices)) continue;
+    const notices = storedNotices
+      .map((notice) => ({
+        role: notice?.role === "error" ? "error" : "assistant",
+        content: String(notice?.content || ""),
+        excludeFromRequest: true,
+        afterMessageCount: Number.isFinite(Number(notice?.afterMessageCount))
+          ? Math.max(0, Math.floor(Number(notice.afterMessageCount)))
+          : 0,
+        persisted: true,
+      }))
+      .filter((notice) => notice.content);
+    if (notices.length > 0) namedAgentUiNotices.set(key, notices);
+  }
+}
+
+function captureNamedAgentSessionSchedules(agentName) {
+  const ownerKey = normalizeLoopOwnerAgent(agentName).toLowerCase();
+  return {
+    session_loops: getLoopTasksForAgent(agentName).map(serializeLoopTask),
+    session_notices: serializeNamedAgentLoopNotices()[ownerKey] || [],
+  };
+}
+
+function restoreNamedAgentSessionSchedules(agentName, archived) {
+  const ownerName = normalizeLoopOwnerAgent(agentName);
+  removeLoopsForAgent(ownerName, { persist: false });
+  namedAgentUiNotices.delete(ownerName.toLowerCase());
+  const now = Date.now();
+  const restoredLoops = (Array.isArray(archived?.session_loops) ? archived.session_loops : [])
+    .map(normalizeLoopTask)
+    .filter(Boolean)
+    .filter((task) => !(task.oneshot && task.paused !== true && task.nextFireAt <= now))
+    .map((task) => ({ ...task, ownerAgent: ownerName }));
+  loopTasks.push(...restoredLoops);
+  restoreNamedAgentLoopNotices({
+    [ownerName.toLowerCase()]: Array.isArray(archived?.session_notices)
+      ? archived.session_notices
+      : [],
+  });
+  if (restoredLoops.length > 0) startLoopScheduler();
+  return restoredLoops.length;
+}
+
+async function persistNamedAgentLoops(filePath = NAMED_AGENT_LOOPS_FILE, options = {}) {
+  if (namedLoopPersistenceSuspended && options.force !== true) return false;
+  if (filePath === NAMED_AGENT_LOOPS_FILE) namedLoopsLoaded = true;
+  const writeCurrentState = async () => {
+    const loops = getNamedAgentLoopTasks().map(serializeLoopTask);
+    const notices = serializeNamedAgentLoopNotices();
+    if (loops.length === 0 && Object.keys(notices).length === 0) {
+      await fs.rm(filePath, { force: true }).catch(() => {});
+      return true;
+    }
+    await writeJsonAtomic(filePath, {
+      kind: "named-agent-loops",
+      workspace: WORKSPACE_ROOT,
+      loops,
+      notices,
+    });
+    return true;
+  };
+  if (filePath !== NAMED_AGENT_LOOPS_FILE || options.force === true) {
+    return writeCurrentState();
+  }
+  namedLoopPersistenceChain = namedLoopPersistenceChain.then(writeCurrentState, writeCurrentState);
+  return namedLoopPersistenceChain;
+}
+
+function persistNamedAgentLoopsSync() {
+  if (namedLoopPersistenceSuspended || !namedLoopsLoaded) return;
+  try {
+    const loops = getNamedAgentLoopTasks().map(serializeLoopTask);
+    const notices = serializeNamedAgentLoopNotices();
+    fsSync.mkdirSync(path.dirname(NAMED_AGENT_LOOPS_FILE), { recursive: true });
+    if (loops.length === 0 && Object.keys(notices).length === 0) {
+      fsSync.rmSync(NAMED_AGENT_LOOPS_FILE, { force: true });
+    } else {
+      fsSync.writeFileSync(
+        NAMED_AGENT_LOOPS_FILE,
+        `${JSON.stringify({ kind: "named-agent-loops", workspace: WORKSPACE_ROOT, loops, notices }, null, 2)}\n`,
+        "utf8"
+      );
+    }
+  } catch {
+    // Best-effort shutdown durability; normal mutations persist asynchronously.
+  }
+}
+
+async function loadNamedAgentLoops(filePath = NAMED_AGENT_LOOPS_FILE, options = {}) {
+  const fileExists = await fs.stat(filePath).then((stat) => stat.isFile()).catch(() => false);
+  const stored = await readJsonObject(filePath);
+  if (!stored || stored.kind !== "named-agent-loops" || !isCurrentWorkspace(stored.workspace)) {
+    if (filePath === NAMED_AGENT_LOOPS_FILE && !fileExists) namedLoopsLoaded = true;
+    return 0;
+  }
+  if (filePath === NAMED_AGENT_LOOPS_FILE) namedLoopsLoaded = true;
+  if (filePath === NAMED_AGENT_LOOPS_FILE) restoreNamedAgentLoopNotices(stored.notices);
+  const now = Date.now();
+  const restored = (Array.isArray(stored.loops) ? stored.loops : [])
+    .map(normalizeLoopTask)
+    .filter(Boolean)
+    .filter((task) => normalizeLoopOwnerAgent(task.ownerAgent) !== "main")
+    .filter((task) => !(task.oneshot && task.paused !== true && task.nextFireAt <= now));
+  const restoredIds = new Set(restored.map((task) => task.id));
+  loopTasks = [
+    ...loopTasks.filter(
+      (task) => normalizeLoopOwnerAgent(task.ownerAgent) === "main" || !restoredIds.has(task.id)
+    ),
+    ...restored,
+  ];
+  if (restored.length > 0) startLoopScheduler();
+  if (restored.length !== (Array.isArray(stored.loops) ? stored.loops.length : 0)) {
+    await persistNamedAgentLoops(filePath, options);
+  }
+  return restored.length;
+}
+
+function getSelectedLoopTaskForAgent(name = activeAgentName) {
+  return getLoopTasksForAgent(name)[loopsSelected] || null;
+}
+
+function recordMainLoopCommand(commandArgs) {
+  if (activeAgentName !== "main") return;
+  const args = String(commandArgs || "").trim();
+  messages.push({
+    role: "user",
+    content: `/loop${args ? ` ${args}` : ""}`,
+    hidden: true,
+    excludeFromRequest: true,
+  });
 }
 
 function parseLoopIntervalToken(token) {
@@ -4534,15 +5401,89 @@ function scheduleLoopTask(intervalMinutes, prompt, options = {}) {
     createdAt: Date.now(),
     nextFireAt,
     display: options.displayLabel || "",
+    ownerAgent: options.ownerAgent || activeAgentName,
   });
   loopTasks.push(task);
+  if (normalizeLoopOwnerAgent(task.ownerAgent) !== "main") {
+    persistNamedAgentLoops().catch(() => {});
+  }
   return task;
 }
 
-function removeLoopTask(id) {
+function stopLoopTaskExecution(task) {
+  if (!task?.id) return false;
+  const owner = normalizeLoopOwnerAgent(task.ownerAgent);
+  if (owner === "main") {
+    if (activeMainLoopTaskId !== task.id || pendingAssistantRequests <= 0) return false;
+    activeMainLoopTaskId = "";
+    handleStopRequest({ notice: `■ Stopped loop ${task.id}.` });
+    return true;
+  }
+  stopNamedLoopTaskExecution(owner, task.id).catch(() => {});
+  return true;
+}
+
+async function stopNamedLoopTaskExecution(owner, taskId) {
+  const recordPath = getNamedAgentRecordPath(owner);
+  let stopped = false;
+  // Retry across the small detached-launch admission window. A cancellation
+  // that lands before the launcher publishes its PID must still win.
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const record = await readJsonObject(recordPath);
+    if (
+      record &&
+      String(record.active_loop_id || "") === taskId &&
+      getNamedAgentStatus(record) === "running"
+    ) {
+      stopped = await stopNamedAgent({ ...record, recordPath }, {
+        error: `Stopped loop ${taskId}`,
+        message: `■ Stopped loop ${taskId}.`,
+      }) || stopped;
+    }
+    if (attempt < 3) {
+      await new Promise((resolve) => setTimeout(resolve, 75));
+    }
+  }
+  return stopped;
+}
+
+function removeLoopTask(id, options = {}) {
+  const owner = options.ownerAgent
+    ? normalizeLoopOwnerAgent(options.ownerAgent).toLowerCase()
+    : "";
+  const removed = loopTasks.filter(
+    (task) => task.id === id && (!owner || normalizeLoopOwnerAgent(task.ownerAgent).toLowerCase() === owner)
+  );
   const before = loopTasks.length;
-  loopTasks = loopTasks.filter((task) => task.id !== id);
+  loopTasks = loopTasks.filter(
+    (task) => !(task.id === id && (!owner || normalizeLoopOwnerAgent(task.ownerAgent).toLowerCase() === owner))
+  );
+  if (options.stopRunning !== false) {
+    for (const task of removed) stopLoopTaskExecution(task);
+  }
+  if (
+    options.persist !== false &&
+    removed.some((task) => normalizeLoopOwnerAgent(task.ownerAgent) !== "main")
+  ) {
+    persistNamedAgentLoops().catch(() => {});
+  }
   return loopTasks.length < before;
+}
+
+function removeLoopsForAgent(ownerAgent, options = {}) {
+  const owner = normalizeLoopOwnerAgent(ownerAgent).toLowerCase();
+  const tasks = loopTasks.filter(
+    (task) => normalizeLoopOwnerAgent(task.ownerAgent).toLowerCase() === owner
+  );
+  for (const task of tasks) {
+    removeLoopTask(task.id, {
+      ownerAgent: owner,
+      stopRunning: options.stopRunning !== false,
+      persist: options.persist !== false,
+    });
+  }
+  if (loopTasks.length === 0) stopLoopScheduler();
+  return tasks.length;
 }
 
 function startLoopScheduler() {
@@ -4565,8 +5506,14 @@ function stopLoopScheduler() {
 }
 
 function pickDynamicLoopDelay(task) {
-  const grew = messages.length - (task.lastRunMessageCount || 0);
-  task.lastRunMessageCount = messages.length;
+  const owner = normalizeLoopOwnerAgent(task?.ownerAgent);
+  const messageCount = owner === "main"
+    ? messages.length
+    : Array.isArray(getNamedAgentByName(owner)?.messages)
+      ? getNamedAgentByName(owner).messages.length
+      : 0;
+  const grew = messageCount - (task.lastRunMessageCount || 0);
+  task.lastRunMessageCount = messageCount;
   if (grew >= 4) {
     task.lastDelayMs = LOOP_DEFAULT_INTERVAL_MS;
   } else {
@@ -4619,23 +5566,22 @@ async function checkDueLoops() {
   if (due.length === 0) {
     return;
   }
-  // Fire between turns only: never while a request is in flight or stopped.
-  if (pendingAssistantRequests > 0 || stopRequested) {
-    return;
-  }
   loopFiring = true;
   try {
     for (const task of due) {
       if (!loopTasks.includes(task)) {
         continue;
       }
-      const scheduledAt = Number(task.nextFireAt) || now;
-      if (task.oneshot) {
-        removeLoopTask(task.id);
+      const owner = normalizeLoopOwnerAgent(task.ownerAgent);
+      if (owner === "main") {
+        // Main-agent loops fire between its turns. Named agents are independent
+        // and must not be blocked by work happening in the main session.
+        if (pendingAssistantRequests > 0 || stopRequested) continue;
       } else {
-        task.nextFireAt =
-          Date.now() + (task.dynamic ? pickDynamicLoopDelay(task) : task.intervalMs);
+        const agent = getNamedAgentByName(owner);
+        if (!agent || getNamedAgentStatus(agent) === "running") continue;
       }
+      const scheduledAt = Number(task.nextFireAt) || now;
       const content =
         typeof task.prompt === "string" && task.prompt.trim()
           ? task.prompt.trim()
@@ -4644,25 +5590,43 @@ async function checkDueLoops() {
       // with matcher "reminder"; failures and block decisions never suppress
       // the reminder itself.
       await runReminderArrivalHooks(task, content, scheduledAt).catch(() => {});
-      ensureSystemMessageAtTop();
-      // Fire as a tool output (not a user message) so the transcript shows a
-      // machine-originated event, and the model sees it as [tool result].
-      messages.push({
-        role: "tool",
-        content,
-        name: "set_reminder",
-        toolInput: task.displayLabel || "scheduled reminder",
-        toolOk: true,
-      });
-      scrollChatToBottom();
-      if (!APPEND_CHAT_TO_SCROLLBACK) {
-        forceFullClearOnNextRender = true;
+      let dispatched = true;
+      if (owner === "main") {
+        ensureSystemMessageAtTop();
+        // Fire as a tool output (not a user message) so the transcript shows a
+        // machine-originated event, and the model sees it as [tool result].
+        messages.push({
+          role: "tool",
+          content,
+          name: "set_reminder",
+          toolInput: task.displayLabel || "scheduled reminder",
+          toolOk: true,
+        });
+        scrollChatToBottom();
+        if (!APPEND_CHAT_TO_SCROLLBACK) {
+          forceFullClearOnNextRender = true;
+        }
+        markDirty();
+        renderFrame(false);
+        const modelAtFire = selectedModel;
+        if (modelAtFire) {
+          activeMainLoopTaskId = task.id;
+          queueAssistantReply(modelAtFire, { sourceLoopId: task.id });
+        }
+      } else {
+        const result = await dispatchNamedAgentTask(owner, content, {
+          sourceLoopId: task.id,
+          toolName: "set_reminder",
+        });
+        dispatched = result?.ok === true && result?.queued !== true;
       }
-      markDirty();
-      renderFrame(false);
-      const modelAtFire = selectedModel;
-      if (modelAtFire) {
-        queueAssistantReply(modelAtFire);
+      if (!dispatched) continue;
+      if (task.oneshot) {
+        removeLoopTask(task.id, { stopRunning: false });
+      } else {
+        task.nextFireAt =
+          Date.now() + (task.dynamic ? pickDynamicLoopDelay(task) : task.intervalMs);
+        if (owner !== "main") await persistNamedAgentLoops().catch(() => {});
       }
       await rewriteSessionWithCurrentMessages().catch(() => {});
       break; // one loop per tick keeps turns orderly
@@ -4686,11 +5650,12 @@ function formatLoopIntervalLabel(intervalMs) {
   return remMinutes > 0 ? `${hours}h ${remMinutes}m` : `${hours}h`;
 }
 
-function buildLoopsSummaryText() {
-  if (loopTasks.length === 0) {
+function buildLoopsSummaryText(ownerAgent = activeAgentName) {
+  const tasks = getLoopTasksForAgent(ownerAgent);
+  if (tasks.length === 0) {
     return "No scheduled loops.";
   }
-  const lines = loopTasks.map((task) => {
+  const lines = tasks.map((task) => {
     const intervalLabel = task.dynamic
       ? "dynamic"
       : task.oneshot
@@ -4700,7 +5665,7 @@ function buildLoopsSummaryText() {
     const truncated = promptPreview.length < task.prompt.length ? "…" : "";
     return `- ${task.id} | every ${intervalLabel} | ${promptPreview}${truncated}`;
   });
-  return `Scheduled loops (${loopTasks.length}):\n${lines.join("\n")}\n\nCancel with: /loops cancel <id>`;
+  return `Scheduled loops for ${normalizeLoopOwnerAgent(ownerAgent)} (${tasks.length}):\n${lines.join("\n")}\n\nCancel with: /loops cancel <id>`;
 }
 
 function getLoopMaintenancePrompt() {
@@ -5760,6 +6725,116 @@ async function installKernelRequirements(requirementsPath) {
   return { ok: true, installed: true, error: "" };
 }
 
+function buildCompactionSummaryPrompt(requestMessages, contextLength, customInstruction = "") {
+  const instruction =
+    typeof customInstruction === "string" && customInstruction.trim().length > 0
+      ? customInstruction.trim()
+      : COMPACTION_DEFAULT_CUSTOM_INSTRUCTION;
+  const maxSummaryChars = Math.max(2000, Math.floor(contextLength * 0.02));
+  return [
+    `You are compacting a long coding session into a handoff summary for another AI engineer.`,
+    ``,
+    `INSTRUCTIONS:`,
+    instruction,
+    ``,
+    `RULES:`,
+    `- Write the summary in plain text (no markdown fences, no code blocks).`,
+    `- Keep it under ${maxSummaryChars} characters.`,
+    `- Do not mention this prompt.`,
+    ``,
+    `CONVERSATION TO COMPACT:`,
+    requestMessages
+      .filter((message) => message.role !== "system")
+      .map((message) => {
+        const roleLabel = message.role === "tool" || message.role === "tool_result" ? "tool" : message.role;
+        const content = typeof message?.content === "string" ? message.content : "";
+        if (Array.isArray(content)) {
+          return `${roleLabel}: ${content.map((part) => (typeof part === "object" && typeof part?.text === "string" ? part.text : "")).join(" ")}`;
+        }
+        return `${roleLabel}: ${content}`;
+      })
+      .join(String.fromCharCode(10, 10))
+      .slice(-Math.max(2000, Math.floor(contextLength * 0.6))),
+  ].join(String.fromCharCode(10));
+}
+
+function compactConversationEntries(sourceEntries, summaryText) {
+  const entries = Array.isArray(sourceEntries) ? sourceEntries : [];
+  const keptTail = [];
+  let recentTokens = 0;
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    const entry = entries[i];
+    if (!entry || entry.ephemeral === true || entry.role === "system" || isCompactionSummaryEntry(entry)) {
+      continue;
+    }
+    const tokens = estimateMessageTokens(entry);
+    if (recentTokens + tokens > COMPACTION_RECENT_USER_TOKENS) break;
+    recentTokens += tokens;
+    keptTail.unshift(entry);
+  }
+  const systemEntries = entries.filter(
+    (entry) => entry && entry.ephemeral !== true && entry.role === "system"
+  );
+  return {
+    entries: [
+      ...systemEntries,
+      {
+        role: "user",
+        content: `${COMPACTION_SUMMARY_PREFIX}\n${summaryText}`,
+        hidden: true,
+      },
+      ...keptTail,
+    ],
+    keptTailCount: keptTail.length,
+  };
+}
+
+function buildNamedAgentCompactionMessages(record, runtime) {
+  const includeReasoning = getNamedAgentReasoningEnabled(runtime, runtime.model);
+  const output = [];
+  for (const entry of Array.isArray(record?.messages) ? record.messages : []) {
+    if (!entry || entry.ephemeral === true || entry.exclude_from_request === true || entry.excludeFromRequest === true) {
+      continue;
+    }
+    const role = String(entry.role || "");
+    if (!["system", "user", "assistant"].includes(role)) continue;
+    const content = typeof entry.content === "string" ? entry.content : "";
+    if (!content.trim()) continue;
+    const next = { role, content };
+    const details = normalizeReasoningDetails(entry.reasoning_details);
+    if (role === "assistant" && includeReasoning && details) next.reasoning_details = details;
+    output.push(next);
+  }
+  return output;
+}
+
+function updateNamedAgentCompactionTelemetry(runtime, completion, systemPrompt, compactedEntries) {
+  const requestedModel = String(runtime.model || "").trim();
+  const responseModel = String(completion?.model || requestedModel).trim() || requestedModel;
+  const usage = extractCacheTokenUsage(completion);
+  const fingerprint = createHash("sha256").update(String(systemPrompt || ""), "utf8").digest("hex").slice(0, 12);
+  const previous = runtime.cache_telemetry_by_model?.[responseModel];
+  const cachePercent = Number.isFinite(usage.promptTokens) && usage.promptTokens > 0 && Number.isFinite(usage.cachedTokens)
+    ? Math.max(0, Math.min(100, Math.round((usage.cachedTokens / usage.promptTokens) * 100)))
+    : null;
+  runtime.cache_telemetry_by_model[responseModel] = {
+    fingerprint,
+    promptTokens: usage.promptTokens,
+    cachedTokens: usage.cachedTokens,
+    cachePercent,
+    prefixChanged: Boolean(previous?.fingerprint && previous.fingerprint !== fingerprint),
+    updatedAt: Date.now(),
+  };
+  if (requestedModel && requestedModel !== responseModel) {
+    runtime.cache_telemetry_by_model[requestedModel] = { ...runtime.cache_telemetry_by_model[responseModel] };
+  }
+  const contextLength = Number(runtime.settings?.context_window) || 128000;
+  const usedTokens = estimateMessagesInChatTokens(compactedEntries);
+  const percentLeft = Math.max(0, Math.min(100, ((contextLength - usedTokens) / contextLength) * 100));
+  if (requestedModel) runtime.context_left_by_model[requestedModel] = percentLeft;
+  if (responseModel && responseModel !== requestedModel) runtime.context_left_by_model[responseModel] = percentLeft;
+}
+
 async function runCompaction(customInstruction = "") {
   // Codex local path: ask the model to summarize the conversation into a
   // single user-role "_summary" message, then keep only the most recent user
@@ -5781,37 +6856,7 @@ async function runCompaction(customInstruction = "") {
   }
 
   const contextLength = getModelContextLength(resolvedModel);
-  const maxSummaryChars = Math.max(2000, Math.floor(contextLength * 0.02));
-  const instruction =
-    typeof customInstruction === "string" && customInstruction.trim().length > 0
-      ? customInstruction.trim()
-      : COMPACTION_DEFAULT_CUSTOM_INSTRUCTION;
-
-  const summaryPrompt = [
-    `You are compacting a long coding session into a handoff summary for another AI engineer.`,
-    ``,
-    `INSTRUCTIONS:`,
-    instruction,
-    ``,
-    `RULES:`,
-    `- Write the summary in plain text (no markdown fences, no code blocks).`,
-    `- Keep it under ${maxSummaryChars} characters.`,
-    `- Do not mention this prompt.`,
-    ``,
-    `CONVERSATION TO COMPACT:`,
-    ...requestMessages
-      .filter((message) => message.role !== "system")
-      .map((message) => {
-        const roleLabel = message.role === "tool" || message.role === "tool_result" ? "tool" : message.role;
-        const content = typeof message?.content === "string" ? message.content : "";
-        if (Array.isArray(content)) {
-          return `${roleLabel}: ${content.map((part) => (typeof part === "object" && typeof part?.text === "string" ? part.text : "")).join(" ")}`;
-        }
-        return `${roleLabel}: ${content}`;
-      })
-      .join(String.fromCharCode(10, 10))
-      .slice(-Math.max(2000, Math.floor(contextLength * 0.6))),
-  ].join(String.fromCharCode(10));
+  const summaryPrompt = buildCompactionSummaryPrompt(requestMessages, contextLength, customInstruction);
 
   let summaryText = "";
   try {
@@ -5849,38 +6894,14 @@ async function runCompaction(customInstruction = "") {
   // recent tail of the conversation that fits the recent-token budget.
   // Everything older (assistant replies, tool results, read file contents)
   // is dropped, matching Codex's local-path compaction tradeoff.
-  const keptTail = [];
-  const recentBudget = COMPACTION_RECENT_USER_TOKENS;
-  let recentTokens = 0;
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const entry = messages[i];
-    if (!entry || entry.ephemeral === true) {
-      continue;
-    }
-    if (isCompactionSummaryEntry(entry)) {
-      continue;
-    }
-    const tokens = estimateMessageTokens(entry);
-    if (recentTokens + tokens > recentBudget) {
-      break;
-    }
-    recentTokens += tokens;
-    keptTail.unshift(entry);
-  }
-
-  const systemEntries = [];
-  for (const entry of messages) {
-    if (entry && entry.ephemeral !== true && entry.role === "system") {
-      systemEntries.push(entry);
-    }
-  }
-
+  if (!currentSessionTitle) currentSessionTitle = getFirstSessionTitle(messages);
+  const compacted = compactConversationEntries(messages, summaryText);
   messages.length = 0;
-  messages.push(
-    ...systemEntries,
-    { role: "user", content: COMPACTION_SUMMARY_PREFIX + "\n" + summaryText },
-    ...keptTail.filter((entry) => !isCompactionSummaryEntry(entry))
-  );
+  messages.push(...compacted.entries);
+
+  const contextLengthAfter = getModelContextLength(resolvedModel) || 128000;
+  const compactedTokens = estimateMessagesInChatTokens(messages);
+  setContextLeftPercent(resolvedModel, ((contextLengthAfter - compactedTokens) / contextLengthAfter) * 100);
 
   printedMessageCount = Math.min(printedMessageCount, messages.length);
   forceTranscriptReplay = true;
@@ -5921,7 +6942,126 @@ async function runCompaction(customInstruction = "") {
     // non-fatal
   }
   pendingHookContext = "";
-  return { ok: true, summary: summaryText, keptRecentUserMessages: keptTail.length };
+  return { ok: true, summary: summaryText, keptRecentUserMessages: compacted.keptTailCount };
+}
+
+async function runNamedAgentCompaction(customInstruction = "") {
+  const agent = getNamedAgentByName(activeAgentName);
+  if (!agent) return { ok: false, error: "Active agent session was not found." };
+  if (getNamedAgentStatus(agent) === "running") {
+    return { ok: false, error: "Stop the agent before compacting its session." };
+  }
+  const client = getOpenRouterClient();
+  if (!client) return { ok: false, error: "LLM provider is not configured." };
+
+  const latest = await readJsonObject(agent.recordPath, agent);
+  const runtime = normalizeNamedAgentSessionRuntime(latest);
+  if (!runtime.model) return { ok: false, error: "Model is not configured. Use /model." };
+  applyNamedAgentSessionRuntime(latest, runtime);
+  const requestMessages = buildNamedAgentCompactionMessages(latest, runtime);
+  if (!requestMessages.some((message) => message.role !== "system")) {
+    return { ok: false, error: "Nothing to compact." };
+  }
+
+  const contextLength = Number(runtime.settings.context_window) || 128000;
+  const summaryPrompt = buildCompactionSummaryPrompt(
+    requestMessages,
+    contextLength,
+    customInstruction
+  );
+  const payload = {
+    model: runtime.model,
+    messages: [
+      ...requestMessages.filter((message) => message.role === "system"),
+      { role: "user", content: summaryPrompt },
+    ],
+  };
+  if (getNamedAgentReasoningEnabled(runtime, runtime.model)) {
+    payload.reasoning_effort = runtime.settings.thinking_effort;
+    payload.reasoning = { enabled: true };
+    payload.thinking = { type: "enabled" };
+  } else {
+    payload.reasoning = { enabled: false };
+    payload.thinking = { type: "disabled" };
+  }
+
+  let completion;
+  let summaryText = "";
+  try {
+    completion = await client.chat.completions.create(payload);
+    summaryText = String(completion?.choices?.[0]?.message?.content || "").trim();
+  } catch (error) {
+    return { ok: false, error: `Compaction failed: ${getOpenRouterErrorMessage(error)}` };
+  }
+  if (!summaryText) return { ok: false, error: "Compaction failed: model returned an empty summary." };
+
+  const trigger = customInstruction.trim() ? "manual" : "auto";
+  let hookContext = "";
+  try {
+    const compactHook = await runHooks({
+      eventName: "PreCompact",
+      matcherValue: trigger,
+      input: {
+        trigger,
+        summary_length: summaryText.length,
+        agent: latest.name,
+        session_uid: latest.session_uid,
+      },
+      timeoutMs: 30000,
+    });
+    hookContext = compactHook.additionalContext || "";
+  } catch {
+    // non-fatal
+  }
+
+  if (!normalizeSessionTitle(latest.session_title)) {
+    latest.session_title = getFirstSessionTitle(latest.messages);
+  }
+  const compacted = compactConversationEntries(latest.messages, summaryText);
+  latest.messages = compacted.entries;
+  const notices = [];
+  try {
+    const postCompactRun = await runHooks({
+      eventName: "PostCompact",
+      matcherValue: trigger,
+      input: {
+        trigger,
+        summary_length: summaryText.length,
+        agent: latest.name,
+        session_uid: latest.session_uid,
+      },
+      timeoutMs: 30000,
+    });
+    const contextToInject = postCompactRun.additionalContext || hookContext;
+    if (contextToInject.trim()) {
+      latest.messages.push({
+        role: "user",
+        content: `[orchestrator]\n${contextToInject.trim()}`,
+      });
+    }
+    notices.push(...postCompactRun.notices);
+  } catch {
+    if (hookContext.trim()) {
+      latest.messages.push({ role: "user", content: `[orchestrator]\n${hookContext.trim()}` });
+    }
+  }
+
+  updateNamedAgentCompactionTelemetry(
+    runtime,
+    completion,
+    latest.messages.find((message) => message?.role === "system")?.content || "",
+    latest.messages
+  );
+  applyNamedAgentSessionRuntime(latest, runtime);
+  latest.updated_at = Date.now() / 1000;
+  await writeJsonAtomic(agent.recordPath, latest);
+  await refreshNamedAgents();
+  return {
+    ok: true,
+    summary: summaryText,
+    keptRecentUserMessages: compacted.keptTailCount,
+    notices,
+  };
 }
 
 async function maybeCompactBeforeTurn() {
@@ -6480,15 +7620,11 @@ function extractAllPythonCodeBlockEntries(text) {
     let closingIndex = -1;
     if (fence.length === 3) {
       // Legacy triple fences are ambiguous when their Python payload contains
-      // Markdown fences. Because tool-use responses must contain one block and
-      // no surrounding prose, the final non-empty matching fence is the outer
-      // closer; any shorter-lived candidates belong to the payload.
-      let lastNonEmptyIndex = lines.length - 1;
-      while (lastNonEmptyIndex > openingIndex && !lines[lastNonEmptyIndex].trim()) {
-        lastNonEmptyIndex -= 1;
-      }
-      if (isMatchingFenceClosing(lines[lastNonEmptyIndex], fence)) {
-        closingIndex = lastNonEmptyIndex;
+      // Markdown fences. Use the final matching fence as the outer closer;
+      // this also recovers a valid execute block when the model incorrectly
+      // appends prose after it.
+      for (let i = openingIndex + 1; i < lines.length; i += 1) {
+        if (isMatchingFenceClosing(lines[i], fence)) closingIndex = i;
       }
     } else {
       // Variable-length fences: prefer the first run at least as long as the
@@ -6519,7 +7655,11 @@ function extractAllPythonCodeBlockEntries(text) {
     const bodyEnd = closingIndex >= 0 ? closingIndex : lines.length;
     const body = lines.slice(openingIndex + 1, bodyEnd).join("\n").trim();
     if (body) {
-      blocks.push({ code: body, complete: closingIndex >= 0 });
+      blocks.push({
+        code: body,
+        complete: closingIndex >= 0,
+        rawBlock: lines.slice(openingIndex, closingIndex >= 0 ? closingIndex + 1 : lines.length).join("\n"),
+      });
     }
 
     if (closingIndex < 0) {
@@ -6528,6 +7668,14 @@ function extractAllPythonCodeBlockEntries(text) {
     openingIndex = closingIndex;
   }
   return blocks;
+}
+
+function normalizeAssistantToolUseResponse(text) {
+  const source = String(text || "");
+  if (!containsExecuteFence(source)) return source;
+  const blocks = extractAllPythonCodeBlockEntries(source);
+  if (blocks.length === 0) return source;
+  return blocks.map((entry) => entry.rawBlock).join("\n\n");
 }
 
 function classifyToolDiscoveryCode(code) {
@@ -7463,12 +8611,19 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
       };
       applyThinkingRequestSettings(payload, resolvedModel, includeReasoning);
 
-      const requestPromise = client.chat.completions.create(payload);
+      const requestController = new AbortController();
+      activeLlmAbortController = requestController;
+      const requestPromise = client.chat.completions.create(payload, {
+        signal: requestController.signal,
+      });
       let timeoutId = null;
       const llmTimeoutMs = getLlmRequestTimeoutMs();
       const timeoutPromise = new Promise((_, reject) => {
         timeoutId = setTimeout(
-          () => reject(new Error(`Request timed out after ${Math.round(llmTimeoutMs / 1000)}s`)),
+          () => {
+            requestController.abort();
+            reject(new Error(`Request timed out after ${Math.round(llmTimeoutMs / 1000)}s`));
+          },
           llmTimeoutMs
         );
       });
@@ -7478,6 +8633,9 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
         if (timeoutId) {
           clearTimeout(timeoutId);
         }
+        if (activeLlmAbortController === requestController) {
+          activeLlmAbortController = null;
+        }
       }
     };
 
@@ -7485,6 +8643,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
     try {
       return await performRequest(messagesForRequest, reasoningEnabled);
     } catch (error) {
+      if (stopRequested) throw error;
       if (disableReasoning || !reasoningEnabled || !shouldRetryWithoutReasoning(error)) {
         throw error;
       }
@@ -7546,6 +8705,10 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
     if (generation !== chatGeneration) {
       return;
     }
+    if (stopRequested) {
+      emitStopNotice();
+      return;
+    }
     updateContextBudgetFromCompletion(completion, resolvedModel);
 
     const reasoningEnabledNow = getReasoningEnabledForModel(resolvedModel);
@@ -7580,11 +8743,15 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
       }
     }
 
-    const assistantContent = assistantPayload.text;
+    const assistantContent = normalizeAssistantToolUseResponse(assistantPayload.text);
     const assistantReasoningDetails = reasoningEnabledNow ? assistantPayload.reasoningDetails : null;
     const emptyContentMessage = getReasoningEnabledForModel(resolvedModel)
       ? "Provider returned no assistant content. Try disabling thinking in /settings for this model."
       : "Provider returned no assistant content.";
+    if (stopRequested) {
+      emitStopNotice();
+      return;
+    }
     finalizePendingAssistantMessage(
       pendingIndex,
       assistantContent.trim().length > 0
@@ -7875,6 +9042,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
           // Keep the original empty result; the notice below will explain.
         }
       }
+      followUpContent = normalizeAssistantToolUseResponse(followUpContent);
       if (followUpContent.trim().length === 0) {
         appendAssistantMessage(
           getReasoningEnabledForModel(resolvedModel)
@@ -7889,6 +9057,10 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
       latestAssistantContent = followUpContent;
     }
   } catch (error) {
+    if (stopRequested) {
+      emitStopNotice();
+      return;
+    }
     const message = getOpenRouterErrorMessage(error);
     finalizePendingAssistantMessage(
       pendingResolved ? -1 : pendingIndex,
@@ -7900,13 +9072,17 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
 }
 
 function queueAssistantReply(modelId, options = {}) {
-  const wasThinking = pendingAssistantRequests > 0;
+  const deferredUntil = options?.deferredUntil && typeof options.deferredUntil.then === "function"
+    ? options.deferredUntil
+    : null;
+  const wasThinking = pendingAssistantRequests > 0 || Boolean(deferredUntil);
   const deferredUserMessage = options?.deferredUserMessage || null;
+  const sourceLoopId = String(options?.sourceLoopId || "");
   const queuedPromptEntry = wasThinking && options?.queuedPrompt
     ? addQueuedBusyPrompt(options.queuedPrompt)
     : null;
   if (!wasThinking) {
-    stopRequested = false;
+    resetStopRequested();
   }
   pendingAssistantRequests += 1;
   if (!wasThinking) {
@@ -7918,7 +9094,10 @@ function queueAssistantReply(modelId, options = {}) {
   let turnStartMessageIndex = pendingIndex >= 0 ? pendingIndex : messages.length;
   let turnStartedAt = 0;
   assistantRequestChain = assistantRequestChain
-    .then(() => {
+    .then(async () => {
+      if (deferredUntil) {
+        await deferredUntil.catch(() => {});
+      }
       turnStartedAt = Date.now();
       if (queuedPromptEntry) {
         removeQueuedBusyPrompt(queuedPromptEntry);
@@ -7948,11 +9127,17 @@ function queueAssistantReply(modelId, options = {}) {
       );
     })
     .finally(() => {
+      if (sourceLoopId && activeMainLoopTaskId === sourceLoopId) {
+        activeMainLoopTaskId = "";
+      }
       attachWorkedSummaryForTurn(
         turnStartMessageIndex,
         Math.max(0, Date.now() - (turnStartedAt || Date.now()))
       );
       const { hadPending, becameIdle } = completeAssistantRequestLifecycle();
+      if (sourceLoopId && becameIdle && stopRequested) {
+        resetStopRequested();
+      }
       updateThinkingAnimationState();
       if (becameIdle) {
         markDirty();
@@ -8857,7 +10042,7 @@ async function runSolveSessionLifecycle(session, options = {}) {
     solveActive = true;
     runningSolveSessionId = session.id;
     solveAbortRequested = false;
-    stopRequested = false;
+    resetStopRequested();
     solveIteration = 0;
     solveLastStatus = "Thinking...";
     openSolveBuffer(session.id);
@@ -9488,18 +10673,20 @@ function formatWorkspacePathForFooter(workspacePath) {
 }
 
 function getMainFooterText() {
-  const modelLabel = selectedModel && selectedModel.trim().length > 0 ? selectedModel.trim() : "no model";
-  const contextLeft = Math.round(getContextLeftPercent(selectedModel));
+  const activeModel = getActiveSessionModel();
+  const modelLabel = activeModel && activeModel.trim().length > 0 ? activeModel.trim() : "no model";
+  const contextLeft = Math.round(getActiveContextLeftPercent(activeModel));
   const safeContextLeft = Math.max(0, Math.min(100, contextLeft));
-  const thinkingState = getReasoningEnabledForModel(selectedModel) ? "thinking on" : "thinking off";
-  const modeState = collaborationMode === "plan" ? "PLAN" : "BUILD";
-  let text = `${modeState} | Current model: ${modelLabel} | ${safeContextLeft}% context left | ${thinkingState}`;
-  const cacheTelemetry = getCacheTelemetry(selectedModel);
+  const thinkingState = getActiveReasoningEnabled() ? "thinking on" : "thinking off";
+  const modeState = getActiveCollaborationMode() === "plan" ? "PLAN" : "BUILD";
+  let text = `${modeState} | Agent: ${activeAgentName} | Current model: ${modelLabel} | ${safeContextLeft}% context left | ${thinkingState}`;
+  const cacheTelemetry = getActiveCacheTelemetry(activeModel);
   if (Number.isFinite(cacheTelemetry?.cachePercent)) {
     text += ` | cache ${cacheTelemetry.cachePercent}%`;
   }
-  if (loopTasks.length > 0) {
-    text += ` | ${loopTasks.length} loop${loopTasks.length === 1 ? "" : "s"} active`;
+  const activeLoopCount = getLoopTaskCountForAgent();
+  if (activeLoopCount > 0) {
+    text += ` | ${activeLoopCount} loop${activeLoopCount === 1 ? "" : "s"} active`;
   }
   text += ` | ${formatWorkspacePathForFooter(WORKSPACE_ROOT)}`;
   const mouseManuallyOff = APP_MOUSE_TRACKING_ENABLED && !mouseTrackingEnabled && !mouseSelectionMode;
@@ -9588,35 +10775,9 @@ async function loadSessionFiles() {
   }
 
   try {
-    await ensureSessionFileReady();
-    const names = await fs.readdir(SESSIONS_DIR);
-    const files = [];
-
-    for (const name of names) {
-      const fullPath = path.join(SESSIONS_DIR, name);
-      const stat = await fs.stat(fullPath);
-      if (!stat.isFile()) {
-        continue;
-      }
-
-      const sessionMetadata = await readSessionListMetadataFromFile(fullPath);
-      const sessionWorkspace = sessionMetadata.sessionWorkspace;
-      if (sessionWorkspace && !isCurrentWorkspace(sessionWorkspace)) {
-        continue;
-      }
-
-      files.push({
-        name,
-        fullPath,
-        mtimeMs: stat.mtimeMs,
-        updatedAt: stat.mtime,
-        sessionWorkspace,
-        firstUserMessage: sessionMetadata.firstUserMessage || "Untitled session",
-      });
-    }
-
-    files.sort((a, b) => b.mtimeMs - a.mtimeMs);
-    sessionFiles = files;
+    sessionFiles = sessionsOwnerAgent === "main"
+      ? await scanWorkspaceSessionFiles()
+      : await scanNamedAgentSessionFiles(sessionsOwnerAgent);
     updateSessionsSelectionState();
   } catch (_error) {
     sessionsLoadError = "Could not load sessions";
@@ -9625,6 +10786,593 @@ async function loadSessionFiles() {
     markDirty();
     renderFrame(true);
   }
+}
+
+async function scanNamedAgentSessionFiles(agentName) {
+  const normalizedName = normalizeNamedAgentName(agentName);
+  if (!normalizedName) return [];
+  const recordPath = getNamedAgentRecordPath(normalizedName);
+  const record = await readJsonObject(recordPath);
+  if (!record || record.kind !== "named-agent" || !isCurrentWorkspace(record.workspace)) return [];
+  const files = [namedAgentRecordToSessionEntry(record, recordPath, true)];
+  const historyDir = getNamedAgentHistoryDir(normalizedName);
+  for (const fileName of await fs.readdir(historyDir).catch(() => [])) {
+    if (!fileName.endsWith(".json")) continue;
+    const fullPath = path.join(historyDir, fileName);
+    const archived = await readJsonObject(fullPath);
+    if (
+      !archived ||
+      archived.kind !== "named-agent-session" ||
+      String(archived.name || "").toLowerCase() !== normalizedName.toLowerCase() ||
+      !isCurrentWorkspace(archived.workspace)
+    ) continue;
+    files.push(namedAgentRecordToSessionEntry(archived, fullPath, false));
+  }
+  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return files;
+}
+
+function namedAgentRecordToSessionEntry(record, recordPath, current) {
+  const firstUserMessage = normalizeSessionTitle(record?.session_title) ||
+    getFirstSessionTitle(record?.messages);
+  const updatedAtMs = Math.max(
+    0,
+    Number(record?.updated_at || record?.created_at || 0) * 1000
+  );
+  return {
+    kind: "named-agent",
+    name: path.basename(recordPath),
+    fullPath: recordPath,
+    agentName: record?.name || "agent",
+    currentNamedSession: current === true,
+    mtimeMs: updatedAtMs,
+    updatedAt: new Date(updatedAtMs || Date.now()),
+    sessionWorkspace: record?.workspace,
+    firstUserMessage: String(firstUserMessage || `Agent ${record?.name || "agent"}`).replace(/\s+/g, " ").trim(),
+  };
+}
+
+function normalizeNamedAgentName(value) {
+  const name = String(value || "").trim();
+  if (!name || name.length > 48 || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) return "";
+  return name;
+}
+
+function getNamedAgentRecordPath(name) {
+  const key = String(name || "").toLowerCase();
+  const digest = createHash("sha256").update(key).digest("hex").slice(0, 12);
+  const prefix = key.replace(/[^a-z0-9._-]+/g, "-").slice(0, 24) || "agent";
+  return path.join(AGENT_SESSIONS_DIR, `${prefix}-${digest}.json`);
+}
+
+function getNamedAgentHistoryDir(name) {
+  const key = String(name || "").toLowerCase();
+  const digest = createHash("sha256").update(key).digest("hex").slice(0, 12);
+  return path.join(AGENT_SESSIONS_DIR, "history", digest);
+}
+
+function getNamedAgentHistoryPath(name, sessionUid) {
+  return path.join(getNamedAgentHistoryDir(name), `session-${sessionUid}.json`);
+}
+
+function getNamedAgentQueuePath(recordPath) {
+  return `${recordPath}.queue.json`;
+}
+
+const TRANSIENT_ATOMIC_RENAME_CODES = new Set(["EPERM", "EACCES", "EBUSY", "EEXIST", "ENOTEMPTY"]);
+
+async function renameAtomicFileWithRetry(sourcePath, destinationPath, options = {}) {
+  const rename = typeof options.rename === "function" ? options.rename : fs.rename.bind(fs);
+  const wait = typeof options.wait === "function"
+    ? options.wait
+    : (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs));
+  const maxAttempts = Math.max(1, Number(options.maxAttempts) || 10);
+  let lastError = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      await rename(sourcePath, destinationPath);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!TRANSIENT_ATOMIC_RENAME_CODES.has(String(error?.code || "")) || attempt + 1 >= maxAttempts) {
+        throw error;
+      }
+      const delayMs = Math.min(400, 20 * (2 ** attempt));
+      await wait(delayMs);
+    }
+  }
+  throw lastError;
+}
+
+async function writeJsonAtomic(filePath, value) {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const temporary = path.join(
+    path.dirname(filePath),
+    `.${path.basename(filePath)}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`
+  );
+  try {
+    await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await renameAtomicFileWithRetry(temporary, filePath);
+  } finally {
+    await fs.rm(temporary, { force: true }).catch(() => {});
+  }
+}
+
+async function readJsonObject(filePath, fallback = null) {
+  try {
+    const parsed = JSON.parse(await fs.readFile(filePath, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function getNamedAgentStatus(agent) {
+  const raw = String(agent?.status || "idle").toLowerCase();
+  if (raw === "admitted" || raw === "running") return "running";
+  if (raw === "error" || raw === "stopped") return "stopped";
+  return "idle";
+}
+
+function getNamedAgentByName(name = activeAgentName) {
+  const key = String(name || "").toLowerCase();
+  return namedAgents.find((agent) => String(agent?.name || "").toLowerCase() === key) || null;
+}
+
+function namedAgentMessagesForDisplay(agent) {
+  const output = [];
+  for (const entry of Array.isArray(agent?.messages) ? agent.messages : []) {
+    if (!entry || entry.role === "system" || entry.hidden === true || isCompactionSummaryEntry(entry)) continue;
+    const content = String(entry.content || "");
+    const toolResultMatch = entry.role === "user"
+      ? content.match(/^\[tool ([A-Za-z0-9._-]+) result\]\s*/)
+      : null;
+    if (toolResultMatch) {
+      const toolName = toolResultMatch[1];
+      output.push({
+        role: "tool",
+        name: toolName,
+        ...(toolName === "set_reminder" ? { toolInput: "scheduled reminder" } : {}),
+        toolOk: true,
+        content: content.slice(toolResultMatch[0].length),
+      });
+      continue;
+    }
+    if (entry.role === "user" && content.startsWith("[orchestrator]")) continue;
+    if (entry.role === "assistant" || entry.role === "user") {
+      const reasoningDetails = normalizeReasoningDetails(entry.reasoning_details);
+      output.push({
+        role: entry.role,
+        content,
+        ...(reasoningDetails ? { reasoningDetails } : {}),
+      });
+    }
+  }
+  for (const queued of Array.isArray(agent?.queuedTasks) ? agent.queuedTasks : []) {
+    output.push({ role: "user", content: String(queued), queued: true });
+  }
+  return output;
+}
+
+function mergeNamedAgentUiNotices(displayMessages, notices) {
+  const stableMessages = Array.from(displayMessages || []).filter((entry) => entry?.queued !== true);
+  const queuedMessages = Array.from(displayMessages || []).filter((entry) => entry?.queued === true);
+  const buckets = Array.from({ length: stableMessages.length + 1 }, () => []);
+  for (const notice of Array.from(notices || [])) {
+    const requestedIndex = Number(notice?.afterMessageCount);
+    const index = Number.isFinite(requestedIndex)
+      ? Math.max(0, Math.min(stableMessages.length, Math.floor(requestedIndex)))
+      : stableMessages.length;
+    buckets[index].push(notice);
+  }
+  const output = [];
+  for (let index = 0; index <= stableMessages.length; index += 1) {
+    if (index > 0) output.push(stableMessages[index - 1]);
+    output.push(...buckets[index]);
+  }
+  output.push(...queuedMessages);
+  return output;
+}
+
+function getActiveChatEntries() {
+  if (activeAgentName === "main") return messages;
+  const notices = namedAgentUiNotices.get(activeAgentName.toLowerCase()) || [];
+  return notices.length
+    ? mergeNamedAgentUiNotices(activeNamedAgentMessages, notices)
+    : activeNamedAgentMessages;
+}
+
+function isActiveNamedAgentRunning() {
+  return activeAgentName !== "main" && getNamedAgentStatus(getNamedAgentByName()) === "running";
+}
+
+function isCurrentChatThinking() {
+  return activeAgentName === "main" ? isAssistantThinking() : isActiveNamedAgentRunning();
+}
+
+function isAnyAgentWorking() {
+  return isAssistantThinking() || namedAgents.some((agent) => getNamedAgentStatus(agent) === "running");
+}
+
+async function readNamedAgentQueue(recordPath) {
+  const queue = await readJsonObject(getNamedAgentQueuePath(recordPath), { tasks: [] });
+  return Array.isArray(queue?.tasks) ? queue.tasks.map((task) => String(task)).filter(Boolean) : [];
+}
+
+async function writeNamedAgentQueue(recordPath, tasks) {
+  await writeJsonAtomic(getNamedAgentQueuePath(recordPath), { tasks: Array.from(tasks || []) });
+}
+
+function buildNamedAgentSystemPrompt(record, runtime = normalizeNamedAgentSessionRuntime(record)) {
+  const modelId = runtime.model;
+  const externalThinkingActive = runtime.settings.external_thinking === true &&
+    !getNamedAgentReasoningEnabled(runtime, modelId);
+  return buildSystemPromptFromDescriptions(toolDescriptions, {
+    collaborationMode: runtime.collaboration_mode,
+    externalThinkingActive,
+    workspaceGuideText,
+    workspaceGuideFileName,
+  });
+}
+
+function applyNamedAgentSessionRuntime(record, runtimeInput) {
+  const runtime = normalizeNamedAgentSessionRuntime({
+    ...record,
+    session_runtime: runtimeInput,
+  });
+  const modelId = runtime.model;
+  const systemPrompt = buildNamedAgentSystemPrompt(record, runtime);
+  const sessionUid = String(record?.session_uid || "current");
+  record.session_runtime = runtime;
+  record.model = modelId;
+  record.collaboration_mode = runtime.collaboration_mode;
+  record.timeout = Math.max(1, Math.round(runtime.settings.request_timeout_ms / 1000));
+  record.reasoning_enabled = getNamedAgentReasoningEnabled(runtime, modelId);
+  record.reasoning_effort = runtime.settings.thinking_effort;
+  record.messages = Array.isArray(record.messages) ? record.messages : [];
+  if (record.messages[0]?.role === "system") {
+    record.messages[0] = { ...record.messages[0], role: "system", content: systemPrompt };
+  } else {
+    record.messages.unshift({ role: "system", content: systemPrompt });
+  }
+  record.runtime = {
+    ...(record.runtime && typeof record.runtime === "object" ? record.runtime : {}),
+    system_prompt: systemPrompt,
+    model: modelId,
+    reasoning_enabled: record.reasoning_enabled,
+    reasoning_effort: record.reasoning_effort,
+    collaboration_mode: runtime.collaboration_mode,
+    session_id: `named-${String(record.name || "agent").toLowerCase()}-${sessionUid}`,
+  };
+  return record;
+}
+
+async function updateActiveNamedAgentSessionRuntime(update) {
+  const agent = getNamedAgentByName(activeAgentName);
+  if (!agent) throw new Error("active agent was not found");
+  if (getNamedAgentStatus(agent) === "running") {
+    throw new Error("stop the agent before changing its runtime settings");
+  }
+  const latest = await readJsonObject(agent.recordPath, agent);
+  const runtime = normalizeNamedAgentSessionRuntime(latest);
+  await update(runtime, latest);
+  applyNamedAgentSessionRuntime(latest, runtime);
+  await writeJsonAtomic(agent.recordPath, latest);
+  await refreshNamedAgents();
+  return normalizeNamedAgentSessionRuntime(latest);
+}
+
+function createNamedAgentRecord(name) {
+  const now = Date.now() / 1000;
+  const sessionUid = createSessionUid();
+  const sourceRuntime = getActiveNamedAgentRuntime();
+  const initialModel = sourceRuntime?.model || selectedModel;
+  const initialReasoning = sourceRuntime
+    ? { ...sourceRuntime.reasoning_by_model }
+    : getSessionReasoningConfig();
+  const initialSettings = sourceRuntime
+    ? { ...sourceRuntime.settings }
+    : { ...getMainSessionRuntimeSettings() };
+  const initialMode = sourceRuntime?.collaboration_mode || collaborationMode;
+  const record = {
+    kind: "named-agent",
+    id: `agent-${createHash("sha256").update(`${WORKSPACE_ROOT}:${name.toLowerCase()}`).digest("hex").slice(0, 16)}`,
+    name,
+    session_uid: sessionUid,
+    session_title: "",
+    workspace: WORKSPACE_ROOT,
+    model: initialModel,
+    timeout: Math.max(1, Math.round(initialSettings.request_timeout_ms / 1000)),
+    max_tokens: 0,
+    reasoning_enabled: sourceRuntime
+      ? getNamedAgentReasoningEnabled(sourceRuntime, initialModel)
+      : getReasoningEnabledForModel(initialModel),
+    reasoning_effort: initialSettings.thinking_effort,
+    messages: [{ role: "system", content: systemPromptText }],
+    status: "idle",
+    result: null,
+    error: null,
+    created_at: now,
+    updated_at: now,
+    turn: 0,
+    runtime: {
+      system_prompt: systemPromptText,
+      model: initialModel,
+      reasoning_enabled: sourceRuntime
+        ? getNamedAgentReasoningEnabled(sourceRuntime, initialModel)
+        : getReasoningEnabledForModel(initialModel),
+      reasoning_effort: initialSettings.thinking_effort,
+      session_id: `named-${name.toLowerCase()}-${sessionUid}`,
+    },
+  };
+  record.session_runtime = {
+    model: initialModel,
+    collaboration_mode: initialMode,
+    reasoning_by_model: initialReasoning,
+    settings: initialSettings,
+    context_left_by_model: {},
+    cache_telemetry_by_model: {},
+  };
+  return applyNamedAgentSessionRuntime(record, record.session_runtime);
+}
+
+function namedAgentRecordHasConversation(record) {
+  return (Array.isArray(record?.messages) ? record.messages : []).some((message) => {
+    if (!message || message.role === "system") return false;
+    const content = String(message.content || "").trim();
+    return content && !content.startsWith("[orchestrator]");
+  });
+}
+
+async function archiveNamedAgentRecord(record) {
+  if (!record?.name) return null;
+  const { session_loops: sessionLoops, session_notices: sessionNotices } =
+    captureNamedAgentSessionSchedules(record.name);
+  if (!namedAgentRecordHasConversation(record) && sessionLoops.length === 0 && sessionNotices.length === 0) {
+    return null;
+  }
+  const sessionUid = String(record.session_uid || createSessionUid());
+  const archivePath = getNamedAgentHistoryPath(record.name, sessionUid);
+  const archived = {
+    ...record,
+    kind: "named-agent-session",
+    session_uid: sessionUid,
+    status: "idle",
+    pid: null,
+    active_loop_id: "",
+    session_loops: sessionLoops,
+    session_notices: sessionNotices,
+  };
+  delete archived.recordPath;
+  delete archived.queuedTasks;
+  await writeJsonAtomic(archivePath, archived);
+  return archivePath;
+}
+
+async function startNewNamedAgentChat() {
+  const agent = getNamedAgentByName();
+  if (!agent) return false;
+  if (getNamedAgentStatus(agent) === "running") {
+    showAgentCommandNotice("Stop the agent before starting a new session.", true);
+    return false;
+  }
+  const current = await readJsonObject(agent.recordPath, agent);
+  await archiveNamedAgentRecord(current);
+  const reset = createNamedAgentRecord(agent.name);
+  reset.id = current.id || reset.id;
+  const carriedRuntime = normalizeNamedAgentSessionRuntime(current);
+  carriedRuntime.collaboration_mode = "build";
+  carriedRuntime.context_left_by_model = {};
+  carriedRuntime.cache_telemetry_by_model = {};
+  applyNamedAgentSessionRuntime(reset, carriedRuntime);
+  await writeJsonAtomic(agent.recordPath, reset);
+  await writeNamedAgentQueue(agent.recordPath, []);
+  removeLoopsForAgent(agent.name, { persist: false });
+  namedAgentUiNotices.delete(agent.name.toLowerCase());
+  await persistNamedAgentLoops();
+  await refreshNamedAgents();
+  switchToAgentSession(agent.name);
+  refreshMainBufferAfterCommand();
+  return true;
+}
+
+async function launchNamedAgentRecord(recordPath, record, task, options = {}) {
+  const next = { ...record };
+  const runtime = normalizeNamedAgentSessionRuntime(record);
+  next.messages = Array.isArray(next.messages) ? [...next.messages] : [];
+  applyNamedAgentSessionRuntime(next, runtime);
+  const toolName = String(options.toolName || "").trim();
+  const taskContent = toolName
+    ? `[tool ${toolName} result]\n${String(task)}`
+    : String(task);
+  const taskEntry = { role: "user", content: taskContent };
+  if (!normalizeSessionTitle(next.session_title) && isSessionTitleUserEntry(taskEntry)) {
+    next.session_title = normalizeSessionTitle(taskEntry.content);
+  }
+  next.messages.push(taskEntry);
+  next.prompt = String(task);
+  next.status = "admitted";
+  next.result = null;
+  next.error = null;
+  next.pid = null;
+  next.task_started_at = Date.now() / 1000;
+  next.active_loop_id = String(options.sourceLoopId || "");
+  await writeJsonAtomic(recordPath, next);
+  refreshNamedAgents().catch(() => {});
+  runPythonCommand([TOOLS_SCRIPT_PATH, "--launch-subagent", recordPath], { timeout: 10000 })
+    .catch(async (error) => {
+      const latest = await readJsonObject(recordPath, next);
+      if (["admitted", "running"].includes(String(latest?.status || ""))) {
+        latest.status = "stopped";
+        latest.error = `failed to launch agent: ${error?.message || String(error)}`;
+        await writeJsonAtomic(recordPath, latest).catch(() => {});
+      }
+      refreshNamedAgents().catch(() => {});
+    });
+}
+
+const namedAgentDispatching = new Set();
+
+async function dispatchNamedAgentTask(name, task, options = {}) {
+  const normalizedName = normalizeNamedAgentName(name);
+  if (!normalizedName) return { ok: false, error: "Agent name must use letters, numbers, dot, dash, or underscore (max 48 characters)" };
+  const recordPath = getNamedAgentRecordPath(normalizedName);
+  let record = await readJsonObject(recordPath);
+  if (!record) {
+    record = createNamedAgentRecord(normalizedName);
+    await writeJsonAtomic(recordPath, record);
+  }
+  const normalizedTask = String(task || "").trim();
+  if (!normalizedTask) {
+    await refreshNamedAgents();
+    return { ok: true, created: true, queued: false, name: record.name };
+  }
+  if (getNamedAgentStatus(record) === "running" || namedAgentDispatching.has(recordPath)) {
+    if (options.sourceLoopId) {
+      return { ok: false, busy: true, queued: false, name: record.name };
+    }
+    const tasks = await readNamedAgentQueue(recordPath);
+    tasks.push(normalizedTask);
+    await writeNamedAgentQueue(recordPath, tasks);
+    await refreshNamedAgents();
+    return { ok: true, created: false, queued: true, name: record.name };
+  }
+  namedAgentDispatching.add(recordPath);
+  try {
+    await launchNamedAgentRecord(recordPath, record, normalizedTask, options);
+  } finally {
+    namedAgentDispatching.delete(recordPath);
+  }
+  return { ok: true, created: false, queued: false, name: record.name };
+}
+
+async function launchNextQueuedNamedAgentTask(agent) {
+  if (!agent?.recordPath || namedAgentDispatching.has(agent.recordPath)) return;
+  if (getNamedAgentStatus(agent) !== "idle") return;
+  const tasks = await readNamedAgentQueue(agent.recordPath);
+  if (tasks.length === 0) return;
+  namedAgentDispatching.add(agent.recordPath);
+  try {
+    const [task, ...remaining] = tasks;
+    await writeNamedAgentQueue(agent.recordPath, remaining);
+    const latest = await readJsonObject(agent.recordPath, agent);
+    await launchNamedAgentRecord(agent.recordPath, latest, task);
+  } finally {
+    namedAgentDispatching.delete(agent.recordPath);
+  }
+}
+
+function getNamedAgentsRefreshFingerprint(agents) {
+  return JSON.stringify(Array.from(agents || []).map((agent) => {
+    const agentMessages = Array.isArray(agent?.messages) ? agent.messages : [];
+    const lastMessage = agentMessages[agentMessages.length - 1];
+    return [
+      agent?.name,
+      agent?.status,
+      agent?.updated_at,
+      agent?.turn,
+      agentMessages.length,
+      lastMessage?.role,
+      lastMessage?.content,
+      Array.from(agent?.queuedTasks || []),
+    ];
+  }));
+}
+
+async function refreshNamedAgents() {
+  await fs.mkdir(AGENT_SESSIONS_DIR, { recursive: true });
+  const names = await fs.readdir(AGENT_SESSIONS_DIR).catch(() => []);
+  const nextAgents = [];
+  for (const fileName of names) {
+    if (!fileName.endsWith(".json") || fileName.endsWith(".queue.json")) continue;
+    const recordPath = path.join(AGENT_SESSIONS_DIR, fileName);
+    const record = await readJsonObject(recordPath);
+    if (!record || record.kind !== "named-agent" || !isCurrentWorkspace(record.workspace)) continue;
+    record.recordPath = recordPath;
+    record.queuedTasks = await readNamedAgentQueue(recordPath);
+    nextAgents.push(record);
+  }
+  nextAgents.sort((a, b) => Number(a.created_at || 0) - Number(b.created_at || 0));
+  const previousFingerprint = getNamedAgentsRefreshFingerprint(namedAgents);
+  namedAgents = nextAgents;
+  const active = getNamedAgentByName();
+  activeNamedAgentMessages = active ? namedAgentMessagesForDisplay(active) : [];
+  const nextFingerprint = getNamedAgentsRefreshFingerprint(namedAgents);
+  if (previousFingerprint !== nextFingerprint) {
+    cachedChatLines = null;
+    forceChatRefreshFlag = true;
+    if (activeBuffer === "sessions" && sessionsOwnerAgent !== "main") {
+      loadSessionFiles().catch(() => {});
+    } else {
+      markDirty();
+      renderFrame(activeAgentName !== "main");
+    }
+  }
+  for (const agent of namedAgents) {
+    if (getNamedAgentStatus(agent) === "idle" && agent.queuedTasks?.length) {
+      launchNextQueuedNamedAgentTask(agent).catch(() => {});
+    }
+  }
+}
+
+function startNamedAgentRefreshLoop() {
+  if (agentsRefreshTimer) return;
+  const tick = async () => {
+    agentsRefreshTimer = null;
+    await refreshNamedAgents().catch(() => {});
+    const viewingNamedChat = activeBuffer === "main" && activeAgentName !== "main";
+    const fast = activeBuffer === "agents" || viewingNamedChat || namedAgents.some((agent) => getNamedAgentStatus(agent) === "running");
+    agentsRefreshTimer = setTimeout(tick, fast ? 250 : 1500);
+    agentsRefreshTimer.unref?.();
+  };
+  agentsRefreshTimer = setTimeout(tick, 0);
+  agentsRefreshTimer.unref?.();
+}
+
+async function stopNamedAgent(agent = getNamedAgentByName(), options = {}) {
+  if (!agent || getNamedAgentStatus(agent) !== "running") return false;
+  const pid = Number(agent.pid);
+  if (Number.isInteger(pid) && pid > 0) {
+    try { process.kill(pid); } catch {}
+  }
+  const latest = await readJsonObject(agent.recordPath, agent);
+  latest.status = "stopped";
+  latest.error = String(options.error || "Stopped by user");
+  latest.pid = null;
+  latest.active_loop_id = "";
+  latest.messages = Array.isArray(latest.messages) ? latest.messages : [];
+  latest.messages.push({ role: "assistant", content: String(options.message || "■ Stopped by user.") });
+  await writeJsonAtomic(agent.recordPath, latest);
+  await refreshNamedAgents();
+  return true;
+}
+
+async function scanWorkspaceSessionFiles() {
+  await ensureSessionFileReady();
+  const names = await fs.readdir(SESSIONS_DIR);
+  const files = [];
+
+  for (const name of names) {
+    const fullPath = path.join(SESSIONS_DIR, name);
+    const stat = await fs.stat(fullPath);
+    if (!stat.isFile()) continue;
+
+    const sessionMetadata = await readSessionListMetadataFromFile(fullPath);
+    const sessionWorkspace = sessionMetadata.sessionWorkspace;
+    if (sessionWorkspace && !isCurrentWorkspace(sessionWorkspace)) continue;
+
+    files.push({
+      name,
+      fullPath,
+      mtimeMs: stat.mtimeMs,
+      updatedAt: stat.mtime,
+      sessionWorkspace,
+      firstUserMessage: sessionMetadata.firstUserMessage || "Untitled session",
+    });
+  }
+
+  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return files;
 }
 
 async function readSessionListMetadataFromFile(filePath) {
@@ -9640,6 +11388,7 @@ async function readSessionListMetadataFromFile(filePath) {
 
 function parseSessionListMetadata(raw) {
   let sessionWorkspace = "";
+  let sessionTitle = "";
   let firstUserMessage = "";
   for (const line of String(raw ?? "").split(/\r?\n/)) {
     if (!line.trim()) continue;
@@ -9648,24 +11397,67 @@ function parseSessionListMetadata(raw) {
       if (!sessionWorkspace && typeof parsed?.sessionWorkspace === "string") {
         sessionWorkspace = normalizeWorkspacePath(parsed.sessionWorkspace);
       }
+      if (!sessionTitle && typeof parsed?.sessionTitle === "string") {
+        sessionTitle = normalizeSessionTitle(parsed.sessionTitle);
+      }
       if (
         !firstUserMessage &&
-        parsed?.role === "user" &&
-        typeof parsed?.content === "string" &&
-        parsed.content.trim() &&
-        !isCompactionSummaryEntry(parsed)
+        isSessionTitleUserEntry(parsed)
       ) {
-        firstUserMessage = parsed.content.replace(/\s+/g, " ").trim();
+        firstUserMessage = normalizeSessionTitle(parsed.content);
       }
-      if (sessionWorkspace && firstUserMessage) break;
+      if (sessionWorkspace && (sessionTitle || firstUserMessage)) break;
     } catch {
       // Ignore malformed history lines and keep scanning.
     }
   }
-  return { sessionWorkspace, firstUserMessage };
+  return { sessionWorkspace, firstUserMessage: sessionTitle || firstUserMessage };
 }
 
-function parseSessionHistory(raw) {
+function normalizeCompactionNoticeOrdering(entries) {
+  if (!Array.isArray(entries) || entries.length < 3) return entries;
+  const noticeText = (entry) => String(entry?.content || "")
+    .trim()
+    .replace(/^■\s*/, "");
+  const isStart = (entry) =>
+    entry?.role === "assistant" &&
+    entry?.excludeFromRequest === true &&
+    /^Compacting context(?: with instruction:|\.\.\.)/.test(noticeText(entry));
+  const isEnd = (entry) =>
+    entry?.role === "assistant" &&
+    entry?.excludeFromRequest === true &&
+    /^Compaction (?:complete\.|failed:)/.test(noticeText(entry));
+
+  for (let start = 0; start < entries.length - 2; start += 1) {
+    if (!isStart(entries[start])) continue;
+    let end = start + 1;
+    while (end < entries.length && !isEnd(entries[end]) && !isStart(entries[end])) {
+      end += 1;
+    }
+    if (end >= entries.length || !isEnd(entries[end])) continue;
+
+    const between = entries.slice(start + 1, end);
+    const deferredUsers = between.filter(
+      (entry) => entry?.role === "user" && !isCompactionSummaryEntry(entry)
+    );
+    if (deferredUsers.length === 0) {
+      start = end;
+      continue;
+    }
+    const retained = between.filter((entry) => !deferredUsers.includes(entry));
+    entries.splice(start + 1, between.length, ...retained);
+    const shiftedEnd = start + 1 + retained.length;
+    entries.splice(shiftedEnd + 1, 0, ...deferredUsers);
+    start = shiftedEnd + deferredUsers.length;
+  }
+  return entries;
+}
+
+function parseSessionHistory(raw, options = {}) {
+  const preservedNamedLoops = options.preserveNamedLoops === true
+    ? loopTasks.filter((task) => normalizeLoopOwnerAgent(task.ownerAgent) !== "main")
+    : [];
+  loopTasks = [...preservedNamedLoops];
   const lines = String(raw ?? "")
     .split(/\r?\n/)
     .filter((line) => line.trim().length > 0);
@@ -9673,8 +11465,12 @@ function parseSessionHistory(raw) {
   let pendingToolMessage = null;
   let sessionModel = "";
   let sessionWorkspace = "";
+  let sessionTitle = "";
   let sessionReasoningByModel = {};
   let sessionMode = "build";
+  let loadedSessionRuntimeSettings = null;
+  let sessionContextLeftByModel = {};
+  let sessionCacheTelemetryByModel = {};
 
   const isSetFeedbackEntry = (entry) => {
     if (!entry || entry.role !== "assistant" || entry.excludeFromRequest !== true) {
@@ -9700,11 +11496,23 @@ function parseSessionHistory(raw) {
       ) {
         sessionWorkspace = normalizeWorkspacePath(parsed.sessionWorkspace);
       }
+      if (typeof parsed?.sessionTitle === "string" && parsed.sessionTitle.trim()) {
+        sessionTitle = normalizeSessionTitle(parsed.sessionTitle);
+      }
       if (parsed?.sessionReasoningByModel && typeof parsed.sessionReasoningByModel === "object") {
         sessionReasoningByModel = normalizeReasoningConfigMap(parsed.sessionReasoningByModel);
       }
       if (parsed?.sessionMode === "plan" || parsed?.sessionMode === "build") {
         sessionMode = parsed.sessionMode;
+      }
+      if (parsed?.sessionRuntimeSettings && typeof parsed.sessionRuntimeSettings === "object") {
+        loadedSessionRuntimeSettings = normalizeSessionRuntimeSettings(parsed.sessionRuntimeSettings);
+      }
+      if (parsed?.sessionContextLeftByModel && typeof parsed.sessionContextLeftByModel === "object") {
+        sessionContextLeftByModel = normalizeContextLeftMap(parsed.sessionContextLeftByModel);
+      }
+      if (parsed?.sessionCacheTelemetryByModel && typeof parsed.sessionCacheTelemetryByModel === "object") {
+        sessionCacheTelemetryByModel = normalizeCacheTelemetryMap(parsed.sessionCacheTelemetryByModel);
       }
 
       const role = typeof parsed?.role === "string" ? parsed.role : "assistant";
@@ -9717,11 +11525,17 @@ function parseSessionHistory(raw) {
         // dropped on resume (no catch-up), matching Claude Code.
         const storedLoops = Array.isArray(parsed?.loops) ? parsed.loops : [];
         const now = Date.now();
-        loopTasks = storedLoops
+        const restoredLoops = storedLoops
           .map(normalizeLoopTask)
           .filter(Boolean)
           .filter((task) => !(task.oneshot && task.paused !== true && task.nextFireAt <= now))
           .slice(0, LOOP_MAX_TASKS);
+        loopTasks = options.preserveNamedLoops === true
+          ? [
+              ...preservedNamedLoops,
+              ...restoredLoops.filter((task) => normalizeLoopOwnerAgent(task.ownerAgent) === "main"),
+            ]
+          : restoredLoops;
         if (loopTasks.length > 0) {
           startLoopScheduler();
         }
@@ -9813,9 +11627,20 @@ function parseSessionHistory(raw) {
     loadedMessages.push({ role: "tool", content: pendingToolMessage });
   }
 
+  normalizeCompactionNoticeOrdering(loadedMessages);
   hideSupersededPlanUiEntries(loadedMessages);
 
-  return { loadedMessages, sessionModel, sessionWorkspace, sessionReasoningByModel, sessionMode };
+  return {
+    loadedMessages,
+    sessionModel,
+    sessionWorkspace,
+    sessionTitle: sessionTitle || getFirstSessionTitle(loadedMessages),
+    sessionReasoningByModel,
+    sessionMode,
+    sessionRuntimeSettings: loadedSessionRuntimeSettings,
+    sessionContextLeftByModel,
+    sessionCacheTelemetryByModel,
+  };
 }
 
 async function loadSessionFileIntoChat(filePath, options = {}) {
@@ -9834,7 +11659,7 @@ async function loadSessionFileIntoChat(filePath, options = {}) {
     chatGeneration += 1;
   }
 
-  const parsedSession = parseSessionHistory(raw);
+  const parsedSession = parseSessionHistory(raw, options);
   const loadedMessages = Array.isArray(parsedSession?.loadedMessages)
     ? parsedSession.loadedMessages
     : [];
@@ -9845,11 +11670,19 @@ async function loadSessionFileIntoChat(filePath, options = {}) {
   const loadedSessionReasoningByModel = normalizeReasoningConfigMap(
     parsedSession?.sessionReasoningByModel
   );
+  currentSessionTitle = normalizeSessionTitle(parsedSession?.sessionTitle) ||
+    getFirstSessionTitle(loadedMessages);
   reasoningEnabledByModel = pruneAutoDisabledReasoningFlags(
     loadedSessionReasoningByModel,
     loadedMessages
   );
+  if (typeof parsedSession?.sessionModel === "string" && parsedSession.sessionModel.trim()) {
+    selectedModel = parsedSession.sessionModel.trim();
+  }
   collaborationMode = parsedSession?.sessionMode === "plan" ? "plan" : "build";
+  sessionRuntimeSettings = normalizeSessionRuntimeSettings(parsedSession?.sessionRuntimeSettings);
+  contextLeftPercentByModel = normalizeContextLeftMap(parsedSession?.sessionContextLeftByModel);
+  cacheTelemetryByModel = normalizeCacheTelemetryMap(parsedSession?.sessionCacheTelemetryByModel);
   messages.length = 0;
   printedMessageCount = 0;
   forceTranscriptReplay = true;
@@ -9864,17 +11697,59 @@ async function loadSessionFileIntoChat(filePath, options = {}) {
 
 async function loadSelectedSessionIntoChat() {
   const selected = getFilteredSessionFiles()[sessionsSelected];
-  if (!selected) {
-    return;
-  }
+  if (!selected) return false;
 
+  return loadSessionEntryIntoChat(selected);
+}
+
+function buildResumedNamedAgentRecord(current, archived, agentName) {
+  return {
+    ...archived,
+    kind: "named-agent",
+    id: current?.id || archived?.id,
+    name: agentName,
+    workspace: WORKSPACE_ROOT,
+    status: "idle",
+    pid: null,
+    active_loop_id: "",
+    // Opening a session is navigation, not activity. Preserve the timestamp
+    // of its last real transcript/status change so /resume does not reset it.
+    updated_at: Number(archived?.updated_at || archived?.created_at || 0),
+  };
+}
+
+async function loadSessionEntryIntoChat(selected) {
+  if (!selected?.fullPath || !selected?.name) return false;
+  if (selected.kind === "named-agent") {
+    if (!selected.currentNamedSession) {
+      const agent = getNamedAgentByName(selected.agentName);
+      if (!agent || getNamedAgentStatus(agent) === "running") return false;
+      const current = await readJsonObject(agent.recordPath, agent);
+      const archived = await readJsonObject(selected.fullPath);
+      if (!archived || archived.kind !== "named-agent-session") return false;
+      await archiveNamedAgentRecord(current);
+      const restoredLoopCount = restoreNamedAgentSessionSchedules(agent.name, archived);
+      const resumed = buildResumedNamedAgentRecord(current, archived, agent.name);
+      await writeJsonAtomic(agent.recordPath, resumed);
+      await fs.rm(selected.fullPath, { force: true });
+      await persistNamedAgentLoops();
+      if (restoredLoopCount > 0) startLoopScheduler();
+    }
+    await refreshNamedAgents();
+    return switchToAgentSession(selected.agentName);
+  }
   await ensureSystemPromptReady();
   const uidMatch = selected.name.match(/^session-(.+)\.jsonl$/i);
   currentSessionUid = uidMatch ? uidMatch[1] : selected.name;
   sessionFilePath = selected.fullPath;
   sessionWriteChain = Promise.resolve();
   sessionPersistenceInitialized = false;
-  await loadSessionFileIntoChat(selected.fullPath);
+  const loaded = await loadSessionFileIntoChat(selected.fullPath, { preserveNamedLoops: true });
+  if (loaded) {
+    activeAgentName = "main";
+    activeNamedAgentMessages = [];
+  }
+  return loaded;
 }
 
 function resetComposerState() {
@@ -9904,13 +11779,17 @@ async function startNewChat() {
   await ensureSystemPromptReady(true);
   chatGeneration += 1;
   currentSessionUid = createSessionUid();
+  currentSessionTitle = "";
+  activeAgentName = "main";
+  activeNamedAgentMessages = [];
   sessionFilePath = getSessionFilePath(currentSessionUid);
   sessionWriteChain = Promise.resolve();
   sessionPersistenceInitialized = false;
-  loopTasks = [];
-  stopLoopScheduler();
+  removeLoopsForAgent("main");
   stopKernelProcess();
   collaborationMode = "build";
+  contextLeftPercentByModel = {};
+  cacheTelemetryByModel = {};
   resetMessagesToSystemPrompt();
   resetComposerState();
   await rewriteSessionWithCurrentMessages();
@@ -9922,9 +11801,10 @@ async function clearCurrentChat() {
   chatGeneration += 1;
   sessionWriteChain = Promise.resolve();
   sessionPersistenceInitialized = false;
-  loopTasks = [];
-  stopLoopScheduler();
   stopKernelProcess();
+  currentSessionTitle = "";
+  contextLeftPercentByModel = {};
+  cacheTelemetryByModel = {};
   resetMessagesToSystemPrompt();
   resetComposerState();
   await fs.unlink(sessionFilePath).catch(() => {});
@@ -10189,43 +12069,115 @@ async function runInitCommand() {
   return true;
 }
 
+function showAgentCommandNotice(text, error = false, options = {}) {
+  if (activeAgentName === "main") {
+    appendAssistantMessage(error ? `■ ${text}` : text, {
+      excludeFromRequest: true,
+      persistHistory: false,
+    });
+  } else {
+    const key = activeAgentName.toLowerCase();
+    const notices = namedAgentUiNotices.get(key) || [];
+    const afterMessageCount = activeNamedAgentMessages.filter((entry) => entry?.queued !== true).length;
+    notices.push({
+      role: error ? "error" : "assistant",
+      content: error ? `■ ${text}` : text,
+      excludeFromRequest: true,
+      afterMessageCount,
+      persisted: options.persist === true,
+    });
+    namedAgentUiNotices.set(key, notices.slice(-50));
+    if (options.persist === true) persistNamedAgentLoops().catch(() => {});
+  }
+  forceFullClearOnNextRender = true;
+  markDirty();
+  renderFrame(true);
+}
+
+function getResumeBufferName(agentName = activeAgentName) {
+  return "sessions";
+}
+
+async function runAgentCommand(commandArgs = "") {
+  const source = String(commandArgs || "").trim();
+  if (!source) {
+    showAgentCommandNotice("Usage: /agent <name> [task]", true);
+    return true;
+  }
+  const match = source.match(/^(\S+)(?:\s+([\s\S]*))?$/);
+  const name = match?.[1] || "";
+  const task = match?.[2] || "";
+  const result = await dispatchNamedAgentTask(name, task);
+  if (!result.ok) {
+    showAgentCommandNotice(result.error || "Could not create agent", true);
+    return true;
+  }
+  showAgentCommandNotice(
+    task
+      ? result.queued
+        ? `Queued task for agent ${result.name}.`
+        : `Agent ${result.name} started in the background.`
+      : `Agent ${result.name} is ready. Open /list-agents to switch to its session.`
+  );
+  return true;
+}
+
 async function runSlashCommand(commandName, commandArgs = "") {
+  if (commandName === "/agent") {
+    return runAgentCommand(commandArgs);
+  }
+  if (commandName === "/list-agents") {
+    openAgentsBuffer();
+    return true;
+  }
   if (commandName === "/init") {
     return runInitCommand();
   }
 
   if (commandName === "/plan") {
-    if (pendingAssistantRequests > 0) {
-      appendTuiErrorMessage("/plan");
+    if (
+      (activeAgentName === "main" && pendingAssistantRequests > 0) ||
+      (activeAgentName !== "main" && isActiveNamedAgentRunning())
+    ) {
+      showAgentCommandNotice("Cannot change plan mode while this agent is working.", true);
       return true;
     }
 
     const arg = String(commandArgs ?? "").trim().toLowerCase();
+    const activeMode = getActiveCollaborationMode();
     if (arg === "status") {
-      appendAssistantMessage(
-        collaborationMode === "plan"
+      showAgentCommandNotice(
+        activeMode === "plan"
           ? "Plan mode is active. The workspace is read-only; use /plan off to return to Build mode."
           : "Build mode is active; use /plan to enter read-only Plan mode.",
-        { excludeFromRequest: true, persistHistory: false }
+        false,
+        { persist: activeAgentName !== "main" }
       );
       refreshMainBufferAfterCommand();
       return true;
     }
     if (arg && !["on", "off", "plan", "build"].includes(arg)) {
-      appendTuiErrorMessage("/plan", "invalid usage. Use '/plan', '/plan on', '/plan off', or '/plan status'");
+      showAgentCommandNotice("Invalid usage. Use '/plan', '/plan on', '/plan off', or '/plan status'.", true);
       return true;
     }
 
-    const enable = arg === "on" || arg === "plan" || (!arg && collaborationMode !== "plan");
-    collaborationMode = enable ? "plan" : "build";
-    ensureSystemMessageAtTop();
-    appendAssistantMessage(
+    const enable = arg === "on" || arg === "plan" || (!arg && activeMode !== "plan");
+    if (activeAgentName === "main") {
+      collaborationMode = enable ? "plan" : "build";
+      ensureSystemMessageAtTop();
+    } else {
+      await updateActiveNamedAgentSessionRuntime((runtime) => {
+        runtime.collaboration_mode = enable ? "plan" : "build";
+      });
+    }
+    showAgentCommandNotice(
       enable
         ? "Plan mode enabled. I can inspect and design a plan, but workspace changes and executable actions are blocked. Use /plan again to return to Build mode."
         : "Build mode enabled. I can now implement and verify the plan.",
-      { excludeFromRequest: true, persistHistory: false }
+      false,
+      { persist: activeAgentName !== "main" }
     );
-    await rewriteSessionWithCurrentMessages();
+    if (activeAgentName === "main") await rewriteSessionWithCurrentMessages();
     refreshMainBufferAfterCommand();
     return true;
   }
@@ -10246,9 +12198,8 @@ async function runSlashCommand(commandName, commandArgs = "") {
   }
 
   if (commandName === "/cache") {
-    appendAssistantMessage(formatCacheTelemetry(selectedModel), {
-      excludeFromRequest: true,
-      persistHistory: false,
+    showAgentCommandNotice(formatActiveCacheTelemetry(), false, {
+      persist: activeAgentName !== "main",
     });
     refreshMainBufferAfterCommand();
     return true;
@@ -10265,7 +12216,7 @@ async function runSlashCommand(commandName, commandArgs = "") {
   }
 
   if (commandName === "/resume") {
-    if (pendingAssistantRequests > 0) {
+    if (activeAgentName === "main" && pendingAssistantRequests > 0) {
       appendTuiErrorMessage("/resume");
       return true;
     }
@@ -10274,6 +12225,10 @@ async function runSlashCommand(commandName, commandArgs = "") {
   }
 
   if (commandName === "/new") {
+    if (activeAgentName !== "main") {
+      await startNewNamedAgentChat();
+      return true;
+    }
     if (pendingAssistantRequests > 0) {
       appendTuiErrorMessage("/new");
       return true;
@@ -10283,6 +12238,29 @@ async function runSlashCommand(commandName, commandArgs = "") {
   }
 
   if (commandName === "/clear") {
+    if (activeAgentName !== "main") {
+      const agent = getNamedAgentByName();
+      if (getNamedAgentStatus(agent) === "running") {
+        showAgentCommandNotice("Stop the agent before clearing its session.", true);
+        return true;
+      }
+      const reset = createNamedAgentRecord(agent?.name || activeAgentName);
+      reset.id = agent?.id || reset.id;
+      reset.created_at = agent?.created_at || reset.created_at;
+      const retainedRuntime = normalizeNamedAgentSessionRuntime(agent);
+      retainedRuntime.context_left_by_model = {};
+      retainedRuntime.cache_telemetry_by_model = {};
+      applyNamedAgentSessionRuntime(reset, retainedRuntime);
+      namedAgentUiNotices.delete(activeAgentName.toLowerCase());
+      await persistNamedAgentLoops();
+      await writeJsonAtomic(agent.recordPath, reset);
+      await writeNamedAgentQueue(agent.recordPath, []);
+      await rewriteSessionWithCurrentMessages().catch(() => {});
+      await refreshNamedAgents();
+      forceFullClearOnNextRender = true;
+      renderFrame(true);
+      return true;
+    }
     if (pendingAssistantRequests > 0) {
       appendTuiErrorMessage("/clear");
       return true;
@@ -10344,9 +12322,11 @@ async function runSlashCommand(commandName, commandArgs = "") {
 
   if (commandName === "/loop" || commandName === "/loops") {
     const args = String(commandArgs ?? "").trim();
+    const loopOwner = activeAgentName;
+    const showLoopNotice = (text, error = false, options = {}) => showAgentCommandNotice(text, error, options);
 
     if (commandName === "/loop" && !args) {
-      appendTuiErrorMessage("/loop", "invalid usage. Use '/loop <interval> <prompt>'");
+      showLoopNotice("Invalid usage. Use '/loop <interval> <prompt>'.", true);
       return true;
     }
 
@@ -10360,25 +12340,22 @@ async function runSlashCommand(commandName, commandArgs = "") {
         ? args.slice("cancel".length).trim()
         : "";
       if (cancelId) {
-        let removed = removeLoopTask(cancelId);
+        let removed = removeLoopTask(cancelId, { ownerAgent: loopOwner });
         if (!removed && cancelId.startsWith("/")) {
           // Allow: /loops cancel <id> where the id contains no slashes
           const normalizedId = cancelId.replace(/^\/+/, "");
-          if (normalizedId && removeLoopTask(normalizedId)) {
+          if (normalizedId && removeLoopTask(normalizedId, { ownerAgent: loopOwner })) {
             removed = true;
           }
         }
-        appendAssistantMessage(
+        if (removed && loopOwner !== "main") await persistNamedAgentLoops();
+        showLoopNotice(
           removed
             ? `Cancelled loop ${cancelId}.`
-            : `No scheduled loop with id "${cancelId}".`,
-          { excludeFromRequest: true, persistHistory: false }
+            : `No scheduled loop with id "${cancelId}" for agent ${loopOwner}.`
         );
       } else {
-        appendAssistantMessage(buildLoopsSummaryText(), {
-          excludeFromRequest: true,
-          persistHistory: false,
-        });
+        showLoopNotice(buildLoopsSummaryText(loopOwner));
       }
       await rewriteSessionWithCurrentMessages();
       refreshMainBufferAfterCommand();
@@ -10390,16 +12367,16 @@ async function runSlashCommand(commandName, commandArgs = "") {
     if (onceMatch) {
       const extracted = extractWhenFromText(onceMatch[1]);
       if (!extracted) {
-        appendTuiErrorMessage("/loop", "invalid usage. Use '/loop once <when> <prompt>' (e.g. /loop once 3pm push the release branch)");
+        showLoopNotice("Invalid usage. Use '/loop once <when> <prompt>' (e.g. /loop once 3pm push the release branch).", true);
         return true;
       }
       const prompt = extracted.rest.replace(/^(?:to|that|for)\s+/, "").trim();
       if (!prompt) {
-        appendTuiErrorMessage("/loop", "invalid usage. Use '/loop once <when> <prompt>' (e.g. /loop once in 45 minutes check tests)");
+        showLoopNotice("Invalid usage. Use '/loop once <when> <prompt>' (e.g. /loop once in 45 minutes check tests).", true);
         return true;
       }
-      if (loopTasks.length >= LOOP_MAX_TASKS) {
-        appendTuiErrorMessage("/loop", "failed because this session already has the maximum number of scheduled loops");
+      if (getLoopTaskCountForAgent(loopOwner) >= LOOP_MAX_TASKS) {
+        showLoopNotice(`Agent ${loopOwner} already has the maximum number of scheduled loops.`, true);
         return true;
       }
       const task = scheduleLoopTask(extracted.when, prompt, {
@@ -10407,11 +12384,15 @@ async function runSlashCommand(commandName, commandArgs = "") {
         dynamic: false,
         fireAt: extracted.when,
         displayLabel: extracted.display,
+        ownerAgent: loopOwner,
       });
+      if (loopOwner !== "main") await persistNamedAgentLoops();
       startLoopScheduler();
-      appendAssistantMessage(
-        `Scheduled one-shot loop ${task.id} for ${extracted.display}. Prompt: ${prompt}`,
-        { excludeFromRequest: true, persistHistory: false }
+      recordMainLoopCommand(args);
+      showLoopNotice(
+        `Scheduled one-shot loop ${task.id} for agent ${loopOwner}, ${extracted.display}. Prompt: ${prompt}`,
+        false,
+        { persist: loopOwner !== "main" }
       );
       await rewriteSessionWithCurrentMessages();
       refreshMainBufferAfterCommand();
@@ -10420,23 +12401,27 @@ async function runSlashCommand(commandName, commandArgs = "") {
 
     const parsed = parseLoopCommandArgs(args);
     if (!parsed.ok) {
-      appendTuiErrorMessage("/loop", `invalid usage: ${parsed.error || ""} Use '/loop [interval] [prompt]'`);
+      showLoopNotice(`Invalid usage: ${parsed.error || ""} Use '/loop [interval] [prompt]'.`, true);
       return true;
     }
-    if (loopTasks.length >= LOOP_MAX_TASKS) {
-      appendTuiErrorMessage("/loop", `failed because the session already has ${LOOP_MAX_TASKS} scheduled loops`);
+    if (getLoopTaskCountForAgent(loopOwner) >= LOOP_MAX_TASKS) {
+      showLoopNotice(`Agent ${loopOwner} already has ${LOOP_MAX_TASKS} scheduled loops.`, true);
       return true;
     }
     const task = scheduleLoopTask(parsed.intervalMinutes, parsed.prompt, {
       dynamic: parsed.intervalMinutes === null,
+      ownerAgent: loopOwner,
     });
+    if (loopOwner !== "main") await persistNamedAgentLoops();
     startLoopScheduler();
+    recordMainLoopCommand(args);
     const intervalLabel = parsed.intervalMinutes
       ? `every ${formatLoopIntervalLabel(task.intervalMs)}`
       : "on a dynamically chosen interval";
-    appendAssistantMessage(
-      `Scheduled loop ${task.id} (${intervalLabel}). Prompt: ${task.prompt}`,
-      { excludeFromRequest: true, persistHistory: false }
+    showLoopNotice(
+      `Scheduled loop ${task.id} for agent ${loopOwner} (${intervalLabel}). Prompt: ${task.prompt}`,
+      false,
+      { persist: loopOwner !== "main" }
     );
     await rewriteSessionWithCurrentMessages();
     refreshMainBufferAfterCommand();
@@ -10562,27 +12547,64 @@ async function runSlashCommand(commandName, commandArgs = "") {
   }
 
   if (commandName === "/compact") {
-    const instruction = String(commandArgs ?? "").trim();
-    appendAssistantMessage(
-      instruction
-        ? `Compacting context with instruction: ${instruction}...`
-        : "Compacting context...",
-      { excludeFromRequest: true, persistHistory: false }
-    );
-    const compactResult = await runCompaction(instruction);
-    if (!compactResult?.ok) {
-      appendAssistantMessage(`Compaction failed: ${compactResult?.error || "unknown error"}`, {
-        excludeFromRequest: true,
-        persistHistory: false,
-      });
-    } else {
-      appendAssistantMessage(
-        `Compaction complete. Summary (${compactResult.summary.length} chars) plus the most recent context retained.`,
-        { excludeFromRequest: true, persistHistory: false }
-      );
+    const compactingAgentName = activeAgentName;
+    if (getActiveSessionCompactionPromise(compactingAgentName)) {
+      showAgentCommandNotice("Compaction is already running for this session.", true);
+      return true;
     }
-    await rewriteSessionWithCurrentMessages();
-    refreshMainBufferAfterCommand();
+    if (
+      (activeAgentName === "main" && pendingAssistantRequests > 0) ||
+      (activeAgentName !== "main" && isActiveNamedAgentRunning())
+    ) {
+      showAgentCommandNotice("Stop the current turn before compacting this session.", true);
+      return true;
+    }
+    let releaseCompaction;
+    const compactionBarrier = new Promise((resolve) => {
+      releaseCompaction = resolve;
+    });
+    const compactionOperation = {
+      agentName: compactingAgentName,
+      promise: compactionBarrier,
+    };
+    activeSessionCompaction = compactionOperation;
+    try {
+      const instruction = String(commandArgs ?? "").trim();
+      const persistNamedNotice = compactingAgentName !== "main";
+      showAgentCommandNotice(
+        instruction
+          ? `Compacting context with instruction: ${instruction}...`
+          : "Compacting context...",
+        false,
+        { persist: persistNamedNotice }
+      );
+      const compactResult = compactingAgentName === "main"
+        ? await runCompaction(instruction)
+        : await runNamedAgentCompaction(instruction);
+      if (!compactResult?.ok) {
+        showAgentCommandNotice(
+          `Compaction failed: ${compactResult?.error || "unknown error"}`,
+          true,
+          { persist: persistNamedNotice }
+        );
+      } else {
+        showAgentCommandNotice(
+          `Compaction complete. Summary (${compactResult.summary.length} chars) plus the most recent context retained.`,
+          false,
+          { persist: persistNamedNotice }
+        );
+        for (const notice of compactResult.notices || []) {
+          showAgentCommandNotice(notice, false, { persist: persistNamedNotice });
+        }
+      }
+      if (compactingAgentName === "main") await rewriteSessionWithCurrentMessages();
+      refreshMainBufferAfterCommand();
+    } finally {
+      if (activeSessionCompaction === compactionOperation) {
+        activeSessionCompaction = null;
+      }
+      releaseCompaction();
+    }
     return true;
   }
 
@@ -10656,6 +12678,7 @@ function shouldTransitionCommandDirectlyToAltBuffer(commandName, commandArgs = "
   const args = String(commandArgs || "").trim();
   if (
     normalized === "/kernels" ||
+    normalized === "/list-agents" ||
     normalized === "/providers" ||
     normalized === "/settings" ||
     normalized === "/mcp" ||
@@ -10664,7 +12687,10 @@ function shouldTransitionCommandDirectlyToAltBuffer(commandName, commandArgs = "
   ) {
     return true;
   }
-  return normalized === "/resume" && pendingAssistantRequests === 0;
+  return (
+    normalized === "/resume" &&
+    (activeAgentName !== "main" || pendingAssistantRequests === 0)
+  );
 }
 
 function openModelBuffer() {
@@ -10684,7 +12710,9 @@ function openModelBuffer() {
   bracketedPasteBuffer = "";
   pasteParserBuffer = "";
   modelSearch = "";
-  modelSelected = 0;
+  const activeModel = getActiveSessionModel();
+  const activeModelIndex = availableModels.findIndex((model) => model?.id === activeModel);
+  modelSelected = activeModelIndex >= 0 ? activeModelIndex : 0;
   modelScroll = 0;
   lastModelRenderedRows = [];
   lastModelRenderedCols = 0;
@@ -10711,6 +12739,7 @@ function closeModelBuffer() {
 
 function openSessionsBuffer() {
   const reuseAltScreen = altScreenActive;
+  sessionsOwnerAgent = activeAgentName;
   commandBufferQuery = "";
   lastCommandRenderedRows = [];
   lastCommandRenderedCols = 0;
@@ -10753,6 +12782,82 @@ function closeSessionsBuffer(options = {}) {
   burstMode = false;
   markDirty();
   renderFrame(options.refreshChat === true);
+}
+
+function getAgentsListEntries() {
+  return [
+    {
+      name: "main",
+      status: isAssistantThinking() ? "running" : "idle",
+      current: activeAgentName === "main",
+      created_at: 0,
+    },
+    ...namedAgents.map((agent) => ({
+      ...agent,
+      status: getNamedAgentStatus(agent),
+      current: String(agent.name).toLowerCase() === activeAgentName.toLowerCase(),
+    })),
+  ].filter((agent) => !agentsSearch || String(agent.name).toLowerCase().includes(agentsSearch.toLowerCase()));
+}
+
+function updateAgentsSelectionState() {
+  const entries = getAgentsListEntries();
+  if (!entries.length) {
+    agentsSelected = 0;
+    agentsScroll = 0;
+    return;
+  }
+  agentsSelected = Math.max(0, Math.min(entries.length - 1, agentsSelected));
+  const visibleCount = Math.max(1, Math.min(20, (process.stdout.rows || 24) - 4));
+  if (agentsSelected < agentsScroll) agentsScroll = agentsSelected;
+  if (agentsSelected >= agentsScroll + visibleCount) agentsScroll = agentsSelected - visibleCount + 1;
+  agentsScroll = Math.max(0, Math.min(agentsScroll, Math.max(0, entries.length - visibleCount)));
+}
+
+function openAgentsBuffer() {
+  const reuseAltScreen = altScreenActive;
+  commandBufferQuery = "";
+  input = "";
+  inputCursorIndex = 0;
+  activeBuffer = "agents";
+  enterAltScreenIfNeeded();
+  agentsSelected = 0;
+  agentsScroll = 0;
+  agentsSearch = "";
+  agentsMessage = "";
+  lastAgentsRenderedRows = [];
+  lastAgentsRenderedCols = 0;
+  lastAgentsRenderedHeight = 0;
+  forceFullClearOnNextRender = !reuseAltScreen;
+  markDirty();
+  renderFrame(true);
+  refreshNamedAgents().catch(() => {});
+}
+
+function closeAgentsBuffer(options = {}) {
+  exitAltScreenIfNeeded({ preserveRestoredScreen: true });
+  activeBuffer = "main";
+  lastAgentsRenderedRows = [];
+  lastAgentsRenderedCols = 0;
+  lastAgentsRenderedHeight = 0;
+  forceFullClearOnNextRender = true;
+  markDirty();
+  renderFrame(options.refreshChat === true);
+}
+
+function switchToAgentSession(name) {
+  const normalized = String(name || "main");
+  if (normalized.toLowerCase() !== "main" && !getNamedAgentByName(normalized)) return false;
+  activeAgentName = normalized.toLowerCase() === "main" ? "main" : getNamedAgentByName(normalized).name;
+  activeNamedAgentMessages = activeAgentName === "main"
+    ? []
+    : namedAgentMessagesForDisplay(getNamedAgentByName(activeAgentName));
+  resetComposerState();
+  chatScrollOffset = 0;
+  cachedChatLines = null;
+  forceTranscriptReplay = true;
+  forceFullClearOnNextRender = true;
+  return true;
 }
 
 function getProvidersVisibleCount() {
@@ -10859,26 +12964,27 @@ function capitalizeSettingLabel(value) {
 }
 
 function getRuntimeSettings() {
-  const contextWindow = normalizeModelContextWindow(nexusConfig?.model_context_window_override);
-  const requestTimeout = getLlmRequestTimeoutMs();
+  const runtimeSettings = getActiveSessionRuntimeSettings();
+  const contextWindow = runtimeSettings.context_window;
+  const requestTimeout = runtimeSettings.request_timeout_ms;
   return [
-    { key: "thinking", label: "thinking", value: getReasoningEnabledForModel(selectedModel), options: [true, false] },
+    { key: "thinking", label: "thinking", value: getActiveReasoningEnabled(), options: [true, false] },
     {
       key: "thinking_blocks",
       label: "thinking blocks",
-      value: shouldShowThinkingBlocks(),
+      value: runtimeSettings.thinking_blocks,
       options: [true, false],
     },
     {
       key: "external_thinking",
       label: "external thinking",
-      value: isExternalThinkingEnabled(),
+      value: runtimeSettings.external_thinking,
       options: [true, false],
     },
     {
       key: "thinking_effort",
       label: "thinking effort",
-      value: getThinkingEffort(),
+      value: runtimeSettings.thinking_effort,
       options: THINKING_EFFORT_OPTIONS,
     },
     {
@@ -11095,27 +13201,49 @@ async function cycleSelectedRuntimeSetting(direction = 1) {
   markDirty();
   renderFrame(true);
   try {
-    if (setting.key === "thinking") {
+    if (activeAgentName !== "main") {
+      await updateActiveNamedAgentSessionRuntime((runtime) => {
+        if (setting.key === "thinking") {
+          if (!runtime.model) throw new Error("current model is not set");
+          runtime.reasoning_by_model[runtime.model] = nextValue === true;
+        } else if (setting.key === "thinking_blocks") {
+          runtime.settings.thinking_blocks = nextValue === true;
+        } else if (setting.key === "external_thinking") {
+          runtime.settings.external_thinking = nextValue === true;
+        } else if (setting.key === "thinking_effort") {
+          runtime.settings.thinking_effort = normalizeThinkingEffort(nextValue);
+        } else if (setting.key === "context_window") {
+          runtime.settings.context_window = normalizeModelContextWindow(nextValue);
+        } else if (setting.key === "request_timeout") {
+          runtime.settings.request_timeout_ms = normalizeLlmRequestTimeoutMs(nextValue);
+        }
+      });
+      cachedChatLines = null;
+      lastRenderableMessageCount = -1;
+    } else if (setting.key === "thinking") {
       if (!selectedModel) throw new Error("current model is not set");
       setReasoningEnabledForModel(selectedModel, nextValue);
       await rewriteSessionWithCurrentMessages();
+      cachedChatLines = null;
+      lastRenderableMessageCount = -1;
     } else if (setting.key === "thinking_blocks") {
-      nexusConfig.show_thinking_blocks = nextValue === true;
-      await saveNexusConfig();
+      getMainSessionRuntimeSettings().thinking_blocks = nextValue === true;
+      await rewriteSessionWithCurrentMessages();
       cachedChatLines = null;
       lastRenderableMessageCount = -1;
     } else if (setting.key === "external_thinking") {
-      nexusConfig.external_thinking = nextValue === true;
-      await saveNexusConfig();
+      getMainSessionRuntimeSettings().external_thinking = nextValue === true;
+      ensureSystemMessageAtTop();
+      await rewriteSessionWithCurrentMessages();
     } else if (setting.key === "thinking_effort") {
-      nexusConfig.thinking_effort = normalizeThinkingEffort(nextValue);
-      await saveNexusConfig();
+      getMainSessionRuntimeSettings().thinking_effort = normalizeThinkingEffort(nextValue);
+      await rewriteSessionWithCurrentMessages();
     } else if (setting.key === "context_window") {
-      nexusConfig.model_context_window_override = normalizeModelContextWindow(nextValue);
-      await saveNexusConfig();
+      getMainSessionRuntimeSettings().context_window = normalizeModelContextWindow(nextValue);
+      await rewriteSessionWithCurrentMessages();
     } else if (setting.key === "request_timeout") {
-      nexusConfig.llm_request_timeout_ms = normalizeLlmRequestTimeoutMs(nextValue);
-      await saveNexusConfig();
+      getMainSessionRuntimeSettings().request_timeout_ms = normalizeLlmRequestTimeoutMs(nextValue);
+      await rewriteSessionWithCurrentMessages();
     }
     const updated = getRuntimeSettings().find((entry) => entry.key === setting.key);
     const formattedValue = updated?.format ? updated.format(updated.value) : String(updated?.value ?? nextValue);
@@ -11147,8 +13275,16 @@ function getPreferredLanAddress() {
 }
 
 function buildRemoteControlStatus() {
-  if (!isAssistantThinking()) {
+  if (!isCurrentChatThinking()) {
     return { phase: "idle", label: "Connected", startedAt: 0 };
+  }
+  if (activeAgentName !== "main") {
+    const agent = getNamedAgentByName();
+    return {
+      phase: "thinking",
+      label: `${agent?.name || "Agent"} working...`,
+      startedAt: Number(agent?.task_started_at || 0) * 1000,
+    };
   }
   if (activeToolRun && !activeToolRun.done) {
     return {
@@ -11165,8 +13301,9 @@ function buildRemoteControlStatus() {
 }
 
 function getRemoteControlVisibleMessages() {
-  const visible = messages.filter((message) => {
+  const visible = getActiveChatEntries().filter((message) => {
     if (!message || message.hidden === true || message.role === "system") return false;
+    if (isCompactionSummaryEntry(message)) return false;
     if (message.ephemeral === true && !String(message.content || "").trim()) return false;
     return ["user", "assistant", "tool", "error"].includes(message.role);
   });
@@ -11222,19 +13359,215 @@ function getRemoteControlVisibleMessages() {
 function buildRemoteControlSnapshot() {
   return {
     type: "snapshot",
-    session: currentSessionUid || "",
+    session: activeAgentName === "main" ? currentSessionUid || "" : `agent:${activeAgentName}`,
+    agent: activeAgentName,
     workspace: path.basename(WORKSPACE_ROOT),
     status: buildRemoteControlStatus(),
-    queued: queuedBusyPrompts
-      .filter((entry) => entry.sessionUid === currentSessionUid)
-      .map((entry) => entry.text),
+    queued: activeAgentName === "main"
+      ? queuedBusyPrompts.filter((entry) => entry.sessionUid === currentSessionUid).map((entry) => entry.text)
+      : Array.from(getNamedAgentByName()?.queuedTasks || []),
     messages: getRemoteControlVisibleMessages(),
+  };
+}
+
+function getRemoteControlSessionEntryId(entry, ownerAgent = "main") {
+  if (String(ownerAgent || "main").toLowerCase() !== "main") {
+    return String(entry?.name || "");
+  }
+  const uidMatch = String(entry?.name || "").match(/^session-(.+)\.jsonl$/i);
+  return uidMatch ? uidMatch[1] : String(entry?.name || "");
+}
+
+function buildRemoteControlSessionItems(files, ownerAgent = "main") {
+  const normalizedOwner = String(ownerAgent || "main");
+  const isMain = normalizedOwner.toLowerCase() === "main";
+  return (Array.isArray(files) ? files : []).map((entry) => {
+    const id = getRemoteControlSessionEntryId(entry, normalizedOwner);
+    return {
+      id,
+      updatedAt: Number(entry.mtimeMs) || 0,
+      title: entry.firstUserMessage || "Untitled session",
+      current: isMain ? id === currentSessionUid : entry.currentNamedSession === true,
+    };
+  });
+}
+
+async function buildRemoteControlSessionsPayload() {
+  const ownerAgent = activeAgentName;
+  const files = ownerAgent === "main"
+    ? await scanWorkspaceSessionFiles()
+    : await scanNamedAgentSessionFiles(ownerAgent);
+  return {
+    type: "sessions",
+    agent: ownerAgent,
+    sessions: buildRemoteControlSessionItems(files, ownerAgent),
+  };
+}
+
+async function sendRemoteControlSessions(client) {
+  if (!client || client.readyState !== WebSocket.OPEN) return false;
+  const payload = await buildRemoteControlSessionsPayload();
+  if (client.readyState !== WebSocket.OPEN) return false;
+  client.send(JSON.stringify(payload));
+  return true;
+}
+
+async function buildRemoteControlAgentsPayload() {
+  await refreshNamedAgents();
+  return {
+    type: "agents",
+    agents: [
+      {
+        name: "main",
+        status: isAssistantThinking() ? "running" : "idle",
+        current: activeAgentName === "main",
+      },
+      ...namedAgents.map((agent) => ({
+        name: String(agent.name || ""),
+        status: getNamedAgentStatus(agent),
+        current: String(agent.name || "").toLowerCase() === activeAgentName.toLowerCase(),
+      })),
+    ],
+  };
+}
+
+async function sendRemoteControlAgents(client) {
+  if (!client || client.readyState !== WebSocket.OPEN) return false;
+  const payload = await buildRemoteControlAgentsPayload();
+  if (client.readyState !== WebSocket.OPEN) return false;
+  client.send(JSON.stringify(payload));
+  return true;
+}
+
+function buildRemoteControlLoopItems(ownerAgent = activeAgentName) {
+  return getLoopTasksForAgent(ownerAgent).map((task) => ({
+    id: task.id,
+    prompt: task.prompt,
+    interval: task.dynamic
+      ? "dynamic"
+      : task.oneshot
+        ? task.displayLabel ? `once - ${task.displayLabel}` : "once"
+        : `every ${formatLoopIntervalLabel(task.intervalMs)}`,
+    paused: task.paused === true,
+    oneshot: task.oneshot === true,
+    nextFireAt: Number(task.nextFireAt) || 0,
+  }));
+}
+
+function buildRemoteControlLoopsPayload(ownerAgent = activeAgentName) {
+  return {
+    type: "loops",
+    agent: ownerAgent,
+    loops: buildRemoteControlLoopItems(ownerAgent),
+  };
+}
+
+async function sendRemoteControlLoops(client) {
+  if (!client || client.readyState !== WebSocket.OPEN) return false;
+  client.send(JSON.stringify(buildRemoteControlLoopsPayload()));
+  return true;
+}
+
+async function updateRemoteControlLoop(rawAgentName, rawLoopId, rawAction) {
+  const requestedAgent = String(rawAgentName || activeAgentName).trim() || "main";
+  const ownerAgent = requestedAgent.toLowerCase() === "main"
+    ? "main"
+    : getNamedAgentByName(requestedAgent)?.name || "";
+  if (!ownerAgent) return { ok: false, error: "Agent was not found in this workspace" };
+  if (ownerAgent.toLowerCase() !== activeAgentName.toLowerCase()) {
+    return { ok: false, error: "The active agent changed; reopen Loops" };
+  }
+  const loopId = String(rawLoopId || "").trim();
+  const action = String(rawAction || "").trim().toLowerCase();
+  if (!loopId || loopId.length > 200 || /[\\/]/.test(loopId)) {
+    return { ok: false, error: "Invalid loop" };
+  }
+  if (action !== "toggle" && action !== "delete") {
+    return { ok: false, error: "Invalid loop action" };
+  }
+  const target = getLoopTasksForAgent(ownerAgent).find((task) => task.id === loopId);
+  if (!target) return { ok: false, error: "Loop was not found for the active agent" };
+
+  const changed = action === "delete"
+    ? removeLoopTask(loopId, { ownerAgent, persist: false })
+    : toggleLoopPaused(loopId, ownerAgent, { persist: false });
+  if (!changed) return { ok: false, error: "Could not update loop" };
+  if (loopTasks.length === 0) stopLoopScheduler();
+  else startLoopScheduler();
+  if (ownerAgent !== "main") await persistNamedAgentLoops();
+  await rewriteSessionWithCurrentMessages().catch(() => {});
+  scheduleRemoteControlBroadcast({ force: true });
+  return { ok: true, payload: buildRemoteControlLoopsPayload(ownerAgent) };
+}
+
+async function switchRemoteControlAgent(rawName) {
+  await refreshNamedAgents();
+  const requested = String(rawName || "").trim();
+  const target = requested.toLowerCase() === "main"
+    ? "main"
+    : getNamedAgentByName(requested)?.name || "";
+  if (!target || !switchToAgentSession(target)) {
+    return { ok: false, error: "Agent was not found in this workspace" };
+  }
+  forceFullClearOnNextRender = true;
+  markDirty();
+  renderFrame(true);
+  scheduleRemoteControlBroadcast({ force: true });
+  return { ok: true, agent: activeAgentName };
+}
+
+async function switchRemoteControlSession(rawSessionId, rawAgentName = activeAgentName) {
+  const sessionId = String(rawSessionId || "").trim();
+  if (!sessionId || sessionId.length > 200 || /[\\/]/.test(sessionId)) {
+    return { ok: false, error: "Invalid session" };
+  }
+  const requestedAgent = String(rawAgentName || activeAgentName).trim() || "main";
+  await refreshNamedAgents();
+  const ownerAgent = requestedAgent.toLowerCase() === "main"
+    ? "main"
+    : getNamedAgentByName(requestedAgent)?.name || "";
+  if (!ownerAgent) return { ok: false, error: "Agent was not found in this workspace" };
+  if (ownerAgent.toLowerCase() !== activeAgentName.toLowerCase()) {
+    return { ok: false, error: "The active agent changed; reopen Sessions" };
+  }
+  if (
+    (ownerAgent === "main" && isAssistantThinking()) ||
+    (ownerAgent !== "main" && getNamedAgentStatus(getNamedAgentByName(ownerAgent)) === "running")
+  ) {
+    return { ok: false, error: "Wait for the current agent turn to finish before switching sessions" };
+  }
+
+  const files = ownerAgent === "main"
+    ? await scanWorkspaceSessionFiles()
+    : await scanNamedAgentSessionFiles(ownerAgent);
+  const selected = files.find(
+    (entry) => getRemoteControlSessionEntryId(entry, ownerAgent) === sessionId
+  );
+  if (!selected) return { ok: false, error: "Session was not found in this workspace" };
+  if (
+    (ownerAgent === "main" && sessionId === currentSessionUid) ||
+    (ownerAgent !== "main" && selected.currentNamedSession === true)
+  ) {
+    return { ok: true, agent: ownerAgent, session: sessionId };
+  }
+
+  const loaded = await loadSessionEntryIntoChat(selected);
+  if (!loaded) return { ok: false, error: "Could not load the selected session" };
+  resetComposerState();
+  forceFullClearOnNextRender = true;
+  markDirty();
+  renderFrame(true);
+  scheduleRemoteControlBroadcast({ force: true });
+  return {
+    ok: true,
+    agent: activeAgentName,
+    session: ownerAgent === "main" ? currentSessionUid : sessionId,
   };
 }
 
 function getRemoteControlFingerprint() {
   const status = buildRemoteControlStatus();
-  const visible = messages.filter(
+  const visible = getActiveChatEntries().filter(
     (message) => message && message.hidden !== true && message.role !== "system"
   );
   const tail = visible.slice(-3).map((message) => {
@@ -11251,6 +13584,7 @@ function getRemoteControlFingerprint() {
   });
   return JSON.stringify({
     session: currentSessionUid,
+    activeAgentName,
     count: visible.length,
     tail,
     status,
@@ -11309,6 +13643,13 @@ async function submitRemoteControlPrompt(rawText) {
     }
   }
 
+  if (activeAgentName !== "main") {
+    const result = await dispatchNamedAgentTask(activeAgentName, trimmedInput);
+    await refreshNamedAgents();
+    scheduleRemoteControlBroadcast({ force: true });
+    return result;
+  }
+
   const queueBehindActiveTurn = isAssistantThinking();
   const promptHookRun = await runHooks({
     eventName: "UserPromptSubmit",
@@ -11353,8 +13694,96 @@ function handleRemoteControlSocketMessage(client, rawData) {
     sendRemoteControlSnapshot(client);
     return;
   }
+  if (payload?.type === "sessions") {
+    sendRemoteControlSessions(client).catch((error) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({ type: "error", message: error?.message || "Could not load sessions" }));
+      }
+    });
+    return;
+  }
+  if (payload?.type === "agents") {
+    sendRemoteControlAgents(client).catch((error) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({ type: "error", message: error?.message || "Could not load agents" }));
+      }
+    });
+    return;
+  }
+  if (payload?.type === "loops") {
+    sendRemoteControlLoops(client).catch((error) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({ type: "error", message: error?.message || "Could not load loops" }));
+      }
+    });
+    return;
+  }
+  if (payload?.type === "loop-action") {
+    remoteControlPromptChain = remoteControlPromptChain
+      .then(() => updateRemoteControlLoop(payload.agent, payload.loop, payload.action))
+      .then((result) => {
+        if (client.readyState !== WebSocket.OPEN) return;
+        if (!result?.ok) {
+          client.send(JSON.stringify({ type: "error", message: result?.error || "Could not update loop" }));
+          return;
+        }
+        client.send(JSON.stringify(result.payload));
+      })
+      .catch((error) => {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify({ type: "error", message: error?.message || String(error) }));
+        }
+      });
+    return;
+  }
+  if (payload?.type === "switch-session") {
+    remoteControlPromptChain = remoteControlPromptChain
+      .then(() => switchRemoteControlSession(payload.session, payload.agent))
+      .then((result) => {
+        if (client.readyState !== WebSocket.OPEN) return;
+        if (!result?.ok) {
+          client.send(JSON.stringify({ type: "error", message: result?.error || "Could not switch sessions" }));
+          return;
+        }
+        client.send(JSON.stringify({
+          type: "session-switched",
+          agent: result.agent,
+          session: result.session,
+        }));
+        sendRemoteControlSnapshot(client);
+      })
+      .catch((error) => {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify({ type: "error", message: error?.message || String(error) }));
+        }
+      });
+    return;
+  }
+  if (payload?.type === "switch-agent") {
+    remoteControlPromptChain = remoteControlPromptChain
+      .then(() => switchRemoteControlAgent(payload.agent))
+      .then((result) => {
+        if (client.readyState !== WebSocket.OPEN) return;
+        if (!result?.ok) {
+          client.send(JSON.stringify({ type: "error", message: result?.error || "Could not switch agents" }));
+          return;
+        }
+        client.send(JSON.stringify({ type: "agent-switched", agent: result.agent }));
+        sendRemoteControlSnapshot(client);
+      })
+      .catch((error) => {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify({ type: "error", message: error?.message || String(error) }));
+        }
+      });
+    return;
+  }
   if (payload?.type === "stop") {
-    if (isAssistantThinking()) handleStopRequest();
+    if (activeAgentName !== "main") {
+      stopNamedAgent().catch(() => {});
+    } else if (isAssistantThinking()) {
+      handleStopRequest();
+    }
     scheduleRemoteControlBroadcast({ force: true });
     return;
   }
@@ -11794,14 +14223,15 @@ function getLoopsVisibleCount() {
 }
 
 function updateLoopsSelectionState() {
-  if (loopTasks.length === 0) {
+  const tasks = getLoopTasksForAgent();
+  if (tasks.length === 0) {
     loopsSelected = 0;
     loopsScroll = 0;
     return;
   }
 
-  if (loopsSelected >= loopTasks.length) {
-    loopsSelected = loopTasks.length - 1;
+  if (loopsSelected >= tasks.length) {
+    loopsSelected = tasks.length - 1;
   }
 
   if (loopsSelected < loopsScroll) {
@@ -11809,14 +14239,17 @@ function updateLoopsSelectionState() {
   }
 
   const visibleCount = getLoopsVisibleCount();
-  const maxScroll = Math.max(0, loopTasks.length - visibleCount);
+  const maxScroll = Math.max(0, tasks.length - visibleCount);
   if (loopsScroll > maxScroll) {
     loopsScroll = maxScroll;
   }
 }
 
-function toggleLoopPaused(id) {
-  const task = loopTasks.find((entry) => entry.id === id);
+function toggleLoopPaused(id, ownerAgent = activeAgentName, options = {}) {
+  const owner = normalizeLoopOwnerAgent(ownerAgent).toLowerCase();
+  const task = loopTasks.find(
+    (entry) => entry.id === id && normalizeLoopOwnerAgent(entry.ownerAgent).toLowerCase() === owner
+  );
   if (!task) {
     return false;
   }
@@ -11829,6 +14262,9 @@ function toggleLoopPaused(id) {
     }
   } else {
     task.paused = true;
+  }
+  if (options.persist !== false && normalizeLoopOwnerAgent(task.ownerAgent) !== "main") {
+    persistNamedAgentLoops().catch(() => {});
   }
   return true;
 }
@@ -11888,6 +14324,7 @@ function renderLoopsBuffer() {
   const panelWidth = Math.min(Math.max(60, Math.floor(cols * 0.85)), cols);
   const panelLeft = Math.max(0, Math.floor((cols - panelWidth) / 2));
   const visibleCount = getLoopsVisibleCount();
+  const tasks = getLoopTasksForAgent();
   updateLoopsSelectionState();
 
   if (!hasInitializedScreen) {
@@ -11926,19 +14363,19 @@ function renderLoopsBuffer() {
     frameRows[y] = { text: `${left}${clipped}${right}`.slice(0, cols), color };
   };
 
-  setPanelRow(0, `Loops (${loopTasks.length} scheduled)`);
+  setPanelRow(0, `Loops — ${activeAgentName} (${tasks.length} scheduled)`);
 
   if (loopsMessage) {
     setPanelRow(1, loopsMessage, PLACEHOLDER_COLOR);
   }
 
-  if (loopTasks.length === 0) {
+  if (tasks.length === 0) {
     setPanelRow(2, "no scheduled loops - use /loop <interval> <prompt>", PLACEHOLDER_COLOR);
   } else {
-    const end = Math.min(loopTasks.length, loopsScroll + visibleCount);
+    const end = Math.min(tasks.length, loopsScroll + visibleCount);
     for (let i = loopsScroll; i < end; i += 1) {
       const row = 2 + (i - loopsScroll) + (loopsMessage ? 1 : 0);
-      const task = loopTasks[i];
+      const task = tasks[i];
       const marker = i === loopsSelected ? "●" : "○";
       const intervalLabel = task.paused
         ? "paused"
@@ -11954,6 +14391,8 @@ function renderLoopsBuffer() {
         setPanelRow(row, text, BLUE_COLOR);
       } else if (task.paused) {
         setPanelRow(row, text, PLACEHOLDER_COLOR);
+      } else {
+        setPanelRow(row, text);
       }
     }
   }
@@ -12382,6 +14821,12 @@ function isRenderableChatEntry(entry) {
 
   const role = typeof entry?.role === "string" ? entry.role : "";
   if (role === "system") {
+    return false;
+  }
+
+  // Compaction summaries are internal context handoffs. Older sessions may
+  // predate the hidden flag, so detect the marker as a compatibility guard.
+  if (isCompactionSummaryEntry(entry)) {
     return false;
   }
 
@@ -12879,6 +15324,14 @@ function isAssistantThinking() {
   return pendingAssistantRequests > 0;
 }
 
+function getActiveSessionCompactionPromise(agentName = activeAgentName) {
+  const operation = activeSessionCompaction;
+  if (!operation || operation.agentName !== agentName) return null;
+  return operation.promise && typeof operation.promise.then === "function"
+    ? operation.promise
+    : null;
+}
+
 function addQueuedBusyPrompt(text) {
   const normalized = String(text || "").replace(/\s+/g, " ").trim();
   if (!normalized) return null;
@@ -12952,14 +15405,16 @@ function styleQueuedBusyHeaderLine(line) {
 }
 
 function getMainStatusRowCount() {
-  const baseVisible = isAssistantThinking() || isMcpStartupStatusVisible() || solveStartupActive;
+  const baseVisible = isCurrentChatThinking() || isMcpStartupStatusVisible() || solveStartupActive;
   if (!baseVisible) return 0;
-  const queuedRows = getQueuedBusyPromptStatusLines(process.stdout.columns || 80).length;
+  const queuedRows = activeAgentName === "main"
+    ? getQueuedBusyPromptStatusLines(process.stdout.columns || 80).length
+    : 0;
   return STATUS_BAR_ROWS + (queuedRows > 0 ? 1 + queuedRows : 0);
 }
 
 function getMainStatusInputGapRows(cols = process.stdout.columns || 80) {
-  return getQueuedBusyPromptStatusLines(cols).length > 0 ? 0 : STATUS_INPUT_GAP;
+  return activeAgentName === "main" && getQueuedBusyPromptStatusLines(cols).length > 0 ? 0 : STATUS_INPUT_GAP;
 }
 
 function isMcpStartupStatusVisible() {
@@ -12981,12 +15436,15 @@ function cancelAndClearActiveToolRun() {
 
 function resetStopRequested() {
   stopRequested = false;
+  stopNoticeEmitted = false;
+  stopNoticeOverride = "";
 }
 
-function handleStopRequest() {
+function handleStopRequest(options = {}) {
   if (stopRequested) {
     return;
   }
+  stopNoticeOverride = String(options.notice || "");
   stopRequested = true;
 
   const toolRunning =
@@ -13001,31 +15459,15 @@ function handleStopRequest() {
     return;
   }
 
-  // Nothing is mid-process: write the stop notice immediately.
-  const text = "■ Stopped by user (Esc pressed).";
-  const idx = pendingAssistantMessageIndex;
-  const candidate =
-    idx >= 0 && idx < messages.length && messages[idx]?.role === "assistant"
-      ? messages[idx]
-      : null;
-  if (candidate && candidate.ephemeral === true) {
-    candidate.content = text;
-    candidate.ephemeral = false;
-    candidate.role = "assistant";
-    pendingAssistantMessageIndex = -1;
-  } else {
-    messages.push({ role: "assistant", content: text });
-  }
-  appendHistoryEntry("assistant", text);
-  cancelAndClearActiveToolRun();
-  scrollChatToBottom();
-  forceFullClearOnNextRender = true;
-  markDirty();
-  renderFrame(true);
+  activeLlmAbortController?.abort();
+  emitStopNotice();
 }
 
 function emitStopNotice() {
-  const text = "■ Stopped by user (Esc pressed).";
+  if (stopNoticeEmitted) return false;
+  stopNoticeEmitted = true;
+  const text = stopNoticeOverride || "■ Stopped by user (Esc pressed).";
+  stopNoticeOverride = "";
   const idx = pendingAssistantMessageIndex;
   const candidate =
     idx >= 0 && idx < messages.length && messages[idx]?.role === "assistant"
@@ -13045,6 +15487,7 @@ function emitStopNotice() {
   forceFullClearOnNextRender = true;
   markDirty();
   renderFrame(true);
+  return true;
 }
 
 function getViewportChatInputGapRows(
@@ -13085,6 +15528,15 @@ function getStatusBarText() {
       ? Math.max(0, Math.floor((Date.now() - clarifyingStartedAt) / 1000))
       : 0;
     return `${frame} ${BOLD_WHITE}Clarifying${RESET_COLOR}${PLACEHOLDER_COLOR} (${elapsed}s)${RESET_COLOR}`;
+  }
+
+  if (activeAgentName !== "main") {
+    const agent = getNamedAgentByName();
+    if (getNamedAgentStatus(agent) !== "running") return "";
+    const frame = SPINNER_FRAMES[spinnerFrameIndex % SPINNER_FRAMES.length];
+    const startedAt = Number(agent?.task_started_at || agent?.updated_at || 0) * 1000;
+    const elapsed = startedAt > 0 ? Math.max(0, Math.floor((Date.now() - startedAt) / 1000)) : 0;
+    return `${frame} ${applyShineEffect(`${agent?.name || "Agent"} working...`, shineFrameIndex, 7)} (${elapsed}s)`;
   }
 
   if (!isAssistantThinking()) {
@@ -13141,7 +15593,7 @@ function applyShineEffect(text, frameIndex, windowWidth) {
 
 function isStatusAnimationNeeded() {
   if (activeBuffer === "main") {
-    return isAssistantThinking() || clarifyingActive || isMcpStartupStatusVisible() || solveStartupActive;
+    return isCurrentChatThinking() || clarifyingActive || isMcpStartupStatusVisible() || solveStartupActive;
   }
   if (activeBuffer === "kernels") {
     return solveStartupActive;
@@ -13740,7 +16192,7 @@ function getChatViewportInfo(cols, rows) {
   const menuBlockHeight = footerBlockHeight + (menuHeight > 0 ? MENU_INPUT_GAP + menuHeight : 0);
   const frameTop = Math.max(0, rows - activeBottomPadding - menuBlockHeight - frameHeight);
   const chatAreaHeight = Math.max(0, frameTop - chatInputGapRows);
-  const allChatLines = buildChatVisualLines(cols);
+  const allChatLines = buildChatVisualLines(cols, getActiveChatEntries());
   const maxOffset = Math.max(0, allChatLines.length - chatAreaHeight);
   return { maxOffset };
 }
@@ -14476,6 +16928,78 @@ function renderSessionsBuffer() {
   dirty = false;
 }
 
+function renderAgentsBuffer() {
+  process.stdout.write(HIDE_CURSOR);
+  const rows = process.stdout.rows || 24;
+  const cols = process.stdout.columns || 80;
+  const panelWidth = Math.min(Math.max(52, Math.floor(cols * 0.82)), cols);
+  const panelLeft = Math.max(0, Math.floor((cols - panelWidth) / 2));
+  const visibleCount = Math.max(1, Math.min(20, rows - 4));
+  updateAgentsSelectionState();
+  const entries = getAgentsListEntries();
+
+  if (!hasInitializedScreen || forceFullClearOnNextRender) {
+    readline.cursorTo(process.stdout, 0, 0);
+    readline.clearScreenDown(process.stdout);
+    hasInitializedScreen = true;
+    forceFullClearOnNextRender = false;
+    lastAgentsRenderedRows = [];
+  }
+  if (lastAgentsRenderedCols !== cols || lastAgentsRenderedHeight !== rows) {
+    lastAgentsRenderedRows = [];
+    lastAgentsRenderedCols = cols;
+    lastAgentsRenderedHeight = rows;
+  }
+
+  const frameRows = Array.from({ length: rows }, () => ({ text: " ".repeat(cols), styledText: "" }));
+  const setRow = (y, plain, styled = "") => {
+    if (y < 0 || y >= rows) return;
+    const clipped = String(plain || "").slice(0, panelWidth).padEnd(panelWidth, " ");
+    const left = " ".repeat(panelLeft);
+    const right = " ".repeat(Math.max(0, cols - panelLeft - panelWidth));
+    frameRows[y] = {
+      text: `${left}${clipped}${right}`.slice(0, cols),
+      styledText: styled ? `${left}${styled}${right}` : "",
+    };
+  };
+
+  setRow(0, agentsSearch || "Type to search", agentsSearch ? "" : `${PLACEHOLDER_COLOR}${"Type to search".padEnd(panelWidth, " ")}${RESET_COLOR}`);
+  setRow(1, "");
+  const end = Math.min(entries.length, agentsScroll + visibleCount);
+  for (let index = agentsScroll; index < end; index += 1) {
+    const agent = entries[index];
+    const selected = index === agentsSelected;
+    const current = agent.current === true;
+    const marker = selected ? "›" : current ? "●" : "○";
+    const status = String(agent.status || "idle").padEnd(8, " ");
+    const plain = `${marker} ${status} ${agent.name}`.slice(0, panelWidth).padEnd(panelWidth, " ");
+    const background = index % 2 === 1 ? SESSION_EVEN_BG_COLOR : "";
+    const statusColor = agent.status === "running"
+      ? SESSION_MARKER_FG_COLOR
+      : agent.status === "stopped" ? RED_COLOR : PLACEHOLDER_COLOR;
+    const foreground = selected || current ? SESSION_SELECTED_FG_COLOR : "";
+    const styled = `${background}${selected ? SESSION_MARKER_FG_COLOR : current ? SESSION_MARKER_FG_COLOR : PLACEHOLDER_COLOR}${marker}${RESET_COLOR}` +
+      `${background} ${statusColor}${status}${RESET_COLOR}` +
+      `${background}${foreground} ${String(agent.name).slice(0, Math.max(0, panelWidth - 12))}${RESET_COLOR}`;
+    setRow(2 + index - agentsScroll, plain, `${styled}${" ".repeat(Math.max(0, panelWidth - stripAnsiSgr(styled).length))}`);
+  }
+  if (agentsMessage) setRow(Math.max(2, rows - 2), agentsMessage, `${PLACEHOLDER_COLOR}${agentsMessage}${RESET_COLOR}`);
+  setRow(rows - 1, "Enter: switch session  Esc: return", `${PLACEHOLDER_COLOR}${"Enter: switch session  Esc: return"}${RESET_COLOR}`);
+
+  for (let y = 0; y < rows; y += 1) {
+    const next = frameRows[y];
+    const previous = lastAgentsRenderedRows[y];
+    if (previous && previous.text === next.text && previous.styledText === next.styledText) continue;
+    if (next.styledText) writeStyledLine(y, next.text, next.styledText, cols);
+    else writeLine(y, next.text, cols);
+  }
+  lastAgentsRenderedRows = frameRows;
+  const cursorX = Math.min(panelLeft + (agentsSearch ? agentsSearch.length : 0), Math.max(0, cols - 1));
+  readline.cursorTo(process.stdout, cursorX, 0);
+  process.stdout.write(SHOW_CURSOR);
+  dirty = false;
+}
+
 function renderProvidersBuffer() {
   process.stdout.write(HIDE_CURSOR);
 
@@ -14681,6 +17205,10 @@ function renderFrame(forceChatRefresh = false) {
     renderSessionsBuffer();
     return;
   }
+  if (activeBuffer === "agents") {
+    renderAgentsBuffer();
+    return;
+  }
   if (activeBuffer === "providers") {
     renderProvidersBuffer();
     return;
@@ -14732,7 +17260,7 @@ function renderFrame(forceChatRefresh = false) {
   const frameHeight = inputVisualLines.length;
   const cursorMetrics = getInputCursorMetrics(cols);
   const statusText = getStatusBarText();
-  const queuedStatusLines = getQueuedBusyPromptStatusLines(cols);
+  const queuedStatusLines = activeAgentName === "main" ? getQueuedBusyPromptStatusLines(cols) : [];
   const statusLines = statusText
     ? [statusText, ...(queuedStatusLines.length > 0 ? ["", ...queuedStatusLines] : [])]
     : [];
@@ -14813,10 +17341,11 @@ function renderFrame(forceChatRefresh = false) {
   const chatAreaHeight = APPEND_CHAT_TO_SCROLLBACK
     ? 0
     : Math.max(0, frameTop - chatInputGapRows);
-  const allChatLines = APPEND_CHAT_TO_SCROLLBACK ? [] : buildChatVisualLines(cols);
+  const activeChatEntries = getActiveChatEntries();
+  const allChatLines = APPEND_CHAT_TO_SCROLLBACK ? [] : buildChatVisualLines(cols, activeChatEntries);
   const currentRenderableMessageCount = APPEND_CHAT_TO_SCROLLBACK
     ? 0
-    : messages.filter((entry) => isRenderableChatEntry(entry)).length;
+    : activeChatEntries.filter((entry) => isRenderableChatEntry(entry)).length;
   const maxScrollOffset = APPEND_CHAT_TO_SCROLLBACK
     ? 0
     : Math.max(0, allChatLines.length - chatAreaHeight);
@@ -15310,7 +17839,11 @@ function appendSubmittedUserMessage(submission) {
   }
   submission.appended = true;
   ensureSystemMessageAtTop();
-  messages.push({ role: "user", content: submission.resolvedContent });
+  const userEntry = { role: "user", content: submission.resolvedContent };
+  if (!currentSessionTitle && isSessionTitleUserEntry(userEntry)) {
+    currentSessionTitle = normalizeSessionTitle(userEntry.content);
+  }
+  messages.push(userEntry);
   appendHistoryEntry("user", submission.resolvedContent);
   scrollChatToBottom();
   return true;
@@ -15860,6 +18393,17 @@ function runAppendSelfTest() {
       out("SELFTEST_FAIL: complete execute block classification\n");
       return 1;
     }
+    const executeWithFalseClaim = `${completeExecute}${NL}${NL}hey, it worked`;
+    const recoveredEntries = extractAllPythonCodeBlockEntries(executeWithFalseClaim);
+    if (
+      recoveredEntries.length !== 1 ||
+      recoveredEntries[0].complete !== true ||
+      recoveredEntries[0].code !== "print(1)" ||
+      normalizeAssistantToolUseResponse(executeWithFalseClaim) !== completeExecute
+    ) {
+      out("SELFTEST_FAIL: execute block with trailing result claim was not recovered and normalized\n");
+      return 1;
+    }
     const truncatedExecute = BT + "execute" + NL + "print(";
     const truncatedEntries = extractAllPythonCodeBlockEntries(truncatedExecute);
     if (
@@ -16125,6 +18669,8 @@ function runFormatSelfTest() {
     if (
       !COMMANDS.some((command) => command.name === "/settings") ||
       !COMMANDS.some((command) => command.name === "/init") ||
+      !COMMANDS.some((command) => command.name === "/agent") ||
+      !COMMANDS.some((command) => command.name === "/list-agents") ||
       COMMANDS.some((command) => command.name === "/set") ||
       !INIT_CONTRIBUTOR_GUIDE_PROMPT.includes("Generate a file named AGENTS.md") ||
       !INIT_CONTRIBUTOR_GUIDE_PROMPT.includes('Title the document "Repository Guidelines"') ||
@@ -16138,6 +18684,174 @@ function runFormatSelfTest() {
       capitalizeSettingLabel("external thinking") !== "External thinking"
     ) {
       out(`FORMAT_FAIL: runtime settings buffer is incomplete: ${JSON.stringify(runtimeSettingKeys)}\n`);
+      return 1;
+    }
+    const namedAgentDisplayFixture = namedAgentMessagesForDisplay({
+      messages: [
+        { role: "system", content: "hidden system" },
+        { role: "user", content: "inspect it" },
+        { role: "assistant", content: "````execute\nprint(1)\n````" },
+        { role: "user", content: "[tool code_execution result]\n{\"ok\":true}" },
+        {
+          role: "assistant",
+          content: "done",
+          reasoning_details: [{ type: "reasoning.text", text: "worker thought", format: "unknown" }],
+        },
+        { role: "user", content: "[tool set_reminder result]\nsay hello" },
+      ],
+      queuedTasks: ["next task"],
+    });
+    if (
+      normalizeNamedAgentName("worker-1") !== "worker-1" ||
+      normalizeNamedAgentName("bad agent") !== "" ||
+      namedAgentDisplayFixture.some((entry) => entry.role === "system") ||
+      !namedAgentDisplayFixture.some((entry) => entry.role === "tool" && entry.content.includes('"ok":true')) ||
+      !namedAgentDisplayFixture.some(
+        (entry) =>
+          entry.role === "tool" &&
+          entry.name === "set_reminder" &&
+          entry.toolInput === "scheduled reminder" &&
+          entry.content === "say hello" &&
+          entry.toolOk === true
+      ) ||
+      !namedAgentDisplayFixture.some(
+        (entry) => entry.role === "assistant" && extractReasoningDisplayText(entry.reasoningDetails).includes("worker thought")
+      ) ||
+      !namedAgentDisplayFixture.some((entry) => entry.queued === true && entry.content === "next task")
+    ) {
+      out("FORMAT_FAIL: named agent session normalization is incorrect\n");
+      return 1;
+    }
+    const savedNamedAgentsForRuntime = namedAgents;
+    const savedActiveAgentForRuntime = activeAgentName;
+    const savedActiveNamedMessagesForRuntime = activeNamedAgentMessages;
+    const mainModeBeforeNamedRuntime = collaborationMode;
+    const mainModelBeforeNamedRuntime = selectedModel;
+    let namedRuntimeIsolationOk = false;
+    try {
+      const workerRuntimeFixture = {
+        kind: "named-agent",
+        name: "runtime-worker",
+        model: "worker-model",
+        reasoning_enabled: false,
+        status: "idle",
+        messages: [
+          { role: "system", content: "old prompt" },
+          { role: "user", content: "worker task" },
+        ],
+        session_runtime: {
+          model: "worker-model",
+          collaboration_mode: "plan",
+          reasoning_by_model: { "worker-model": false },
+          settings: {
+            thinking_blocks: true,
+            external_thinking: true,
+            thinking_effort: "xhigh",
+            context_window: 256000,
+            request_timeout_ms: 120000,
+          },
+          context_left_by_model: { "worker-model": 37 },
+          cache_telemetry_by_model: {
+            "worker-model": { cachePercent: 82, fingerprint: "worker-cache" },
+          },
+        },
+      };
+      namedAgents = [workerRuntimeFixture];
+      activeAgentName = "runtime-worker";
+      activeNamedAgentMessages = namedAgentMessagesForDisplay(workerRuntimeFixture);
+      const workerSettings = getRuntimeSettings();
+      const workerPrompt = buildNamedAgentSystemPrompt(
+        workerRuntimeFixture,
+        normalizeNamedAgentSessionRuntime(workerRuntimeFixture)
+      );
+      const workerFooter = getMainFooterText();
+      namedRuntimeIsolationOk =
+        getActiveSessionModel() === "worker-model" &&
+        getActiveCollaborationMode() === "plan" &&
+        getActiveReasoningEnabled() === false &&
+        workerSettings.find((setting) => setting.key === "thinking_blocks")?.value === true &&
+        shouldShowThinkingBlocks() === false &&
+        workerSettings.find((setting) => setting.key === "thinking_effort")?.value === "xhigh" &&
+        workerSettings.find((setting) => setting.key === "context_window")?.value === 256000 &&
+        workerSettings.find((setting) => setting.key === "request_timeout")?.value === 120000 &&
+        workerFooter.includes("PLAN | Agent: runtime-worker") &&
+        workerFooter.includes("37% context left") &&
+        workerFooter.includes("cache 82%") &&
+        workerPrompt.includes("PLAN MODE (MANDATORY)") &&
+        !workerPrompt.includes("write_file") &&
+        collaborationMode === mainModeBeforeNamedRuntime &&
+        selectedModel === mainModelBeforeNamedRuntime;
+    } finally {
+      namedAgents = savedNamedAgentsForRuntime;
+      activeAgentName = savedActiveAgentForRuntime;
+      activeNamedAgentMessages = savedActiveNamedMessagesForRuntime;
+    }
+    if (!namedRuntimeIsolationOk) {
+      out("FORMAT_FAIL: named agent runtime state leaked into the main session\n");
+      return 1;
+    }
+    const planToBuildFixture = {
+      name: "plan-round-trip",
+      session_uid: "plan-round-trip-session",
+      model: "worker-model",
+      collaboration_mode: "plan",
+      messages: [{ role: "system", content: "old plan prompt" }],
+      session_runtime: {
+        model: "worker-model",
+        collaboration_mode: "plan",
+        reasoning_by_model: { "worker-model": true },
+        settings: normalizeSessionRuntimeSettings(null),
+      },
+      runtime: { collaboration_mode: "plan" },
+    };
+    const buildRuntimeFixture = normalizeNamedAgentSessionRuntime(planToBuildFixture);
+    buildRuntimeFixture.collaboration_mode = "build";
+    applyNamedAgentSessionRuntime(planToBuildFixture, buildRuntimeFixture);
+    if (
+      normalizeNamedAgentSessionRuntime(planToBuildFixture).collaboration_mode !== "build" ||
+      planToBuildFixture.collaboration_mode !== "build" ||
+      planToBuildFixture.session_runtime?.collaboration_mode !== "build" ||
+      planToBuildFixture.runtime?.collaboration_mode !== "build" ||
+      String(planToBuildFixture.messages?.[0]?.content || "").includes("PLAN MODE (MANDATORY)")
+    ) {
+      out("FORMAT_FAIL: named agent could not transition from plan mode back to build mode\n");
+      return 1;
+    }
+    const resumedTimestampFixture = buildResumedNamedAgentRecord(
+      { id: "stable-agent-id" },
+      {
+        id: "archived-id",
+        name: "worker-a",
+        workspace: WORKSPACE_ROOT,
+        created_at: 100,
+        updated_at: 125,
+        messages: [],
+      },
+      "worker-a"
+    );
+    if (
+      resumedTimestampFixture.id !== "stable-agent-id" ||
+      resumedTimestampFixture.updated_at !== 125 ||
+      resumedTimestampFixture.status !== "idle"
+    ) {
+      out("FORMAT_FAIL: resuming a named-agent session reset its activity timestamp\n");
+      return 1;
+    }
+    const anchoredNoticeFixture = mergeNamedAgentUiNotices(
+      [
+        { role: "user", content: "say kral" },
+        { role: "assistant", content: "kral" },
+        { role: "user", content: "say kral again" },
+        { role: "assistant", content: "kral again" },
+        { role: "user", content: "queued", queued: true },
+      ],
+      [{ role: "assistant", content: "Scheduled loop", afterMessageCount: 2 }]
+    );
+    if (
+      anchoredNoticeFixture.map((entry) => entry.content).join("|") !==
+        "say kral|kral|Scheduled loop|say kral again|kral again|queued"
+    ) {
+      out("FORMAT_FAIL: named-agent UI notices were not anchored in transcript order\n");
       return 1;
     }
     const thinkingPayload = applyThinkingRequestSettings({}, "self-test-model", true);
@@ -16165,20 +18879,19 @@ function runFormatSelfTest() {
       out("FORMAT_FAIL: external thinking prompt activation is incorrect\n");
       return 1;
     }
-    const savedShowThinkingBlocks = nexusConfig.show_thinking_blocks;
+    const savedShowThinkingBlocks = getMainSessionRuntimeSettings().thinking_blocks;
     const reasoningDisplayFixture = [{
       role: "assistant",
       content: "visible answer",
       reasoningDetails: [{ type: "reasoning.text", text: "private reasoning trace" }],
     }];
-    nexusConfig.show_thinking_blocks = false;
+    getMainSessionRuntimeSettings().thinking_blocks = false;
     const hiddenReasoningLines = buildChatVisualLines(80, reasoningDisplayFixture)
       .map((line) => stripAnsiSgr(line.text));
-    nexusConfig.show_thinking_blocks = true;
+    getMainSessionRuntimeSettings().thinking_blocks = true;
     const shownReasoningLines = buildChatVisualLines(80, reasoningDisplayFixture)
       .map((line) => stripAnsiSgr(line.text));
-    if (savedShowThinkingBlocks === undefined) delete nexusConfig.show_thinking_blocks;
-    else nexusConfig.show_thinking_blocks = savedShowThinkingBlocks;
+    getMainSessionRuntimeSettings().thinking_blocks = savedShowThinkingBlocks;
     if (
       hiddenReasoningLines.some((line) => line.includes("private reasoning trace")) ||
       !hiddenReasoningLines.some((line) => line.includes("visible answer")) ||
@@ -16199,14 +18912,40 @@ function runFormatSelfTest() {
     );
     const sessionMetadata = parseSessionListMetadata([
       JSON.stringify({ role: "system", content: "hidden", sessionWorkspace: WORKSPACE_ROOT }),
-      JSON.stringify({ role: "user", content: "first user\nmessage" }),
+      JSON.stringify({ role: "user", content: "_summary\ninternal handoff" }),
+      JSON.stringify({ role: "user", content: "[orchestrator]\ninternal context" }),
+      JSON.stringify({ role: "user", content: "[tool code_execution result]\ninternal result" }),
+      JSON.stringify({ role: "user", content: "first user\nmessage", excludeFromRequest: true }),
       JSON.stringify({ role: "user", content: "second user message" }),
     ].join("\n"));
+    const persistedTitleMetadata = parseSessionListMetadata([
+      JSON.stringify({
+        role: "user",
+        content: "_summary\nonly compacted context remains",
+        sessionWorkspace: WORKSPACE_ROOT,
+        sessionTitle: "original first message",
+      }),
+    ].join("\n"));
+    const namedSessionTitleFixture = namedAgentRecordToSessionEntry(
+      {
+        name: "title-worker",
+        workspace: WORKSPACE_ROOT,
+        messages: [
+          { role: "user", content: "_summary\nnamed internal handoff" },
+          { role: "user", content: "named first message", exclude_from_request: true },
+          { role: "user", content: "named second message" },
+        ],
+      },
+      "title-worker.json",
+      true
+    );
     if (
       !sessionRow.startsWith("› 4m ago") ||
       !sessionRow.endsWith("...") ||
       sessionRow.length > 34 ||
-      sessionMetadata.firstUserMessage !== "first user message"
+      sessionMetadata.firstUserMessage !== "first user message" ||
+      persistedTitleMetadata.firstUserMessage !== "original first message" ||
+      namedSessionTitleFixture.firstUserMessage !== "named first message"
     ) {
       out(`FORMAT_FAIL: session list time/title layout is incorrect: ${JSON.stringify(sessionRow)}\n`);
       return 1;
@@ -16304,9 +19043,35 @@ function runFormatSelfTest() {
     }
     if (
       shouldTransitionCommandDirectlyToAltBuffer("/loop", "") ||
-      !shouldTransitionCommandDirectlyToAltBuffer("/loops", "")
+      !shouldTransitionCommandDirectlyToAltBuffer("/loops", "") ||
+      getResumeBufferName("main") !== "sessions" ||
+      getResumeBufferName("worker-a") !== "sessions"
     ) {
-      out("FORMAT_FAIL: /loop usage and /loops navigation transitions are incorrect\n");
+      out("FORMAT_FAIL: loop/resume navigation transitions are incorrect\n");
+      return 1;
+    }
+    const hadDisabledPayloadReasoning = Object.prototype.hasOwnProperty.call(
+      reasoningEnabledByModel,
+      "disabled-self-test-model"
+    );
+    const savedDisabledPayloadReasoning = reasoningEnabledByModel["disabled-self-test-model"];
+    reasoningEnabledByModel["disabled-self-test-model"] = false;
+    const disabledThinkingPayload = applyThinkingRequestSettings(
+      {},
+      "disabled-self-test-model",
+      false
+    );
+    if (hadDisabledPayloadReasoning) {
+      reasoningEnabledByModel["disabled-self-test-model"] = savedDisabledPayloadReasoning;
+    } else {
+      delete reasoningEnabledByModel["disabled-self-test-model"];
+    }
+    if (
+      disabledThinkingPayload.reasoning?.enabled !== false ||
+      disabledThinkingPayload.thinking?.type !== "disabled" ||
+      Object.prototype.hasOwnProperty.call(disabledThinkingPayload, "reasoning_effort")
+    ) {
+      out(`FORMAT_FAIL: thinking off did not explicitly disable provider reasoning: ${JSON.stringify(disabledThinkingPayload)}\n`);
       return 1;
     }
     const previousCommandQuery = commandBufferQuery;
@@ -16506,6 +19271,8 @@ function runFormatSelfTest() {
     });
     if (
       !deferredPrompt.includes("tool_search") ||
+      !deferredPrompt.includes(`Current date: ${NEXUS_START_DATE}`) ||
+      !deferredPrompt.includes(`Operating system: ${NEXUS_OPERATING_SYSTEM}`) ||
       !deferredPrompt.includes("list_skills()") ||
       !deferredPrompt.includes("get_skill(name") ||
       !deferredPrompt.includes("SKILL USE (MUST FOLLOW)") ||
@@ -16536,6 +19303,11 @@ function runFormatSelfTest() {
       !deferredPrompt.includes("A spawn execute block must only launch workers") ||
       !deferredPrompt.includes("Never call join/await/wait_subagents, sleep, poll files") ||
       !deferredPrompt.includes("Workers continue in the background after the block ends") ||
+      !deferredPrompt.includes("EXECUTION RESULT BOUNDARY (MANDATORY)") ||
+      !deferredPrompt.includes("only requests execution") ||
+      !deferredPrompt.includes("Wait for the subsequent code_execution tool result") ||
+      !deferredPrompt.includes("A successful wrapper does not make an inner {ok: false} operation successful") ||
+      !deferredPrompt.includes("treat the block as not executed and its outcome as unknown") ||
       !workspaceGuidePrompt.includes("WORKSPACE GUIDE (MUST FOLLOW)") ||
       !workspaceGuidePrompt.includes("loaded from AGENTS.md when this session started") ||
       !workspaceGuidePrompt.includes("Run `npm test` before submitting changes.") ||
@@ -16612,8 +19384,12 @@ function runFormatSelfTest() {
     );
     if (
       !planModePrompt.includes("PLAN MODE (MANDATORY)") ||
+      !planModePrompt.includes(`Current date: ${NEXUS_START_DATE}`) ||
+      !planModePrompt.includes(`Operating system: ${NEXUS_OPERATING_SYSTEM}`) ||
       !planModePrompt.includes("SKILL USE (MUST FOLLOW)") ||
       !planModePrompt.includes("Do not substitute an ad-hoc library workflow without checking skills first") ||
+      !planModePrompt.includes("EXECUTION RESULT BOUNDARY (MANDATORY)") ||
+      !planModePrompt.includes("Wait for the subsequent code_execution tool result") ||
       !planModePrompt.includes("get_file_content") ||
       !planModePrompt.includes("harness_overview()") ||
       !planModePrompt.includes("web_search(query") ||
@@ -16742,7 +19518,17 @@ function runFormatSelfTest() {
         role: "tool",
         content: "new raw result",
         name: "code_execution",
+        sessionModel: "resumed-model",
         sessionMode: "plan",
+        sessionRuntimeSettings: {
+          thinking_blocks: false,
+          external_thinking: true,
+          thinking_effort: "max",
+          context_window: 512000,
+          request_timeout_ms: 300000,
+        },
+        sessionContextLeftByModel: { "resumed-model": 44 },
+        sessionCacheTelemetryByModel: { "resumed-model": { cachePercent: 91 } },
         uiKind: "plan",
         uiContent: "## Plan\n\n🗹 Old task",
       }),
@@ -16753,9 +19539,39 @@ function runFormatSelfTest() {
       resumedPlanHistory[0].hidden !== true ||
       resumedPlanHistory[1].hidden === true ||
       resumedPlanHistory[1].uiContent !== "## Plan\n\n🗹 Old task" ||
-      resumedPlanSession.sessionMode !== "plan"
+      resumedPlanSession.sessionMode !== "plan" ||
+      resumedPlanSession.sessionModel !== "resumed-model" ||
+      resumedPlanSession.sessionRuntimeSettings?.thinking_effort !== "max" ||
+      resumedPlanSession.sessionRuntimeSettings?.context_window !== 512000 ||
+      resumedPlanSession.sessionContextLeftByModel?.["resumed-model"] !== 44 ||
+      resumedPlanSession.sessionCacheTelemetryByModel?.["resumed-model"]?.cachePercent !== 91
     ) {
       out("FORMAT_FAIL: resumed session should show only the newest plan UI\n");
+      return 1;
+    }
+
+    const resumedCompactionSession = parseSessionHistory([
+      JSON.stringify({
+        role: "assistant",
+        content: "Compacting context...",
+        excludeFromRequest: true,
+      }),
+      JSON.stringify({ role: "user", content: "what was we talking about" }),
+      JSON.stringify({
+        role: "assistant",
+        content: "Compaction complete. Summary (1095 chars) plus the most recent context retained.",
+        excludeFromRequest: true,
+      }),
+    ].join("\n"));
+    const resumedCompactionText = resumedCompactionSession.loadedMessages.map(
+      (entry) => entry.content
+    );
+    if (
+      resumedCompactionText[0] !== "Compacting context..." ||
+      !resumedCompactionText[1]?.startsWith("Compaction complete.") ||
+      resumedCompactionText[2] !== "what was we talking about"
+    ) {
+      out("FORMAT_FAIL: resumed compaction must place queued user messages after completion\n");
       return 1;
     }
 
@@ -16886,7 +19702,26 @@ function runFormatSelfTest() {
 // ---------------------------------------------------------------------------
 async function runLoopSelfTest() {
   const out = (s) => process.stdout.write(s);
+  namedLoopPersistenceSuspended = true;
   try {
+    let transientRenameAttempts = 0;
+    await renameAtomicFileWithRetry("temporary", "destination", {
+      maxAttempts: 4,
+      wait: async () => {},
+      rename: async () => {
+        transientRenameAttempts += 1;
+        if (transientRenameAttempts < 3) {
+          const error = new Error("locked");
+          error.code = "EPERM";
+          throw error;
+        }
+      },
+    });
+    if (transientRenameAttempts !== 3) {
+      out("LOOP_FAIL: transient atomic rename was not retried\n");
+      return 1;
+    }
+
     // Interval token parsing
     const cases = [
       ["5m", 5],
@@ -16945,6 +19780,8 @@ async function runLoopSelfTest() {
 
     // Schedule math: a task created with a 5m interval gets ~5min window
     const savedTasks = loopTasks;
+    const savedMessages = [...messages];
+    const savedActiveAgentNameForPersistence = activeAgentName;
     loopTasks = [];
     const task = scheduleLoopTask(5, "hello", {});
     if (task.intervalMs !== 5 * 60 * 1000) {
@@ -16967,6 +19804,156 @@ async function runLoopSelfTest() {
       out("LOOP_FAIL: removeLoopTask failed\n");
       return 1;
     }
+    const ownedTask = scheduleLoopTask(1, "worker loop", { ownerAgent: "worker-a" });
+    if (
+      ownedTask.ownerAgent !== "worker-a" ||
+      getLoopTasksForAgent("main").length !== 1 ||
+      getLoopTasksForAgent("worker-a").length !== 1
+    ) {
+      out("LOOP_FAIL: loop ownership was not isolated by agent\n");
+      return 1;
+    }
+    namedAgentUiNotices.set("worker-a", [{
+      role: "assistant",
+      content: "Scheduled loop for worker-a",
+      afterMessageCount: 1,
+      persisted: true,
+    }]);
+    const ownedSessionSchedules = captureNamedAgentSessionSchedules("worker-a");
+    removeLoopsForAgent("worker-a", { stopRunning: false, persist: false });
+    namedAgentUiNotices.delete("worker-a");
+    const restoredOwnedLoopCount = restoreNamedAgentSessionSchedules("worker-a", ownedSessionSchedules);
+    if (
+      restoredOwnedLoopCount !== 1 ||
+      getLoopTasksForAgent("worker-a")[0]?.id !== ownedTask.id ||
+      namedAgentUiNotices.get("worker-a")?.[0]?.content !== "Scheduled loop for worker-a"
+    ) {
+      out("LOOP_FAIL: named-agent session did not restore its loops/notices\n");
+      return 1;
+    }
+    namedAgentUiNotices.delete("worker-a");
+    if (
+      removeLoopTask(ownedTask.id, { ownerAgent: "main", stopRunning: false }) ||
+      !removeLoopTask(ownedTask.id, { ownerAgent: "worker-a", stopRunning: false })
+    ) {
+      out("LOOP_FAIL: agent-scoped loop cancellation crossed owners\n");
+      return 1;
+    }
+    const selectedOwnedTask = scheduleLoopTask(1, "selected worker loop", { ownerAgent: "worker-a" });
+    const savedActiveAgentName = activeAgentName;
+    const savedLoopsSelected = loopsSelected;
+    activeAgentName = "worker-a";
+    loopsSelected = 0;
+    if (getSelectedLoopTaskForAgent()?.id !== selectedOwnedTask.id) {
+      out("LOOP_FAIL: loops buffer selection did not resolve the active agent's task\n");
+      return 1;
+    }
+    activeAgentName = savedActiveAgentName;
+    loopsSelected = savedLoopsSelected;
+    removeLoopTask(selectedOwnedTask.id, { ownerAgent: "worker-a", stopRunning: false });
+    const beforeNamedDurabilityTest = [...loopTasks];
+    const namedDurabilityPath = path.join(
+      WORKSPACE_ROOT,
+      `.nexus-named-loop-self-test-${process.pid}-${randomBytes(4).toString("hex")}.json`
+    );
+    loopTasks = [normalizeLoopTask({
+      id: "durable-worker-loop",
+      prompt: "persist me",
+      intervalMs: 60000,
+      nextFireAt: Date.now() + 60000,
+      ownerAgent: "worker-a",
+    })];
+    const previousWorkerNotices = namedAgentUiNotices.get("worker-a");
+    namedAgentUiNotices.set("worker-a", [
+      {
+        role: "assistant",
+        content: "Scheduled loop durable-worker-loop for agent worker-a.",
+        excludeFromRequest: true,
+        afterMessageCount: 2,
+        persisted: true,
+      },
+      {
+        role: "assistant",
+        content: "ephemeral status",
+        excludeFromRequest: true,
+        afterMessageCount: 2,
+        persisted: false,
+      },
+    ]);
+    await persistNamedAgentLoops(namedDurabilityPath, { force: true });
+    const storedNamedLoopState = await readJsonObject(namedDurabilityPath);
+    loopTasks = [];
+    const restoredNamedLoopCount = await loadNamedAgentLoops(namedDurabilityPath, { force: true });
+    namedAgentUiNotices.delete("worker-a");
+    restoreNamedAgentLoopNotices(storedNamedLoopState?.notices);
+    const restoredNotices = namedAgentUiNotices.get("worker-a") || [];
+    await fs.rm(namedDurabilityPath, { force: true });
+    if (
+      restoredNamedLoopCount !== 1 ||
+      loopTasks[0]?.id !== "durable-worker-loop" ||
+      loopTasks[0]?.ownerAgent !== "worker-a" ||
+      restoredNotices.length !== 1 ||
+      restoredNotices[0]?.content !== "Scheduled loop durable-worker-loop for agent worker-a." ||
+      restoredNotices[0]?.afterMessageCount !== 2
+    ) {
+      out("LOOP_FAIL: named-agent loops/notices did not survive durable storage reload\n");
+      return 1;
+    }
+    namedAgentUiNotices.delete("worker-a");
+    await persistNamedAgentLoops(namedDurabilityPath, { force: true });
+    const clearedNoticeState = await readJsonObject(namedDurabilityPath);
+    if (
+      clearedNoticeState?.loops?.length !== 1 ||
+      clearedNoticeState.loops[0]?.id !== "durable-worker-loop" ||
+      Object.keys(clearedNoticeState?.notices || {}).length !== 0
+    ) {
+      out("LOOP_FAIL: clearing named-agent notices removed its active loops\n");
+      return 1;
+    }
+    loopTasks = [];
+    await persistNamedAgentLoops(namedDurabilityPath, { force: true });
+    await fs.rm(namedDurabilityPath, { force: true });
+    if (previousWorkerNotices) namedAgentUiNotices.set("worker-a", previousWorkerNotices);
+    stopLoopScheduler();
+    loopTasks = beforeNamedDurabilityTest;
+    messages.length = 0;
+    messages.push({ role: "system", content: "loop persistence test", hidden: true });
+    activeAgentName = "main";
+    recordMainLoopCommand("1m say hello");
+    messages.push({ role: "assistant", content: "Scheduled loop test", excludeFromRequest: true });
+    if (
+      !shouldPersistSessionHistory() ||
+      !messages.some(
+        (entry) => entry.role === "user" && entry.hidden === true && entry.content === "/loop 1m say hello"
+      )
+    ) {
+      out("LOOP_FAIL: a loop-only main chat did not become persistable\n");
+      return 1;
+    }
+    const savedSessionFilePath = sessionFilePath;
+    const savedSessionPersistenceInitialized = sessionPersistenceInitialized;
+    const loopOnlySessionPath = path.join(
+      WORKSPACE_ROOT,
+      `.nexus-loop-only-session-self-test-${process.pid}-${randomBytes(4).toString("hex")}.jsonl`
+    );
+    sessionFilePath = loopOnlySessionPath;
+    sessionPersistenceInitialized = false;
+    const loopOnlySessionSaved = await rewriteSessionWithCurrentMessages();
+    const loopOnlySessionRaw = await fs.readFile(loopOnlySessionPath, "utf8").catch(() => "");
+    await fs.rm(loopOnlySessionPath, { force: true });
+    sessionFilePath = savedSessionFilePath;
+    sessionPersistenceInitialized = savedSessionPersistenceInitialized;
+    if (
+      !loopOnlySessionSaved ||
+      !loopOnlySessionRaw.includes('"role":"user"') ||
+      !loopOnlySessionRaw.includes("/loop 1m say hello")
+    ) {
+      out("LOOP_FAIL: loop-only main session was not written to disk\n");
+      return 1;
+    }
+    messages.length = 0;
+    messages.push(...savedMessages);
+    activeAgentName = savedActiveAgentNameForPersistence;
 
     // Dynamic flag: prompt-only loops are dynamic, interval loops are not.
     const dynTask = scheduleLoopTask(null, "watch it", { dynamic: true });
@@ -16986,14 +19973,15 @@ async function runLoopSelfTest() {
       createdAt: Date.now(),
       nextFireAt: Date.now() + 60000,
       lastDelayMs: 120000,
+      ownerAgent: "worker-a",
     };
     const restored = normalizeLoopTask(stored);
     if (!restored || restored.id !== "dyn-test" || restored.prompt !== "watch it") {
       out("LOOP_FAIL: normalizeLoopTask lost id/prompt\n");
       return 1;
     }
-    if (restored.dynamic !== true || restored.oneshot !== false) {
-      out("LOOP_FAIL: normalizeLoopTask lost dynamic/oneshot flags\n");
+    if (restored.dynamic !== true || restored.oneshot !== false || restored.ownerAgent !== "worker-a") {
+      out("LOOP_FAIL: normalizeLoopTask lost dynamic/oneshot/owner fields\n");
       return 1;
     }
 
@@ -17125,6 +20113,17 @@ async function runLoopSelfTest() {
       return 1;
     }
     loopTasks = [];
+    const namedBridge = await handleMcpBridgeRequest({
+      method: "reminder",
+      when: "in 1 minute",
+      prompt: "named bridge test",
+      session_id: "named-worker-a",
+    });
+    if (!namedBridge?.ok || loopTasks[0]?.ownerAgent !== "worker-a") {
+      out("LOOP_FAIL: reminder bridge did not preserve named-agent ownership\n");
+      return 1;
+    }
+    loopTasks = [];
     const badBridge = await handleMcpBridgeRequest({ method: "reminder", when: "sometime later", prompt: "x" });
     if (!badBridge || badBridge.ok !== false || loopTasks.length !== 0) {
       out(`LOOP_FAIL: reminder bridge should reject unparseable time: ${JSON.stringify(badBridge)}\n`);
@@ -17170,11 +20169,11 @@ async function runLoopSelfTest() {
     }
     const savedToggleTasks = loopTasks;
     loopTasks = [pausedStored];
-    if (!toggleLoopPaused(pausedStored.id) || pausedStored.paused !== false) {
+    if (!toggleLoopPaused(pausedStored.id, "worker-a") || pausedStored.paused !== false) {
       out("LOOP_FAIL: toggleLoopPaused should resume a paused task\n");
       return 1;
     }
-    if (!toggleLoopPaused(pausedStored.id) || pausedStored.paused !== true) {
+    if (!toggleLoopPaused(pausedStored.id, "worker-a") || pausedStored.paused !== true) {
       out("LOOP_FAIL: toggleLoopPaused should pause a running task\n");
       return 1;
     }
@@ -17209,6 +20208,7 @@ async function runLoopSelfTest() {
     }
 
     loopTasks = savedTasks;
+    namedLoopPersistenceSuspended = false;
 
     out("LOOP_OK\n");
     return 0;
@@ -17267,6 +20267,85 @@ function runCompactionSelfTest() {
     }
     if (isCompactionSummaryEntry({ role: "user", content: "normal user text" })) {
       out("COMPACT_FAIL: normal user text should not be a summary\n");
+      return 1;
+    }
+
+    // Session isolation: compacting one named-agent transcript must not read
+    // or mutate the main transcript (or another named-agent transcript).
+    const mainSessionFixture = [
+      { role: "system", content: "main system" },
+      { role: "user", content: "main-only task" },
+      { role: "assistant", content: "main-only answer" },
+    ];
+    const namedSessionFixture = [
+      { role: "system", content: "named system" },
+      { role: "user", content: "_summary\nold named summary" },
+      { role: "user", content: "named-only task" },
+      { role: "assistant", content: "named-only answer" },
+    ];
+    const mainSnapshot = JSON.stringify(mainSessionFixture);
+    const compactedNamedFixture = compactConversationEntries(namedSessionFixture, "fresh named summary");
+    const compactedNamedText = compactedNamedFixture.entries.map((entry) => entry.content).join("\n");
+    const compactedSummaryEntry = compactedNamedFixture.entries.find(isCompactionSummaryEntry);
+    if (
+      JSON.stringify(mainSessionFixture) !== mainSnapshot ||
+      !compactedNamedText.includes("fresh named summary") ||
+      !compactedNamedText.includes("named-only task") ||
+      compactedNamedText.includes("old named summary") ||
+      compactedNamedText.includes("main-only task") ||
+      compactedNamedFixture.entries.filter((entry) => entry.role === "system").length !== 1 ||
+      compactedSummaryEntry?.hidden !== true ||
+      isRenderableChatEntry(compactedSummaryEntry) ||
+      namedAgentMessagesForDisplay({ messages: compactedNamedFixture.entries })
+        .some((entry) => isCompactionSummaryEntry(entry))
+    ) {
+      out("COMPACT_FAIL: compaction crossed the active session boundary or exposed its summary\n");
+      return 1;
+    }
+    const legacyVisibleSummary = { role: "user", content: "_summary\nlegacy visible summary" };
+    if (
+      isRenderableChatEntry(legacyVisibleSummary) ||
+      namedAgentMessagesForDisplay({ messages: [legacyVisibleSummary] }).length !== 0
+    ) {
+      out("COMPACT_FAIL: a legacy compaction summary leaked into the transcript\n");
+      return 1;
+    }
+    const namedRuntimeFixture = {
+      model: "named-compact-model",
+      collaboration_mode: "build",
+      reasoning_by_model: { "named-compact-model": false },
+      settings: normalizeSessionRuntimeSettings({ context_window: 128000 }),
+      context_left_by_model: {},
+      cache_telemetry_by_model: {},
+    };
+    const namedRequestFixture = buildNamedAgentCompactionMessages(
+      { messages: namedSessionFixture },
+      namedRuntimeFixture
+    );
+    const namedSummaryPrompt = buildCompactionSummaryPrompt(namedRequestFixture, 128000, "named instruction");
+    if (
+      !namedSummaryPrompt.includes("named-only task") ||
+      !namedSummaryPrompt.includes("named instruction") ||
+      namedSummaryPrompt.includes("main-only task") ||
+      namedRequestFixture.some((entry) => Object.prototype.hasOwnProperty.call(entry, "reasoning_details"))
+    ) {
+      out(`COMPACT_FAIL: named-agent summary request used another session's runtime or messages: ${JSON.stringify({ namedSummaryPrompt, namedRequestFixture })}\n`);
+      return 1;
+    }
+    updateNamedAgentCompactionTelemetry(
+      namedRuntimeFixture,
+      {
+        model: "named-compact-model",
+        usage: { prompt_tokens: 1000, prompt_tokens_details: { cached_tokens: 750 } },
+      },
+      "named system",
+      compactedNamedFixture.entries
+    );
+    if (
+      namedRuntimeFixture.cache_telemetry_by_model["named-compact-model"]?.cachePercent !== 75 ||
+      !Number.isFinite(namedRuntimeFixture.context_left_by_model["named-compact-model"])
+    ) {
+      out("COMPACT_FAIL: named-agent compaction telemetry was not session-scoped\n");
       return 1;
     }
 
@@ -18054,6 +21133,14 @@ async function runRemoteControlSelfTest() {
       !pageText.includes("interactive-widget=resizes-content") ||
       !pageText.includes("appendHighlightedPython") ||
       !pageText.includes("appendMarkdown") ||
+      !pageText.includes('id="drawer"') ||
+      !pageText.includes('id="sessions-menu"') ||
+      !pageText.includes('id="agents-menu"') ||
+      !pageText.includes('id="loops-menu"') ||
+      !pageText.includes("type:'switch-session'") ||
+      !pageText.includes("agent:remoteSessionsAgent") ||
+      !pageText.includes("type:'switch-agent'") ||
+      !pageText.includes("type:'loop-action'") ||
       pageText.includes(remoteControlToken)
     ) {
       throw new Error("remote page response was invalid or leaked its token");
@@ -18104,6 +21191,141 @@ async function runRemoteControlSelfTest() {
     if (!toolMessage?.content.includes("... +") || toolMessage.content.includes("tool line 15")) {
       throw new Error("remote snapshot did not truncate tool output");
     }
+    const sessionsPayloadPromise = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        client.off("message", onMessage);
+        reject(new Error("sessions payload timed out"));
+      }, 5000);
+      const onMessage = (data) => {
+        try {
+          const parsed = JSON.parse(String(data || ""));
+          if (parsed?.type !== "sessions") return;
+          clearTimeout(timeout);
+          client.off("message", onMessage);
+          resolve(parsed);
+        } catch (error) {
+          clearTimeout(timeout);
+          client.off("message", onMessage);
+          reject(error);
+        }
+      };
+      client.on("message", onMessage);
+    });
+    client.send(JSON.stringify({ type: "sessions" }));
+    const sessionsPayload = await sessionsPayloadPromise;
+    if (
+      sessionsPayload?.type !== "sessions" ||
+      sessionsPayload?.agent !== "main" ||
+      !Array.isArray(sessionsPayload?.sessions)
+    ) {
+      throw new Error("remote sessions drawer did not receive a session list");
+    }
+    const namedSessionItems = buildRemoteControlSessionItems([
+      {
+        name: "worker.json",
+        mtimeMs: 20,
+        firstUserMessage: "current named session",
+        currentNamedSession: true,
+      },
+      {
+        name: "session-old.json",
+        mtimeMs: 10,
+        firstUserMessage: "older named session",
+        currentNamedSession: false,
+      },
+    ], "Worker");
+    if (
+      namedSessionItems.length !== 2 ||
+      namedSessionItems[0]?.id !== "worker.json" ||
+      namedSessionItems[0]?.current !== true ||
+      namedSessionItems[1]?.id !== "session-old.json" ||
+      namedSessionItems[1]?.current !== false
+    ) {
+      throw new Error("remote named-agent sessions were not mapped independently");
+    }
+    const loopsPayloadPromise = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        client.off("message", onMessage);
+        reject(new Error("loops payload timed out"));
+      }, 5000);
+      const onMessage = (data) => {
+        try {
+          const parsed = JSON.parse(String(data || ""));
+          if (parsed?.type !== "loops") return;
+          clearTimeout(timeout);
+          client.off("message", onMessage);
+          resolve(parsed);
+        } catch (error) {
+          clearTimeout(timeout);
+          client.off("message", onMessage);
+          reject(error);
+        }
+      };
+      client.on("message", onMessage);
+    });
+    client.send(JSON.stringify({ type: "loops" }));
+    const loopsPayload = await loopsPayloadPromise;
+    if (
+      loopsPayload?.type !== "loops" ||
+      loopsPayload?.agent !== "main" ||
+      !Array.isArray(loopsPayload?.loops)
+    ) {
+      throw new Error("remote loops drawer did not receive the active agent loop list");
+    }
+    const agentsPayloadPromise = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        client.off("message", onMessage);
+        reject(new Error("agents payload timed out"));
+      }, 5000);
+      const onMessage = (data) => {
+        try {
+          const parsed = JSON.parse(String(data || ""));
+          if (parsed?.type !== "agents") return;
+          clearTimeout(timeout);
+          client.off("message", onMessage);
+          resolve(parsed);
+        } catch (error) {
+          clearTimeout(timeout);
+          client.off("message", onMessage);
+          reject(error);
+        }
+      };
+      client.on("message", onMessage);
+    });
+    client.send(JSON.stringify({ type: "agents" }));
+    const agentsPayload = await agentsPayloadPromise;
+    if (
+      agentsPayload?.type !== "agents" ||
+      !Array.isArray(agentsPayload?.agents) ||
+      !agentsPayload.agents.some((agent) => agent.name === "main" && agent.current === true)
+    ) {
+      throw new Error("remote agents drawer did not receive the current main agent");
+    }
+    const agentSwitchPromise = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        client.off("message", onMessage);
+        reject(new Error("agent switch timed out"));
+      }, 5000);
+      const onMessage = (data) => {
+        try {
+          const parsed = JSON.parse(String(data || ""));
+          if (parsed?.type !== "agent-switched") return;
+          clearTimeout(timeout);
+          client.off("message", onMessage);
+          resolve(parsed);
+        } catch (error) {
+          clearTimeout(timeout);
+          client.off("message", onMessage);
+          reject(error);
+        }
+      };
+      client.on("message", onMessage);
+    });
+    client.send(JSON.stringify({ type: "switch-agent", agent: "main" }));
+    const agentSwitch = await agentSwitchPromise;
+    if (agentSwitch?.agent !== "main") {
+      throw new Error("remote agent switch did not select main");
+    }
     client.close();
     await new Promise((resolve) => client.once("close", resolve));
     client = null;
@@ -18126,6 +21348,96 @@ async function runRemoteControlSelfTest() {
     } else {
       delete nexusConfig.show_thinking_blocks;
     }
+  }
+}
+
+async function runNamedAgentSelfTest() {
+  const out = process.stdout.write.bind(process.stdout);
+  const testPath = path.join(
+    WORKSPACE_ROOT,
+    `.nexus-named-agent-self-test-${process.pid}-${randomBytes(4).toString("hex")}.json`
+  );
+  try {
+    const record = {
+      kind: "named-agent",
+      id: "named-agent-self-test",
+      name: "self-test",
+      workspace: WORKSPACE_ROOT,
+      model: "self-test-model",
+      timeout: 10,
+      max_tokens: 256,
+      reasoning_enabled: false,
+      reasoning_effort: "low",
+      messages: [
+        { role: "system", content: "PARENT NEXUS SYSTEM PROMPT" },
+        { role: "user", content: "finish this named agent turn" },
+      ],
+      status: "admitted",
+      result: null,
+      error: null,
+      created_at: Date.now() / 1000,
+      turn: 0,
+      self_test_responses: [
+        {
+          choices: [
+            {
+              message: {
+                content: "named agent finished",
+                reasoning_content: "named agent reasoning",
+              },
+            },
+          ],
+        },
+      ],
+      runtime: {
+        system_prompt: "PARENT NEXUS SYSTEM PROMPT",
+        model: "self-test-model",
+        reasoning_enabled: false,
+        reasoning_effort: "low",
+        session_id: "named-agent-self-test",
+      },
+    };
+    await writeJsonAtomic(testPath, record);
+    const startedAt = Date.now();
+    await runPythonCommand([TOOLS_SCRIPT_PATH, "--launch-subagent-test", testPath], { timeout: 10000 });
+    if (Date.now() - startedAt > 3000) throw new Error("named agent launcher blocked instead of returning asynchronously");
+    let completed = null;
+    // A freshly built one-file PyInstaller worker may spend several seconds
+    // unpacking on its first launch even though the launcher itself returns
+    // immediately. Keep this deadline generous without changing runtime task
+    // timeouts or the non-blocking admission contract.
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      completed = await readJsonObject(testPath);
+      if (["done", "error"].includes(String(completed?.status || ""))) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    if (
+      completed?.status !== "done" ||
+      completed?.result !== "named agent finished" ||
+      !Array.isArray(completed?.messages) ||
+      completed.messages[0]?.content !== "PARENT NEXUS SYSTEM PROMPT" ||
+      completed.messages.some(
+        (message) =>
+          message?.role === "assistant" &&
+          Array.isArray(message?.reasoning_details) &&
+          message.reasoning_details.some((detail) => detail?.text === "named agent reasoning")
+      )
+    ) {
+      throw new Error(`thinking-off named agent exposed provider reasoning: ${JSON.stringify(completed)}`);
+    }
+    out("AGENTS_OK\n");
+    return 0;
+  } catch (error) {
+    namedLoopPersistenceSuspended = false;
+    out(`AGENTS_FAIL: ${error?.message || String(error)}\n`);
+    return 1;
+  } finally {
+    // The detached worker writes its terminal state just before exiting. Give
+    // that final atomic rename time to release the record on Windows/OneDrive
+    // before removing the self-test file.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await fs.unlink(testPath).catch(() => {});
   }
 }
 
@@ -18155,6 +21467,11 @@ if (process.argv.includes("--self-test-background")) {
 
 if (process.argv.includes("--self-test-remote")) {
   runRemoteControlSelfTest().then((code) => process.exit(code));
+  return;
+}
+
+if (process.argv.includes("--self-test-agents")) {
+  runNamedAgentSelfTest().then((code) => process.exit(code));
   return;
 }
 
@@ -18188,6 +21505,8 @@ process.stdin.on("data", (rawChunk) => {
     closeModelBuffer();
   } else if (activeBuffer === "sessions" && chunk === "\u001b") {
     closeSessionsBuffer();
+  } else if (activeBuffer === "agents" && chunk === "\u001b") {
+    closeAgentsBuffer();
   } else if (activeBuffer === "providers" && chunk === "\u001b") {
     closeProvidersBuffer();
   } else if (activeBuffer === "settings" && chunk === "\u001b") {
@@ -18304,6 +21623,12 @@ process.stdin.on("keypress", async (str, key) => {
     activeBuffer === "main" &&
     (key?.name === "escape" || key?.sequence === "\u001b" || str === "\u001b");
   if (isMainBufferEscape) {
+    if (activeAgentName !== "main") {
+      if (isActiveNamedAgentRunning()) {
+        await stopNamedAgent();
+      }
+      return;
+    }
     if (solveStartupActive) {
       cancelSolveStartup();
       return;
@@ -18393,8 +21718,21 @@ process.stdin.on("keypress", async (str, key) => {
     if (key?.sequence === "\r" || key?.name === "return" || key?.name === "enter") {
       const models = getFilteredModels();
       if (models.length > 0) {
-        selectedModel = models[modelSelected].id;
-        await rewriteSessionWithCurrentMessages().catch(() => {});
+        const nextModel = models[modelSelected].id;
+        if (activeAgentName === "main") {
+          selectedModel = nextModel;
+          await rewriteSessionWithCurrentMessages().catch(() => {});
+        } else {
+          try {
+            await updateActiveNamedAgentSessionRuntime((runtime) => {
+              runtime.model = nextModel;
+            });
+          } catch (error) {
+            closeModelBuffer();
+            showAgentCommandNotice(error?.message || String(error), true);
+            return;
+          }
+        }
       }
       closeModelBuffer();
       return;
@@ -18486,6 +21824,50 @@ process.stdin.on("keypress", async (str, key) => {
       return;
     }
 
+    return;
+  }
+
+  if (activeBuffer === "agents") {
+    if (key?.ctrl) return;
+    if (key?.name === "escape" || key?.sequence === "\u001b" || str === "\u001b") {
+      closeAgentsBuffer();
+      return;
+    }
+    if (key?.name === "up" || key?.name === "down") {
+      const entries = getAgentsListEntries();
+      if (entries.length) {
+        agentsSelected = key.name === "up"
+          ? Math.max(0, agentsSelected - 1)
+          : Math.min(entries.length - 1, agentsSelected + 1);
+        updateAgentsSelectionState();
+      }
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+    if (key?.name === "backspace") {
+      agentsSearch = agentsSearch.slice(0, -1);
+      agentsSelected = 0;
+      agentsScroll = 0;
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+    if (key?.sequence === "\r" || key?.name === "return" || key?.name === "enter") {
+      const selected = getAgentsListEntries()[agentsSelected];
+      if (selected && switchToAgentSession(selected.name)) {
+        closeAgentsBuffer({ refreshChat: true });
+      }
+      return;
+    }
+    if (!key?.meta && str && !str.startsWith("\u001b")) {
+      agentsSearch += str;
+      agentsSelected = 0;
+      agentsScroll = 0;
+      markDirty();
+      renderFrame(true);
+      return;
+    }
     return;
   }
 
@@ -18620,6 +22002,7 @@ process.stdin.on("keypress", async (str, key) => {
   }
 
   if (activeBuffer === "loops") {
+    const visibleLoopTasks = getLoopTasksForAgent();
     if (key?.ctrl) {
       return;
     }
@@ -18634,11 +22017,11 @@ process.stdin.on("keypress", async (str, key) => {
     }
 
     if (key?.name === "up" || key?.name === "down") {
-      if (loopTasks.length > 0) {
+      if (visibleLoopTasks.length > 0) {
         if (key.name === "up") {
           loopsSelected = Math.max(0, loopsSelected - 1);
         } else {
-          loopsSelected = Math.min(loopTasks.length - 1, loopsSelected + 1);
+          loopsSelected = Math.min(visibleLoopTasks.length - 1, loopsSelected + 1);
         }
 
         if (loopsSelected < loopsScroll) {
@@ -18657,15 +22040,22 @@ process.stdin.on("keypress", async (str, key) => {
     }
 
     if (key?.name === "delete") {
-      const target = loopTasks[loopsSelected];
+      const target = getSelectedLoopTaskForAgent();
       if (target) {
         const id = target.id;
-        const removed = removeLoopTask(id);
+        const removed = removeLoopTask(id, { ownerAgent: activeAgentName, persist: false });
         loopsMessage = removed ? `Deleted loop ${id}.` : "Could not delete loop.";
         if (loopTasks.length === 0) {
           stopLoopScheduler();
         }
         updateLoopsSelectionState();
+        if (removed && activeAgentName !== "main") {
+          try {
+            await persistNamedAgentLoops();
+          } catch (error) {
+            loopsMessage = `Deleted loop ${id}, but could not save loop state: ${error?.code || error?.message || String(error)}.`;
+          }
+        }
         await rewriteSessionWithCurrentMessages().catch(() => {});
       }
       markDirty();
@@ -18674,15 +22064,23 @@ process.stdin.on("keypress", async (str, key) => {
     }
 
     if (key?.sequence === "\r" || key?.name === "return" || key?.name === "enter") {
-      const target = loopTasks[loopsSelected];
+      const target = getSelectedLoopTaskForAgent();
       if (target) {
-        const toggled = toggleLoopPaused(target.id);
+        const toggled = toggleLoopPaused(target.id, activeAgentName, { persist: false });
         loopsMessage = toggled
           ? target.paused
             ? `Paused loop ${target.id}.`
             : `Resumed loop ${target.id}.`
           : "Could not update loop.";
         startLoopScheduler();
+        if (toggled && activeAgentName !== "main") {
+          try {
+            await persistNamedAgentLoops();
+          } catch (error) {
+            const action = target.paused ? "Paused" : "Resumed";
+            loopsMessage = `${action} loop ${target.id}, but could not save loop state: ${error?.code || error?.message || String(error)}.`;
+          }
+        }
         await rewriteSessionWithCurrentMessages().catch(() => {});
       }
       markDirty();
@@ -19227,9 +22625,40 @@ process.stdin.on("keypress", async (str, key) => {
       }
     }
 
+    if (activeAgentName !== "main") {
+      if (!trimmedInput) return;
+      const targetAgent = activeAgentName;
+      const compactionBarrier = getActiveSessionCompactionPromise(targetAgent);
+      commitSubmittedInputHistory(input);
+      input = "";
+      inputCursorIndex = 0;
+      pendingPastedPayloads = [];
+      activeBlockedPastePayloadIndex = -1;
+      if (compactionBarrier) {
+        agentsMessage = `Queued for ${targetAgent}`;
+        markDirty();
+        renderFrame(false);
+        await compactionBarrier.catch(() => {});
+      }
+      const result = await dispatchNamedAgentTask(targetAgent, trimmedInput);
+      if (!result.ok) {
+        agentsMessage = result.error || "Could not submit the agent task";
+      } else if (result.queued) {
+        agentsMessage = `Queued for ${targetAgent}`;
+      } else {
+        agentsMessage = "";
+      }
+      await refreshNamedAgents();
+      scrollChatToBottom();
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+
     cancelIdleFlush();
     burstMode = false;
-    const queueBehindActiveTurn = isAssistantThinking();
+    const compactionBarrier = getActiveSessionCompactionPromise("main");
+    const queueBehindActiveTurn = isAssistantThinking() || Boolean(compactionBarrier);
     // UserPromptSubmit hook: deterministic pre-prompt hooks (e.g. inject
     // context, block prompts). exit code 2 blocks the turn.
     const promptHookRun = await runHooks({
@@ -19265,6 +22694,7 @@ process.stdin.on("keypress", async (str, key) => {
         queuedPrompt: queueBehindActiveTurn ? trimmedInput : "",
         deferredUserMessage: queueBehindActiveTurn ? submission : null,
         deferredHookContext: queuedHookContext,
+        deferredUntil: compactionBarrier,
       });
     }
     markDirty();
@@ -19326,6 +22756,7 @@ async function initializeApp() {
   await ensureSessionFileReady();
   await loadSkillsCatalog();
   await loadNexusConfig();
+  sessionRuntimeSettings = normalizeSessionRuntimeSettings(null);
   await loadProvidersFromFile();
   await ensureSelectedProviderIsValid();
   await loadModelsFromProvider();
@@ -19350,6 +22781,9 @@ async function initializeApp() {
     }
 
   }
+  await loadNamedAgentLoops().catch(() => {});
+  await refreshNamedAgents().catch(() => {});
+  startNamedAgentRefreshLoop();
   renderFrame(true);
 }
 
