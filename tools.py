@@ -2296,6 +2296,50 @@ def _run_named_agent_tool_self_test() -> dict:
         context_window = ((price_record.get("session_runtime") or {}).get("settings") or {}).get("context_window")
         if context_window != 1_000_000:
             raise AssertionError("named agent did not inherit the source session runtime settings")
+        listed_agents = {
+            item.get("name"): item
+            for item in list_subagents()
+            if item.get("kind") == "named-agent"
+        }
+        if listed_agents.get("Kral", {}).get("status") != "idle":
+            raise AssertionError("completed named agent was not listed as idle")
+        if listed_agents.get("Kral", {}).get("task_status") != "done":
+            raise AssertionError("completed named agent lost its raw task status")
+        if listed_agents.get("Price", {}).get("status") != "running":
+            raise AssertionError("admitted named agent was not listed as running")
+
+        price_record["status"] = "stopped"
+        price_record["error"] = "Stopped by user"
+        _write_named_agent_record(_named_agent_record_path("Price"), price_record)
+        stopped_agents = {
+            item.get("name"): item
+            for item in list_subagents()
+            if item.get("kind") == "named-agent"
+        }
+        if stopped_agents.get("Price", {}).get("status") != "stopped":
+            raise AssertionError("stopped named agent was not listed as stopped")
+        kral_id = str(listed_agents.get("Kral", {}).get("id") or "")
+        waited = wait_subagents([kral_id], timeout=1, poll_interval=0.05)
+        if (
+            len(waited) != 1
+            or waited[0].get("name") != "Kral"
+            or waited[0].get("status") != "idle"
+            or waited[0].get("result") != "delegated answer"
+        ):
+            raise AssertionError(f"wait_subagents did not return completed named agent: {waited}")
+        missing_started = time.monotonic()
+        missing = wait_subagents(["agent-does-not-exist"], timeout=10, poll_interval=0.05)
+        if (
+            time.monotonic() - missing_started >= 1
+            or missing != [{
+                "ok": False,
+                "id": "agent-does-not-exist",
+                "status": "stopped",
+                "task_status": "missing",
+                "error": "agent not found",
+            }]
+        ):
+            raise AssertionError(f"wait_subagents did not reject an unknown agent immediately: {missing}")
         return {"ok": True}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
@@ -2328,10 +2372,64 @@ def rlm_spawn(
         return {"ok": False, "error": str(exc)}
 
 
+def _agent_activity_status(value: object) -> str:
+    """Normalize persisted task states into the statuses shown by Nexus."""
+    raw = str(value or "idle").strip().lower()
+    if raw in {"admitted", "running"}:
+        return "running"
+    if raw in {"error", "stopped", "cancelled", "killed"}:
+        return "stopped"
+    return "idle"
+
+
+def _list_named_agent_records() -> list[dict]:
+    """Read every named agent belonging to the current workspace."""
+    workspace_scope = hashlib.sha256(str(WORKSPACE_ROOT).encode("utf-8")).hexdigest()[:16]
+    directory = NEXUS_DIR / "agents" / workspace_scope
+    if not directory.exists():
+        return []
+
+    expected_workspace = os.path.normcase(str(WORKSPACE_ROOT))
+    agents = []
+    for record_path in directory.glob("*.json"):
+        record = _read_named_agent_record(record_path)
+        if not record or record.get("kind") != "named-agent":
+            continue
+        record_workspace = os.path.normcase(str(record.get("workspace") or ""))
+        if record_workspace and record_workspace != expected_workspace:
+            continue
+        raw_status = str(record.get("status") or "idle").strip().lower()
+        agents.append({
+            "kind": "named-agent",
+            "id": record.get("id"),
+            "name": record.get("name"),
+            "status": _agent_activity_status(raw_status),
+            "task_status": raw_status,
+            "prompt": str(record.get("prompt") or record.get("session_title") or "")[:200],
+            "result": record.get("result"),
+            "error": record.get("error"),
+            "model": record.get("model"),
+            "turn": record.get("turn", 0),
+            "pid": record.get("pid"),
+            "created_at": record.get("created_at"),
+            "updated_at": record.get("updated_at"),
+        })
+    return agents
+
+
 def list_subagents() -> list[dict]:
-    """List spawned child sub-agents with status, prompt, result, error."""
+    """List all workspace named agents and session-spawned child agents."""
     try:
-        return harness.rlm.list_subagents()
+        agents = _list_named_agent_records()
+        for record in harness.rlm.list_subagents():
+            raw_status = str(record.get("status") or "idle").strip().lower()
+            agents.append({
+                **record,
+                "kind": "spawned-agent",
+                "status": _agent_activity_status(raw_status),
+                "task_status": raw_status,
+            })
+        return sorted(agents, key=lambda item: float(item.get("created_at") or 0))
     except Exception as exc:
         return [{"ok": False, "error": str(exc)}]
 
@@ -2341,22 +2439,54 @@ def wait_subagents(
     timeout: int | float = 300,
     poll_interval: int | float = 0.5,
 ) -> list[dict]:
-    """Wait for selected child sub-agents to finish and return their final records.
+    """Wait for selected named or spawned agents to become idle/stopped.
 
     Workers and status survive across execute blocks. A running status is
     progress, not a failure.
     """
-    selected = {str(value) for value in (handle_ids or []) if str(value).strip()}
+    requested = [handle_ids] if isinstance(handle_ids, str) else (handle_ids or [])
+    selected = {str(value).strip() for value in requested if str(value).strip()}
+    selected_keys = {value.casefold() for value in selected}
     timeout_seconds = max(0.0, min(float(timeout), 3600.0))
     interval_seconds = max(0.05, min(float(poll_interval), 5.0))
     deadline = time.monotonic() + timeout_seconds
 
     while True:
-        records = harness.rlm.list_subagents()
+        records = list_subagents()
+        if any(record.get("ok") is False for record in records):
+            return records
         if selected:
-            records = [record for record in records if str(record.get("id", "")) in selected]
-        terminal = {"done", "error"}
-        if records and all(str(record.get("status", "")) in terminal for record in records):
+            records = [
+                record
+                for record in records
+                if str(record.get("id") or "").casefold() in selected_keys
+                or str(record.get("name") or "").casefold() in selected_keys
+            ]
+            found = {
+                key
+                for record in records
+                for key in (
+                    str(record.get("id") or "").casefold(),
+                    str(record.get("name") or "").casefold(),
+                )
+                if key in selected_keys
+            }
+            missing = sorted(selected_keys - found)
+            if missing:
+                return records + [
+                    {
+                        "ok": False,
+                        "id": value,
+                        "status": "stopped",
+                        "task_status": "missing",
+                        "error": "agent not found",
+                    }
+                    for value in missing
+                ]
+        if not records:
+            return []
+        terminal = {"idle", "stopped"}
+        if all(str(record.get("status") or "").lower() in terminal for record in records):
             return records
         if time.monotonic() >= deadline:
             return records
@@ -2824,8 +2954,8 @@ FUNCTION_DESCRIPTIONS = {
     "manage_skill": "manage_skill(name: str, description: str = '', body: str = '', delete: bool = False) -> dict: Create, update, or delete a personal skill under ~/.nexus/skills. Workspace and bundled skills are read-only.",
     "web_search": "web_search(query: str, max_results: int = 5) -> dict: Search the web via DuckDuckGo (Lite HTML with Instant Answer fallback). Returns {query, results: [{title, snippet, url}], error}.",
     "rlm_spawn": "rlm_spawn(prompt: str, system: str = '', timeout: int = 300, max_tokens: int = 2048, template: str = '') -> dict: Non-blocking spawn of a persistent concurrent Nexus child process using the active provider/model, parent system prompt, unlimited tool turns, shared workspace, and tools. timeout is a hard wall-clock limit for each provider request and execute block. Returns an admitted handle immediately; end the current execute block after spawning so the child continues in the background.",
-    "list_subagents": "list_subagents() -> list[dict]: Non-blocking session-scoped snapshot of persistent child agents with status, prompt, result, error, turn, and pid. Results remain available in later execute blocks.",
-    "wait_subagents": "wait_subagents(handle_ids: list[str] | None = None, timeout: int|float = 300, poll_interval: int|float = 0.5) -> list[dict]: Block until selected persistent Nexus child agents finish/error or timeout. Use only in a later execute block, never in the block that calls rlm_spawn.",
+    "list_subagents": "list_subagents() -> list[dict]: Non-blocking workspace-wide list of named agents plus session-spawned child agents. status is normalized to idle, running, or stopped; task_status preserves the raw last-task state such as done or error. Returns kind, id, name, status, task_status, prompt, result, error, turn, and pid.",
+    "wait_subagents": "wait_subagents(handle_ids: list[str] | None = None, timeout: int|float = 300, poll_interval: int|float = 0.5) -> list[dict]: Block until selected named or spawned Nexus agents become idle/stopped or timeout. Accepts agent IDs or names, returns already-finished agents immediately, and rejects unknown IDs immediately. Use only in a later execute block, never in the block that starts an agent.",
     "delete_subagent": "delete_subagent(handle_id: str) -> dict: Delete a spawned child sub-agent by handle id.",
     "harness_overview": "harness_overview() -> dict: Continual harness overview: memories, skills, subagent templates, prompt notes, refinements.",
     "harness_memory": "harness_memory(key: str, content: str = '', delete: bool = False) -> dict: Read a persistent memory when content is omitted; create/update it when content is supplied; delete it with delete=True.",

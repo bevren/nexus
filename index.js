@@ -118,6 +118,7 @@ const WHITE_COLOR = "\u001b[97m";
 const BOLD_WHITE = "\u001b[1m\u001b[97m";
 const VSCODE_BLUE_COLOR = "\u001b[38;2;86;156;214m";
 const GOLDENROD_COLOR = "\u001b[38;2;218;165;32m";
+const AGENT_MENTION_NAME_COLOR = "\u001b[35m";
 const CODE_BLOCK_BG_COLOR = "\u001b[48;5;236m";
 const SESSION_EVEN_BG_COLOR = "\u001b[48;2;24;24;24m";
 const SESSION_SELECTED_FG_COLOR = "\u001b[38;2;184;134;11m";
@@ -1343,6 +1344,14 @@ let commandBufferQuery = "";
 let lastCommandRenderedRows = [];
 let lastCommandRenderedCols = 0;
 let lastCommandRenderedHeight = 0;
+let agentMentionQuery = "";
+let agentMentionSelected = 0;
+let agentMentionScroll = 0;
+let agentMentionInputPrefix = "";
+let agentMentionInputSuffix = "";
+let lastAgentMentionRenderedRows = [];
+let lastAgentMentionRenderedCols = 0;
+let lastAgentMentionRenderedHeight = 0;
 let burstWindowStartAt = 0;
 let burstWindowChars = 0;
 let burstWindowNewlines = 0;
@@ -1357,6 +1366,7 @@ let isBracketedPasteActive = false;
 let bracketedPasteBuffer = "";
 let suppressKeypressUntil = 0;
 let suppressSolveEscapeKeypressUntil = 0;
+let suppressAgentMentionEscapeKeypressUntil = 0;
 let suppressMouseNoiseUntil = 0;
 let ignoreNextProvidersEscape = false;
 let bracketedPasteModeEnabled = false;
@@ -3223,6 +3233,33 @@ function terminateBackgroundShellProcess(job) {
   }
 }
 
+function shouldResumeMainAgentAfterBackgroundCompletion(job, overrides = null) {
+  const state = overrides && typeof overrides === "object" ? overrides : {};
+  const isCleanedUp = Object.prototype.hasOwnProperty.call(state, "cleanedUp")
+    ? Boolean(state.cleanedUp)
+    : cleanedUp;
+  const activeSessionUid = Object.prototype.hasOwnProperty.call(state, "sessionUid")
+    ? String(state.sessionUid || "")
+    : currentSessionUid;
+  const activeGeneration = Object.prototype.hasOwnProperty.call(state, "generation")
+    ? Number(state.generation)
+    : chatGeneration;
+  const assistantThinking = Object.prototype.hasOwnProperty.call(state, "assistantThinking")
+    ? Boolean(state.assistantThinking)
+    : isAssistantThinking();
+  const modelId = Object.prototype.hasOwnProperty.call(state, "model")
+    ? String(state.model || "")
+    : String(selectedModel || job?.model || "");
+  return Boolean(
+    !isCleanedUp &&
+    job &&
+    String(job.sessionUid || "") === activeSessionUid &&
+    Number(job.generation) === activeGeneration &&
+    !assistantThinking &&
+    modelId
+  );
+}
+
 async function appendBackgroundShellCompletion(job, result) {
   const content = JSON.stringify(result, null, 2);
   const toolInput = `background job ${job.id}: ${job.command}`;
@@ -3237,6 +3274,9 @@ async function appendBackgroundShellCompletion(job, result) {
       Boolean(result.ok),
       job.generation
     );
+    if (shouldResumeMainAgentAfterBackgroundCompletion(job)) {
+      queueAssistantReply(selectedModel || job.model);
+    }
     return;
   }
   if (!job.sessionFilePath) return;
@@ -3411,6 +3451,32 @@ async function runBackgroundShellSelfTest() {
   const out = process.stdout.write.bind(process.stdout);
   const command = 'python3 -c "print(\'BG_OK\')"';
   try {
+    const eligibleResumeJob = { sessionUid: "background-test-session", generation: 7, model: "test-model" };
+    const eligibleResumeState = {
+      cleanedUp: false,
+      sessionUid: "background-test-session",
+      generation: 7,
+      assistantThinking: false,
+      model: "test-model",
+    };
+    if (
+      !shouldResumeMainAgentAfterBackgroundCompletion(eligibleResumeJob, eligibleResumeState) ||
+      shouldResumeMainAgentAfterBackgroundCompletion(eligibleResumeJob, {
+        ...eligibleResumeState,
+        assistantThinking: true,
+      }) ||
+      shouldResumeMainAgentAfterBackgroundCompletion(eligibleResumeJob, {
+        ...eligibleResumeState,
+        sessionUid: "another-session",
+      }) ||
+      shouldResumeMainAgentAfterBackgroundCompletion(eligibleResumeJob, {
+        ...eligibleResumeState,
+        generation: 8,
+      })
+    ) {
+      out("BACKGROUND_FAIL: idle resume eligibility\n");
+      return 1;
+    }
     await startMcpBridgeServer();
     const execution = await executeCodeWithPythonTool(
       `print(run_shell(${JSON.stringify(command)}, timeout=5, background=True))`
@@ -10443,12 +10509,15 @@ function wrapLineWithPrefixes(text, firstPrefix, continuationPrefix, cols) {
   const result = [];
   let remaining = source;
   let first = true;
+  let bodyStart = 0;
 
   if (remaining.length === 0) {
     return [
       {
         prefix: firstPrefix,
         body: "",
+        bodyStart: 0,
+        bodyEnd: 0,
         fullText: firstPrefix,
       },
     ];
@@ -10461,9 +10530,12 @@ function wrapLineWithPrefixes(text, firstPrefix, continuationPrefix, cols) {
     result.push({
       prefix,
       body,
+      bodyStart,
+      bodyEnd: bodyStart + body.length,
       fullText: `${prefix}${body}`,
     });
     remaining = remaining.slice(body.length);
+    bodyStart += body.length;
     first = false;
   }
 
@@ -10471,7 +10543,9 @@ function wrapLineWithPrefixes(text, firstPrefix, continuationPrefix, cols) {
 }
 
 function stripAnsiSgr(text) {
-  return String(text ?? "").replace(/\u001b\[[0-9;]*m/g, "");
+  return String(text ?? "")
+    .replace(/\u001b\][\s\S]*?(?:\u0007|\u001b\\)/g, "")
+    .replace(/\u001b\[[0-9;]*m/g, "");
 }
 
 function sanitizeTerminalOutput(text) {
@@ -10725,7 +10799,7 @@ function getMainFooterText() {
   text += ` | ${formatWorkspacePathForFooter(WORKSPACE_ROOT)}`;
   const mouseManuallyOff = APP_MOUSE_TRACKING_ENABLED && !mouseTrackingEnabled && !mouseSelectionMode;
   if (mouseManuallyOff) {
-    text += " | drag to select/copy · Alt+M mouse · PgUp/PgDn scroll";
+    text += " | drag to select/copy · Alt+S sessions · Alt+A agents · Alt+M mouse · PgUp/PgDn scroll";
   }
   return text;
 }
@@ -11798,7 +11872,8 @@ function startNamedAgentRefreshLoop() {
     agentsRefreshTimer = null;
     await refreshNamedAgents().catch(() => {});
     const viewingNamedChat = activeBuffer === "main" && activeAgentName !== "main";
-    const fast = activeBuffer === "agents" || viewingNamedChat || namedAgents.some((agent) => getNamedAgentStatus(agent) === "running");
+    const fast = activeBuffer === "agents" || activeBuffer === "agent_mention" ||
+      viewingNamedChat || namedAgents.some((agent) => getNamedAgentStatus(agent) === "running");
     agentsRefreshTimer = setTimeout(tick, fast ? 250 : 1500);
     agentsRefreshTimer.unref?.();
   };
@@ -13148,6 +13223,127 @@ function closeCommandBuffer(options = {}) {
   }
   markDirty();
   renderFrame(false);
+}
+
+function getAgentMentionCandidates() {
+  const currentName = String(activeAgentName || "main").toLowerCase();
+  const candidates = [];
+  if (currentName !== "main") {
+    candidates.push({
+      name: "main",
+      description: "Main agent session",
+      status: isAssistantThinking() ? "running" : "idle",
+    });
+  }
+  for (const agent of namedAgents) {
+    const name = String(agent?.name || "").trim();
+    if (!name || name.toLowerCase() === currentName) continue;
+    const description = normalizeSessionTitle(agent?.session_title) ||
+      getFirstSessionTitle(agent?.messages) ||
+      "Persistent agent session";
+    candidates.push({
+      name,
+      description: String(description).replace(/\s+/g, " ").trim(),
+      status: getNamedAgentStatus(agent),
+    });
+  }
+  const query = agentMentionQuery.trim().toLowerCase();
+  if (!query) return candidates;
+  return candidates.filter((entry) =>
+    entry.name.toLowerCase().includes(query) ||
+    entry.description.toLowerCase().includes(query) ||
+    entry.status.toLowerCase().includes(query)
+  );
+}
+
+function getAgentMentionVisibleCount() {
+  return Math.max(1, (process.stdout.rows || 24) - 4);
+}
+
+function updateAgentMentionSelectionState() {
+  const candidates = getAgentMentionCandidates();
+  if (candidates.length === 0) {
+    agentMentionSelected = 0;
+    agentMentionScroll = 0;
+    return;
+  }
+  agentMentionSelected = Math.max(0, Math.min(candidates.length - 1, agentMentionSelected));
+  const visibleCount = getAgentMentionVisibleCount();
+  if (agentMentionSelected < agentMentionScroll) {
+    agentMentionScroll = agentMentionSelected;
+  } else if (agentMentionSelected >= agentMentionScroll + visibleCount) {
+    agentMentionScroll = agentMentionSelected - visibleCount + 1;
+  }
+  agentMentionScroll = Math.max(
+    0,
+    Math.min(Math.max(0, candidates.length - visibleCount), agentMentionScroll)
+  );
+}
+
+function moveAgentMentionSelection(delta) {
+  const candidates = getAgentMentionCandidates();
+  if (candidates.length === 0) return false;
+  const previous = agentMentionSelected;
+  agentMentionSelected = Math.max(
+    0,
+    Math.min(candidates.length - 1, agentMentionSelected + (delta < 0 ? -1 : 1))
+  );
+  updateAgentMentionSelectionState();
+  return previous !== agentMentionSelected;
+}
+
+function composeAgentMentionInput(replacement) {
+  return `${agentMentionInputPrefix}${String(replacement || "")}${agentMentionInputSuffix}`;
+}
+
+function openAgentMentionBuffer() {
+  agentMentionInputPrefix = input.slice(0, inputCursorIndex);
+  agentMentionInputSuffix = input.slice(inputCursorIndex);
+  agentMentionQuery = "";
+  agentMentionSelected = 0;
+  agentMentionScroll = 0;
+  input = "";
+  inputCursorIndex = 0;
+  activeBuffer = "agent_mention";
+  enterAltScreenIfNeeded();
+  lastAgentMentionRenderedRows = [];
+  lastAgentMentionRenderedCols = 0;
+  lastAgentMentionRenderedHeight = 0;
+  forceFullClearOnNextRender = true;
+  cancelIdleFlush();
+  burstMode = false;
+  updateAgentMentionSelectionState();
+  markDirty();
+  renderFrame(true);
+}
+
+function closeAgentMentionBuffer(replacement = `@${agentMentionQuery}`) {
+  exitAltScreenIfNeeded({ preserveRestoredScreen: true });
+  activeBuffer = "main";
+  input = composeAgentMentionInput(replacement);
+  inputCursorIndex = agentMentionInputPrefix.length + String(replacement || "").length;
+  agentMentionQuery = "";
+  agentMentionSelected = 0;
+  agentMentionScroll = 0;
+  agentMentionInputPrefix = "";
+  agentMentionInputSuffix = "";
+  lastAgentMentionRenderedRows = [];
+  lastAgentMentionRenderedCols = 0;
+  lastAgentMentionRenderedHeight = 0;
+  inputVerticalGoalColumn = null;
+  breakSubmittedInputHistoryNavigation();
+  cancelIdleFlush();
+  burstMode = false;
+  markDirty();
+  renderFrame(false);
+}
+
+function insertSelectedAgentMention() {
+  updateAgentMentionSelectionState();
+  const selected = getAgentMentionCandidates()[agentMentionSelected];
+  if (!selected) return false;
+  closeAgentMentionBuffer(`@${selected.name} `);
+  return true;
 }
 
 function shouldTransitionCommandDirectlyToAltBuffer(commandName, commandArgs = "") {
@@ -15289,26 +15485,271 @@ function stylePythonToken(token, color) {
   return `${color}${token}${CODE_BLOCK_FG_COLOR}`;
 }
 
+function getMarkdownInlineStyleSpans(text) {
+  const raw = String(text ?? "");
+  const spans = [];
+  const addMatches = (regex, priority, style, splitMatch = null) => {
+    for (const match of raw.matchAll(regex)) {
+      if (typeof match.index !== "number") continue;
+      if (splitMatch) {
+        spans.push(...splitMatch(match));
+      } else {
+        spans.push({
+          start: match.index,
+          end: match.index + match[0].length,
+          priority,
+          style,
+        });
+      }
+    }
+  };
+
+  addMatches(/`([^`\n]+)`/g, 30, `${CODE_BLOCK_BG_COLOR}${MARKDOWN_INLINE_CODE_FG}`);
+  addMatches(/\*\*([^*\n]+)\*\*/g, 20, MARKDOWN_BOLD_COLOR);
+  addMatches(
+    /\[([^\]\n]+)\]\(([^)\n]+)\)/g,
+    10,
+    "",
+    (match) => {
+      const labelEnd = match.index + match[1].length + 2;
+      const href = String(match[2] || "").trim();
+      return [
+        {
+          start: match.index,
+          end: labelEnd,
+          priority: 10,
+          style: MARKDOWN_LINK_TEXT_COLOR,
+          href,
+        },
+        {
+          start: labelEnd,
+          end: match.index + match[0].length,
+          priority: 10,
+          style: MARKDOWN_LINK_URL_COLOR,
+          href,
+        },
+      ];
+    }
+  );
+  return spans;
+}
+
+function terminalHyperlink(url, text) {
+  const href = String(url || "").trim();
+  const label = String(text ?? "");
+  if (!/^https?:\/\/[^\s\u0000-\u001f\u007f]+$/i.test(href)) return label;
+  return `\u001b]8;;${href}\u001b\\${label}\u001b]8;;\u001b\\`;
+}
+
+function styleMarkdownInlineRange(text, start = 0, end = null, baseStyle = "") {
+  const raw = String(text ?? "");
+  const safeStart = Math.max(0, Math.min(raw.length, Number(start) || 0));
+  const requestedEnd = end === null ? raw.length : Number(end);
+  const safeEnd = Math.max(safeStart, Math.min(raw.length, Number.isFinite(requestedEnd) ? requestedEnd : raw.length));
+  const relevant = getMarkdownInlineStyleSpans(raw).filter(
+    (span) => span.end > safeStart && span.start < safeEnd
+  );
+  if (relevant.length === 0) {
+    const value = raw.slice(safeStart, safeEnd);
+    return {
+      styled: baseStyle ? `${baseStyle}${value}${RESET_COLOR}` : value,
+      changed: Boolean(baseStyle),
+    };
+  }
+
+  const boundaries = new Set([safeStart, safeEnd]);
+  for (const span of relevant) {
+    boundaries.add(Math.max(safeStart, span.start));
+    boundaries.add(Math.min(safeEnd, span.end));
+  }
+  const points = [...boundaries].sort((a, b) => a - b);
+  let styled = "";
+  let activeStyle = "";
+  for (let index = 0; index < points.length - 1; index += 1) {
+    const segmentStart = points[index];
+    const segmentEnd = points[index + 1];
+    const span = relevant
+      .filter((candidate) => candidate.start <= segmentStart && candidate.end >= segmentEnd)
+      .sort((a, b) => b.priority - a.priority)[0];
+    const nextStyle = span?.style || baseStyle;
+    if (nextStyle !== activeStyle) {
+      styled += nextStyle ? `${RESET_COLOR}${nextStyle}` : RESET_COLOR;
+      activeStyle = nextStyle;
+    }
+    const segment = raw.slice(segmentStart, segmentEnd);
+    styled += span?.href ? terminalHyperlink(span.href, segment) : segment;
+  }
+  if (activeStyle) styled += RESET_COLOR;
+  return { styled, changed: true };
+}
+
 function styleMarkdownInline(text) {
-  let changed = false;
-  let styled = String(text ?? "");
+  const raw = String(text ?? "");
+  return styleMarkdownInlineRange(raw, 0, raw.length);
+}
 
-  styled = styled.replace(/`([^`\n]+)`/g, (_match, code) => {
-    changed = true;
-    return `${CODE_BLOCK_BG_COLOR}${MARKDOWN_INLINE_CODE_FG}\`${code}\`${RESET_COLOR}`;
-  });
+function highlightMarkdownTextRange(text, start, end, allowBlockMarkers) {
+  const raw = String(text ?? "");
+  const safeStart = Math.max(0, Math.min(raw.length, Number(start) || 0));
+  const safeEnd = Math.max(safeStart, Math.min(raw.length, Number(end) || 0));
+  const slice = raw.slice(safeStart, safeEnd);
+  if (allowBlockMarkers && /^\s*(?:[-*_]\s*){3,}$/.test(raw)) {
+    return `${PLACEHOLDER_COLOR}${slice}${RESET_COLOR}`;
+  }
+  if (allowBlockMarkers && /^\s*#{1,6}\s+/.test(raw)) {
+    return styleMarkdownInlineRange(raw, safeStart, safeEnd, MARKDOWN_HEADER_COLOR).styled;
+  }
+  if (allowBlockMarkers && (/^\s*>\s?/.test(raw) || /^\s*(?:[-*+]|\d+\.)\s+/.test(raw))) {
+    const blockStyled = highlightMarkdownText(slice, true);
+    if (blockStyled) return blockStyled;
+  }
+  const inline = styleMarkdownInlineRange(raw, safeStart, safeEnd);
+  return inline.changed ? inline.styled : null;
+}
 
-  styled = styled.replace(/\*\*([^*\n]+)\*\*/g, (_match, value) => {
-    changed = true;
-    return `${MARKDOWN_BOLD_COLOR}**${value}**${RESET_COLOR}`;
-  });
+function splitMarkdownTableRow(line) {
+  let source = String(line ?? "").trim();
+  if (!source.includes("|")) return null;
+  if (source.startsWith("|")) source = source.slice(1);
+  if (source.endsWith("|")) source = source.slice(0, -1);
+  const cells = [];
+  let cell = "";
+  let inCode = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (character === "`" && source[index - 1] !== "\\") {
+      inCode = !inCode;
+      cell += character;
+    } else if (character === "|" && !inCode && source[index - 1] !== "\\") {
+      cells.push(cell.trim().replace(/\\\|/g, "|"));
+      cell = "";
+    } else {
+      cell += character;
+    }
+  }
+  cells.push(cell.trim().replace(/\\\|/g, "|"));
+  return cells.length >= 2 ? cells : null;
+}
 
-  styled = styled.replace(/\[([^\]\n]+)\]\(([^)\n]+)\)/g, (_match, label, url) => {
-    changed = true;
-    return `${MARKDOWN_LINK_TEXT_COLOR}[${label}]${RESET_COLOR}${MARKDOWN_LINK_URL_COLOR}(${url})${RESET_COLOR}`;
-  });
+function parseMarkdownTable(lines, startIndex) {
+  const header = splitMarkdownTableRow(lines[startIndex]);
+  const separator = splitMarkdownTableRow(lines[startIndex + 1]);
+  if (
+    !header ||
+    !separator ||
+    header.length !== separator.length ||
+    !separator.every((cell) => /^:?-{3,}:?$/.test(cell))
+  ) {
+    return null;
+  }
+  const alignments = separator.map((cell) =>
+    cell.startsWith(":") && cell.endsWith(":")
+      ? "center"
+      : cell.endsWith(":")
+        ? "right"
+        : "left"
+  );
+  const rows = [];
+  let endIndex = startIndex + 2;
+  while (endIndex < lines.length) {
+    const cells = splitMarkdownTableRow(lines[endIndex]);
+    if (!cells || cells.length !== header.length) break;
+    rows.push(cells);
+    endIndex += 1;
+  }
+  return { header, alignments, rows, endIndex };
+}
 
-  return { styled, changed };
+function wrapMarkdownTableCell(text, width) {
+  const source = String(text ?? "");
+  const available = Math.max(1, Number(width) || 1);
+  if (!source) return [{ start: 0, end: 0, text: "" }];
+  const chunks = [];
+  let cursor = 0;
+  while (cursor < source.length) {
+    while (source[cursor] === " ") cursor += 1;
+    if (cursor >= source.length) break;
+    let end = Math.min(source.length, cursor + available);
+    if (end < source.length) {
+      const wordBreak = source.lastIndexOf(" ", end);
+      if (wordBreak > cursor) end = wordBreak;
+    }
+    if (end <= cursor) end = Math.min(source.length, cursor + available);
+    chunks.push({ start: cursor, end, text: source.slice(cursor, end) });
+    cursor = end;
+  }
+  return chunks.length ? chunks : [{ start: 0, end: 0, text: "" }];
+}
+
+function allocateMarkdownTableWidths(table, maxWidth) {
+  const columnCount = table.header.length;
+  const borderWidth = columnCount * 3 + 1;
+  const cellBudget = Math.floor(maxWidth) - borderWidth;
+  if (cellBudget < columnCount) return null;
+  const allRows = [table.header, ...table.rows];
+  const natural = table.header.map((_, column) =>
+    Math.max(1, ...allRows.map((row) => String(row[column] ?? "").length))
+  );
+  if (natural.reduce((sum, width) => sum + width, 0) <= cellBudget) return natural;
+
+  const widths = natural.map((width, column) =>
+    Math.min(width, Math.max(1, Math.min(12, String(table.header[column] ?? "").length)))
+  );
+  while (widths.reduce((sum, width) => sum + width, 0) > cellBudget) {
+    const widest = widths.reduce(
+      (best, width, index) => width > widths[best] && width > 1 ? index : best,
+      0
+    );
+    if (widths[widest] <= 1) return null;
+    widths[widest] -= 1;
+  }
+  let remaining = cellBudget - widths.reduce((sum, width) => sum + width, 0);
+  while (remaining > 0) {
+    let grew = false;
+    for (let column = 0; column < columnCount && remaining > 0; column += 1) {
+      if (widths[column] >= natural[column]) continue;
+      widths[column] += 1;
+      remaining -= 1;
+      grew = true;
+    }
+    if (!grew) break;
+  }
+  return widths;
+}
+
+function renderMarkdownTable(table, maxWidth) {
+  const widths = allocateMarkdownTableWidths(table, maxWidth);
+  if (!widths) return null;
+  const border = (left, middle, right) =>
+    `${PLACEHOLDER_COLOR}${left}${widths.map((width) => "─".repeat(width + 2)).join(middle)}${right}${RESET_COLOR}`;
+  const output = [border("┌", "┬", "┐")];
+  const renderRow = (cells, header = false) => {
+    const wrapped = cells.map((cell, column) => wrapMarkdownTableCell(cell, widths[column]));
+    const height = Math.max(...wrapped.map((chunks) => chunks.length));
+    for (let row = 0; row < height; row += 1) {
+      let line = `${PLACEHOLDER_COLOR}│${RESET_COLOR}`;
+      for (let column = 0; column < cells.length; column += 1) {
+        const chunk = wrapped[column][row] || { start: 0, end: 0, text: "" };
+        const gap = Math.max(0, widths[column] - chunk.text.length);
+        const alignment = table.alignments[column];
+        const leftPad = alignment === "right" ? gap : alignment === "center" ? Math.floor(gap / 2) : 0;
+        const rightPad = gap - leftPad;
+        const styled = styleMarkdownInlineRange(
+          cells[column],
+          chunk.start,
+          chunk.end,
+          header ? MARKDOWN_HEADER_COLOR : ""
+        ).styled;
+        line += ` ${" ".repeat(leftPad)}${styled}${" ".repeat(rightPad)} ${PLACEHOLDER_COLOR}│${RESET_COLOR}`;
+      }
+      output.push(line);
+    }
+  };
+  renderRow(table.header, true);
+  output.push(border("├", "┼", "┤"));
+  for (const row of table.rows) renderRow(row, false);
+  output.push(border("└", "┴", "┘"));
+  return output;
 }
 
 function highlightMarkdownText(text, allowBlockMarkers) {
@@ -15682,6 +16123,30 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
       : i === 0
         ? `${assistantPrefix}${userPrefix}`
         : continuationPrefix;
+    const markdownTable =
+      displayRole === "assistant" &&
+      !isToolCall &&
+      !lineMeta.python &&
+      !logicalLineMeta[i + 1]?.python
+        ? parseMarkdownTable(logicalLines, i)
+        : null;
+    if (markdownTable) {
+      const visiblePrefix = i === 0 ? "\u2022 " : continuationPrefix;
+      const tableLines = renderMarkdownTable(
+        markdownTable,
+        Math.max(1, contentWidth - visiblePrefix.length)
+      );
+      if (tableLines) {
+        for (let tableLineIndex = 0; tableLineIndex < tableLines.length; tableLineIndex += 1) {
+          const prefix = i === 0 && tableLineIndex === 0
+            ? `${PLACEHOLDER_COLOR}\u2022${RESET_COLOR} `
+            : continuationPrefix;
+          output.push(styleInlineTokens(`${prefix}${tableLines[tableLineIndex]}`));
+        }
+        i = markdownTable.endIndex - 1;
+        continue;
+      }
+    }
     const wrapped = wrapLineWithPrefixes(
       body,
       firstPrefix,
@@ -15750,7 +16215,12 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
       } else if (displayRole === "assistant" && lineMeta.python) {
         line = highlightPythonCodeLine(visibleText.padEnd(contentWidth, " "), lineMeta.fence);
       } else if (displayRole === "assistant") {
-        const styledMarkdown = highlightMarkdownText(wrappedLine.body, w === 0);
+        const styledMarkdown = highlightMarkdownTextRange(
+          body,
+          wrappedLine.bodyStart,
+          wrappedLine.bodyEnd,
+          w === 0
+        );
         if (styledMarkdown) {
           line = `${wrappedLine.prefix}${styledMarkdown}`;
         } else if (i === 0 && w === 0) {
@@ -17129,6 +17599,108 @@ function render() {
   renderFrame(false);
 }
 
+function renderAgentMentionBuffer() {
+  process.stdout.write(HIDE_CURSOR);
+  const rows = process.stdout.rows || 24;
+  const cols = process.stdout.columns || 80;
+  const visibleCount = getAgentMentionVisibleCount();
+  updateAgentMentionSelectionState();
+  const candidates = getAgentMentionCandidates();
+
+  if (!hasInitializedScreen) {
+    readline.cursorTo(process.stdout, 0, 0);
+    readline.clearScreenDown(process.stdout);
+    hasInitializedScreen = true;
+  }
+  if (forceFullClearOnNextRender) {
+    readline.cursorTo(process.stdout, 0, 0);
+    readline.clearScreenDown(process.stdout);
+    forceFullClearOnNextRender = false;
+    lastAgentMentionRenderedRows = [];
+  }
+  if (
+    lastAgentMentionRenderedCols !== cols ||
+    lastAgentMentionRenderedHeight !== rows
+  ) {
+    lastAgentMentionRenderedRows = [];
+    lastAgentMentionRenderedCols = cols;
+    lastAgentMentionRenderedHeight = rows;
+  }
+
+  const frameRows = Array.from({ length: rows }, () => ({
+    text: " ".repeat(cols),
+    styledText: "",
+    color: null,
+  }));
+  const setRow = (y, text, options = {}) => {
+    if (y < 0 || y >= rows) return;
+    const raw = String(text || "").slice(0, cols).padEnd(cols, " ");
+    frameRows[y] = {
+      text: raw,
+      styledText: String(options.styledText || ""),
+      color: options.color || null,
+    };
+  };
+
+  const promptText = `${PROMPT_PREFIX}@${agentMentionQuery}`;
+  setRow(0, promptText);
+  setRow(1, "");
+  if (candidates.length === 0) {
+    setRow(2, "  no matching agents", { color: PLACEHOLDER_COLOR });
+  } else {
+    const visible = candidates.slice(agentMentionScroll, agentMentionScroll + visibleCount);
+    const nameWidth = Math.min(
+      Math.max(10, ...visible.map((entry) => entry.name.length + 2)),
+      Math.max(10, Math.floor(cols * 0.28))
+    );
+    const statusWidth = Math.min(10, Math.max(6, ...visible.map((entry) => entry.status.length + 2)));
+    const descriptionWidth = Math.max(0, cols - 2 - nameWidth - statusWidth);
+    visible.forEach((entry, visibleIndex) => {
+      const index = agentMentionScroll + visibleIndex;
+      const selected = index === agentMentionSelected;
+      const marker = selected ? "> " : "  ";
+      const name = entry.name.slice(0, nameWidth).padEnd(nameWidth, " ");
+      const description = entry.description.slice(0, descriptionWidth).padEnd(descriptionWidth, " ");
+      const statusLabel = entry.status.charAt(0).toUpperCase() + entry.status.slice(1);
+      const status = statusLabel.slice(0, statusWidth).padStart(statusWidth, " ");
+      const raw = `${marker}${name}${description}${status}`.slice(0, cols).padEnd(cols, " ");
+      const background = selected ? SESSION_EVEN_BG_COLOR : "";
+      const nameColor = selected ? VSCODE_BLUE_COLOR : AGENT_MENTION_NAME_COLOR;
+      const statusColor = selected ? VSCODE_BLUE_COLOR : AGENT_MENTION_NAME_COLOR;
+      const styledText =
+        `${background}${nameColor}${marker}${name}${RESET_COLOR}` +
+        `${background}${PLACEHOLDER_COLOR}${description}${RESET_COLOR}` +
+        `${background}${statusColor}${status}${RESET_COLOR}`;
+      setRow(2 + visibleIndex, raw, { styledText });
+    });
+  }
+  setRow(rows - 1, "enter insert  ·  esc close  ·  ↑/↓ select", {
+    color: PLACEHOLDER_COLOR,
+  });
+
+  for (let y = 0; y < rows; y += 1) {
+    const nextRow = frameRows[y];
+    const previousRow = lastAgentMentionRenderedRows[y];
+    if (
+      previousRow &&
+      previousRow.text === nextRow.text &&
+      previousRow.styledText === nextRow.styledText &&
+      previousRow.color === nextRow.color
+    ) continue;
+    if (nextRow.styledText) {
+      writeStyledLine(y, nextRow.text, nextRow.styledText, cols);
+    } else if (nextRow.color) {
+      writeColoredLine(y, nextRow.text, cols, nextRow.color);
+    } else {
+      writeLine(y, nextRow.text, cols);
+    }
+  }
+  lastAgentMentionRenderedRows = frameRows;
+  readline.cursorTo(process.stdout, Math.min(promptText.length, Math.max(0, cols - 1)), 0);
+  process.stdout.write(SHOW_CURSOR);
+  dirty = false;
+}
+
 function renderCommandBuffer() {
   process.stdout.write(HIDE_CURSOR);
 
@@ -17749,6 +18321,10 @@ function renderFrame(forceChatRefresh = false) {
 
   if (activeBuffer === "command") {
     renderCommandBuffer();
+    return;
+  }
+  if (activeBuffer === "agent_mention") {
+    renderAgentMentionBuffer();
     return;
   }
   if (activeBuffer === "model") {
@@ -19428,6 +20004,49 @@ function runFormatSelfTest() {
       out("FORMAT_FAIL: main-agent @mention handoff parsing or status is incorrect\n");
       return 1;
     }
+    const savedMentionAgents = namedAgents;
+    const savedMentionActiveAgent = activeAgentName;
+    const savedMentionQuery = agentMentionQuery;
+    const savedMentionSelected = agentMentionSelected;
+    const savedMentionScroll = agentMentionScroll;
+    const savedMentionPrefix = agentMentionInputPrefix;
+    const savedMentionSuffix = agentMentionInputSuffix;
+    let agentMentionPickerOk = false;
+    try {
+      activeAgentName = "main";
+      namedAgents = [
+        { name: "Kral", status: "idle", session_title: "Weather checks", messages: [] },
+        { name: "Price", status: "running", session_title: "Gold prices", messages: [] },
+      ];
+      agentMentionQuery = "kr";
+      agentMentionSelected = 0;
+      agentMentionScroll = 0;
+      agentMentionInputPrefix = "";
+      agentMentionInputSuffix = "existing suffix";
+      const filteredMentionAgents = getAgentMentionCandidates();
+      const composedMention = composeAgentMentionInput("@Kral ");
+      activeAgentName = "Kral";
+      agentMentionQuery = "";
+      const workerMentionAgents = getAgentMentionCandidates();
+      agentMentionPickerOk =
+        filteredMentionAgents.length === 1 &&
+        filteredMentionAgents[0]?.name === "Kral" &&
+        composedMention === "@Kral existing suffix" &&
+        workerMentionAgents.some((entry) => entry.name === "main") &&
+        !workerMentionAgents.some((entry) => entry.name === "Kral");
+    } finally {
+      namedAgents = savedMentionAgents;
+      activeAgentName = savedMentionActiveAgent;
+      agentMentionQuery = savedMentionQuery;
+      agentMentionSelected = savedMentionSelected;
+      agentMentionScroll = savedMentionScroll;
+      agentMentionInputPrefix = savedMentionPrefix;
+      agentMentionInputSuffix = savedMentionSuffix;
+    }
+    if (!agentMentionPickerOk) {
+      out("FORMAT_FAIL: agent mention picker filtering or insertion is incorrect\n");
+      return 1;
+    }
     const planToBuildFixture = {
       name: "plan-round-trip",
       session_uid: "plan-round-trip-session",
@@ -20213,6 +20832,45 @@ function runFormatSelfTest() {
       resumedCompactionText[2] !== "what was we talking about"
     ) {
       out("FORMAT_FAIL: resumed compaction must place queued user messages after completion\n");
+      return 1;
+    }
+
+    const wrappedLinkTarget = "https://example.test/a/very/long/path/that/wraps/across/terminal/rows";
+    const wrappedMarkdownLink = buildTranscriptLinesForEntry({
+      role: "assistant",
+      content: `Source: [link](${wrappedLinkTarget})`,
+    }, 36);
+    const wrappedLinkOsc = `\u001b]8;;${wrappedLinkTarget}\u001b\\`;
+    if (
+      !wrappedMarkdownLink.some((line) => line.includes(MARKDOWN_LINK_TEXT_COLOR)) ||
+      wrappedMarkdownLink.filter((line) => line.includes(MARKDOWN_LINK_URL_COLOR)).length < 2 ||
+      wrappedMarkdownLink.filter((line) => line.includes(wrappedLinkOsc)).length < 2 ||
+      wrappedMarkdownLink.map(stripAnsiSgr).some((line) => line.includes("\u001b]8;;"))
+    ) {
+      out("FORMAT_FAIL: wrapped markdown links must retain styling and their complete click target on every row\n");
+      return 1;
+    }
+
+    const markdownTableLines = buildTranscriptLinesForEntry({
+      role: "assistant",
+      content: [
+        "| # | Title | Author | Link |",
+        "|---|-------|--------|------|",
+        "| 1 | A long title that wraps cleanly inside its table cell | u/example | [link](https://example.test/a/very/long/table/link/path) |",
+        "| 2 | Short title | u/other | [link](https://example.test/other) |",
+      ].join("\n"),
+    }, 64);
+    const plainMarkdownTable = markdownTableLines.map(stripAnsiSgr);
+    if (
+      !plainMarkdownTable.some((line) => line.includes("┌") && line.includes("┬")) ||
+      !plainMarkdownTable.some((line) => line.includes("├") && line.includes("┼")) ||
+      !plainMarkdownTable.some((line) => line.includes("└") && line.includes("┴")) ||
+      plainMarkdownTable.some((line) => line.length > 64) ||
+      plainMarkdownTable.some((line) => line.includes("|---")) ||
+      markdownTableLines.filter((line) => line.includes(MARKDOWN_LINK_URL_COLOR)).length < 2 ||
+      !markdownTableLines.some((line) => line.includes(MARKDOWN_HEADER_COLOR))
+    ) {
+      out(`FORMAT_FAIL: markdown table rendering is incomplete\n${plainMarkdownTable.join("\n")}\n`);
       return 1;
     }
 
@@ -22142,6 +22800,12 @@ process.stdin.on("data", (rawChunk) => {
 
   if (activeBuffer === "command" && chunk === "\u001b") {
     closeCommandBuffer();
+  } else if (activeBuffer === "agent_mention" && chunk === "\u001b") {
+    // Bypass readline's standalone-Escape ambiguity delay. Suppress the
+    // delayed keypress so it cannot clear the mention restored to the input.
+    suppressAgentMentionEscapeKeypressUntil = Date.now() + 1500;
+    closeAgentMentionBuffer();
+    return;
   } else if (activeBuffer === "model" && chunk === "\u001b") {
     closeModelBuffer();
   } else if (activeBuffer === "sessions" && chunk === "\u001b") {
@@ -22224,6 +22888,10 @@ process.stdin.on("keypress", async (str, key) => {
     suppressSolveEscapeKeypressUntil = 0;
     return;
   }
+  if (isEscapeKey && Date.now() < suppressAgentMentionEscapeKeypressUntil) {
+    suppressAgentMentionEscapeKeypressUntil = 0;
+    return;
+  }
   const hasMouseNoise =
     isStandaloneMouseSequence(str) ||
     isStandaloneMouseSequence(seq) ||
@@ -22291,6 +22959,22 @@ process.stdin.on("keypress", async (str, key) => {
 
   if (mouseSelectionMode) {
     exitMouseSelectionMode();
+  }
+
+  const isOpenAgentsShortcut =
+    activeBuffer === "main" &&
+    ((key?.meta && key?.name === "a") || key?.sequence === "\u001ba");
+  if (isOpenAgentsShortcut) {
+    openAgentsBuffer();
+    return;
+  }
+
+  const isOpenSessionsShortcut =
+    activeBuffer === "main" &&
+    ((key?.meta && key?.name === "s") || key?.sequence === "\u001bs");
+  if (isOpenSessionsShortcut) {
+    openSessionsBuffer();
+    return;
   }
 
   const isToggleMouseCapture =
@@ -23125,6 +23809,67 @@ process.stdin.on("keypress", async (str, key) => {
     return;
   }
 
+  if (activeBuffer === "agent_mention") {
+    if (key?.ctrl) return;
+    if (
+      key?.name === "escape" ||
+      key?.sequence === "\u001b" ||
+      str === "\u001b"
+    ) {
+      closeAgentMentionBuffer();
+      return;
+    }
+    if (key?.name === "up" || key?.name === "down") {
+      moveAgentMentionSelection(key.name === "up" ? -1 : 1);
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+    if (key?.name === "backspace") {
+      if (agentMentionQuery.length === 0) {
+        closeAgentMentionBuffer("");
+      } else {
+        agentMentionQuery = agentMentionQuery.slice(0, -1);
+        agentMentionSelected = 0;
+        agentMentionScroll = 0;
+        updateAgentMentionSelectionState();
+        markDirty();
+        renderFrame(true);
+      }
+      return;
+    }
+    if (
+      key?.sequence === "\r" ||
+      key?.name === "return" ||
+      key?.name === "enter" ||
+      key?.name === "tab"
+    ) {
+      insertSelectedAgentMention();
+      return;
+    }
+    if (!key?.meta && str && !str.startsWith("\u001b")) {
+      if (shouldBlockPastedInput(str)) return;
+      if (/^[A-Za-z0-9._-]+$/.test(str)) {
+        agentMentionQuery += str;
+        agentMentionSelected = 0;
+        agentMentionScroll = 0;
+        updateAgentMentionSelectionState();
+        markDirty();
+        renderFrame(true);
+      } else {
+        const exact = getAgentMentionCandidates().find(
+          (entry) => entry.name.toLowerCase() === agentMentionQuery.toLowerCase()
+        );
+        const replacement = /^\s+$/.test(str) && exact
+          ? `@${exact.name}${str}`
+          : `@${agentMentionQuery}${str}`;
+        closeAgentMentionBuffer(replacement);
+      }
+      return;
+    }
+    return;
+  }
+
   if (
     !key?.ctrl &&
     !key?.meta &&
@@ -23133,6 +23878,17 @@ process.stdin.on("keypress", async (str, key) => {
     inputCursorIndex === 0
   ) {
     openCommandBuffer("");
+    return;
+  }
+
+  if (
+    !key?.ctrl &&
+    !key?.meta &&
+    str === "@" &&
+    input.slice(0, inputCursorIndex).trim().length === 0
+  ) {
+    openAgentMentionBuffer();
+    refreshNamedAgents().catch(() => {});
     return;
   }
 
