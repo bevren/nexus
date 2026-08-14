@@ -30,6 +30,7 @@ _AGENT_RUNTIME: dict[str, object] = {
     "reasoning_effort": "low",
     "session_id": "",
     "collaboration_mode": "build",
+    "settings": {},
 }
 
 _PLAN_ALLOWED_TOOLS = {
@@ -115,6 +116,7 @@ def configure_agent_runtime(
     reasoning_effort: str = "low",
     session_id: str = "",
     collaboration_mode: str = "build",
+    runtime_settings: dict | None = None,
 ) -> None:
     """Install the parent Nexus runtime inherited by subsequently spawned agents."""
     _AGENT_RUNTIME.update(
@@ -125,8 +127,16 @@ def configure_agent_runtime(
             "reasoning_effort": str(reasoning_effort or "low"),
             "session_id": str(session_id or ""),
             "collaboration_mode": "plan" if collaboration_mode == "plan" else "build",
+            "settings": dict(runtime_settings) if isinstance(runtime_settings, dict) else {},
         }
     )
+
+
+def get_agent_runtime() -> dict[str, object]:
+    """Return a copy of the runtime inherited by tools and delegated agents."""
+    runtime = dict(_AGENT_RUNTIME)
+    runtime["settings"] = dict(_AGENT_RUNTIME.get("settings") or {})
+    return runtime
 
 
 def get_agent_runtime_session_id() -> str:
@@ -726,6 +736,8 @@ def run_subagent_job(job_path: str) -> int:
         reasoning_effort=str(runtime.get("reasoning_effort") or "low"),
         session_id=str(runtime.get("session_id") or entry.get("scope_id") or ""),
         collaboration_mode=str(runtime.get("collaboration_mode") or "build"),
+        runtime_settings=(entry.get("session_runtime") or {}).get("settings")
+        if isinstance(entry.get("session_runtime"), dict) else {},
     )
     _subagent_worker(entry, on_update=lambda current: _write_job(path, current))
     return 0 if entry.get("status") == "done" else 1

@@ -14,10 +14,13 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
 import difflib
 import textwrap
 import bisect
 import hashlib
+import errno
+import uuid
 from datetime import datetime, timezone
 from typing import Iterable
 import harness
@@ -2024,6 +2027,8 @@ def configure_subagent_runtime(
     reasoning_enabled: bool = False,
     reasoning_effort: str = "low",
     session_id: str = "",
+    collaboration_mode: str = "build",
+    runtime_settings: dict | None = None,
 ) -> None:
     """Internal bridge: make child agents inherit the active Nexus runtime."""
     harness.configure_agent_runtime(
@@ -2032,7 +2037,272 @@ def configure_subagent_runtime(
         reasoning_enabled=reasoning_enabled,
         reasoning_effort=reasoning_effort,
         session_id=session_id,
+        collaboration_mode=collaboration_mode,
+        runtime_settings=runtime_settings,
     )
+
+
+def _normalize_named_agent_name(value: str) -> str:
+    name = str(value or "").strip()
+    if not name or len(name) > 48 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+        raise ValueError("agent name must use letters, numbers, dot, dash, or underscore (max 48 characters)")
+    return name
+
+
+def _named_agent_record_path(name: str) -> Path:
+    workspace_scope = hashlib.sha256(str(WORKSPACE_ROOT).encode("utf-8")).hexdigest()[:16]
+    key = name.lower()
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+    prefix = re.sub(r"[^a-z0-9._-]+", "-", key)[:24] or "agent"
+    return NEXUS_DIR / "agents" / workspace_scope / f"{prefix}-{digest}.json"
+
+
+def _read_named_agent_record(path: Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _write_named_agent_record(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        for attempt in range(10):
+            try:
+                os.replace(temporary, path)
+                return
+            except OSError as exc:
+                transient = (
+                    exc.errno in {errno.EACCES, errno.EPERM, errno.EBUSY}
+                    or getattr(exc, "winerror", None) in {5, 32, 33}
+                )
+                if not transient or attempt == 9:
+                    raise
+                time.sleep(min(0.4, 0.02 * (2 ** attempt)))
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _new_named_agent_record(name: str, task: str) -> dict:
+    runtime = harness.get_agent_runtime()
+    now = time.time()
+    session_uid = uuid.uuid4().hex
+    model = str(runtime.get("model") or "")
+    settings = dict(runtime.get("settings") or {})
+    request_timeout_ms = settings.get("request_timeout_ms", 300_000)
+    try:
+        request_timeout = max(1, round(float(request_timeout_ms) / 1000))
+    except (TypeError, ValueError):
+        request_timeout = 300
+    reasoning_enabled = bool(runtime.get("reasoning_enabled"))
+    reasoning_effort = str(runtime.get("reasoning_effort") or "low")
+    collaboration_mode = "plan" if runtime.get("collaboration_mode") == "plan" else "build"
+    system_prompt = str(runtime.get("system_prompt") or "")
+    return {
+        "kind": "named-agent",
+        "id": "agent-" + hashlib.sha256(f"{WORKSPACE_ROOT}:{name.lower()}".encode("utf-8")).hexdigest()[:16],
+        "name": name,
+        "session_uid": session_uid,
+        "session_title": task,
+        "workspace": str(WORKSPACE_ROOT),
+        "model": model,
+        "timeout": request_timeout,
+        "max_tokens": 0,
+        "reasoning_enabled": reasoning_enabled,
+        "reasoning_effort": reasoning_effort,
+        "messages": [{"role": "system", "content": system_prompt}],
+        "status": "idle",
+        "result": None,
+        "error": None,
+        "created_at": now,
+        "updated_at": now,
+        "turn": 0,
+        "runtime": {
+            "system_prompt": system_prompt,
+            "model": model,
+            "reasoning_enabled": reasoning_enabled,
+            "reasoning_effort": reasoning_effort,
+            "collaboration_mode": collaboration_mode,
+            "session_id": f"named-{name.lower()}-{session_uid}",
+        },
+        "session_runtime": {
+            "model": model,
+            "collaboration_mode": collaboration_mode,
+            "reasoning_by_model": {model: reasoning_enabled} if model else {},
+            "settings": settings,
+            "context_left_by_model": {},
+            "cache_telemetry_by_model": {},
+        },
+    }
+
+
+def _admit_named_agent(name: str, task: str) -> dict:
+    normalized_name = _normalize_named_agent_name(name)
+    normalized_task = str(task or "").strip()
+    if not normalized_task:
+        return {"ok": False, "agent": normalized_name, "error": "task must be non-empty"}
+    if normalized_name.lower() == "main":
+        return {"ok": False, "agent": normalized_name, "error": "main must be targeted through the Nexus session router"}
+    runtime_session_id = str(harness.get_agent_runtime().get("session_id") or "").lower()
+    if runtime_session_id.startswith(f"named-{normalized_name.lower()}-"):
+        return {"ok": False, "agent": normalized_name, "error": "an agent cannot delegate a task to itself"}
+
+    record_path = _named_agent_record_path(normalized_name)
+    record = _read_named_agent_record(record_path)
+    if not record:
+        record = _new_named_agent_record(normalized_name, normalized_task)
+    status = str(record.get("status") or "idle").lower()
+    if status in {"admitted", "running"}:
+        return {"ok": False, "agent": str(record.get("name") or normalized_name), "status": status, "error": f"Agent {record.get('name') or normalized_name} is already working"}
+
+    call_id = uuid.uuid4().hex
+    record["messages"] = list(record.get("messages") or [])
+    record["messages"].append({"role": "user", "content": normalized_task})
+    if not str(record.get("session_title") or "").strip():
+        record["session_title"] = normalized_task
+    record["prompt"] = normalized_task
+    record["status"] = "admitted"
+    record["result"] = None
+    record["error"] = None
+    record["pid"] = None
+    record["task_started_at"] = time.time()
+    record["active_loop_id"] = ""
+    record["main_handoff_id"] = ""
+    record["agent_tool_call_id"] = call_id
+    record["updated_at"] = time.time()
+    _write_named_agent_record(record_path, record)
+    try:
+        pid = harness.launch_subagent_job(str(record_path))
+    except Exception as exc:
+        latest = _read_named_agent_record(record_path) or record
+        if latest.get("agent_tool_call_id") == call_id:
+            latest["status"] = "stopped"
+            latest["error"] = f"failed to launch agent: {exc}"
+            latest["updated_at"] = time.time()
+            _write_named_agent_record(record_path, latest)
+        return {"ok": False, "agent": str(record.get("name") or normalized_name), "status": "stopped", "error": str(exc)}
+    return {
+        "ok": True,
+        "agent": str(record.get("name") or normalized_name),
+        "status": "admitted",
+        "pid": pid,
+        "call_id": call_id,
+        "record_path": str(record_path),
+    }
+
+
+def notify_agent(name: str, task: str) -> dict:
+    """Start a named Nexus agent and return as soon as its task is admitted."""
+    admitted = _admit_named_agent(name, task)
+    admitted.pop("record_path", None)
+    admitted.pop("call_id", None)
+    return admitted
+
+
+def delegate_agent(
+    name: str,
+    task: str,
+    timeout: int | float = 240,
+    poll_interval: int | float = 0.25,
+) -> dict:
+    """Run a task in a named Nexus agent and wait for its terminal result."""
+    admitted = _admit_named_agent(name, task)
+    if not admitted.get("ok"):
+        admitted.pop("record_path", None)
+        admitted.pop("call_id", None)
+        return admitted
+    try:
+        timeout_seconds = max(0.1, min(3600.0, float(timeout)))
+        interval_seconds = max(0.05, min(2.0, float(poll_interval)))
+    except (TypeError, ValueError):
+        return {"ok": False, "agent": admitted["agent"], "status": "admitted", "error": "timeout and poll_interval must be numbers"}
+    deadline = time.monotonic() + timeout_seconds
+    record_path = Path(admitted["record_path"])
+    call_id = admitted["call_id"]
+    while time.monotonic() < deadline:
+        record = _read_named_agent_record(record_path)
+        if record and record.get("agent_tool_call_id") != call_id:
+            return {"ok": False, "agent": admitted["agent"], "status": "stopped", "error": "agent session changed while waiting for its result"}
+        status = str((record or {}).get("status") or "admitted").lower()
+        if status in {"done", "error", "stopped"}:
+            result = str((record or {}).get("result") or "").strip()
+            error = str((record or {}).get("error") or "").strip()
+            if status == "done":
+                return {"ok": True, "agent": str((record or {}).get("name") or admitted["agent"]), "status": status, "result": result}
+            return {"ok": False, "agent": str((record or {}).get("name") or admitted["agent"]), "status": status, "error": error or "agent stopped before completing the task"}
+        time.sleep(interval_seconds)
+    return {
+        "ok": False,
+        "agent": admitted["agent"],
+        "status": "running",
+        "error": f"timed out after {timeout_seconds:g}s while waiting; the named agent is still running",
+    }
+
+
+def _run_named_agent_tool_self_test() -> dict:
+    """Exercise named-agent admission/result behavior without a live provider."""
+    global NEXUS_DIR
+    temporary_root = Path(tempfile.mkdtemp(prefix="nexus-agent-tools-"))
+    original_nexus_dir = NEXUS_DIR
+    original_launcher = harness.launch_subagent_job
+    try:
+        NEXUS_DIR = temporary_root
+        configure_subagent_runtime(
+            system_prompt="named agent tool self-test",
+            model="self-test/model",
+            reasoning_enabled=True,
+            reasoning_effort="high",
+            session_id="main-self-test",
+            collaboration_mode="build",
+            runtime_settings={"context_window": 1_000_000, "request_timeout_ms": 600_000},
+        )
+
+        def complete_agent(job_path: str) -> int:
+            path = Path(job_path)
+            record = _read_named_agent_record(path)
+            if not record:
+                raise AssertionError("delegated agent record was not written")
+            record["status"] = "done"
+            record["result"] = "delegated answer"
+            _write_named_agent_record(path, record)
+            return 321
+
+        harness.launch_subagent_job = complete_agent
+        delegated = delegate_agent("Kral", "check weather", timeout=1)
+        if delegated != {
+            "ok": True,
+            "agent": "Kral",
+            "status": "done",
+            "result": "delegated answer",
+        }:
+            raise AssertionError(f"delegate_agent returned an unexpected result: {delegated}")
+
+        harness.launch_subagent_job = lambda _job_path: 654
+        notified = notify_agent("Price", "check gold")
+        if notified != {
+            "ok": True,
+            "agent": "Price",
+            "status": "admitted",
+            "pid": 654,
+        }:
+            raise AssertionError(f"notify_agent returned an unexpected result: {notified}")
+        price_record = _read_named_agent_record(_named_agent_record_path("Price")) or {}
+        context_window = ((price_record.get("session_runtime") or {}).get("settings") or {}).get("context_window")
+        if context_window != 1_000_000:
+            raise AssertionError("named agent did not inherit the source session runtime settings")
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    finally:
+        harness.launch_subagent_job = original_launcher
+        NEXUS_DIR = original_nexus_dir
+        shutil.rmtree(temporary_root, ignore_errors=True)
 
 def rlm_spawn(
     prompt: str,
@@ -2471,6 +2741,8 @@ def deep_think(thought: str) -> dict:
 
 FUNCTIONS = {
     "deep_think": deep_think,
+    "delegate_agent": delegate_agent,
+    "notify_agent": notify_agent,
     "tool_search": tool_search,
     "create_plan": create_plan,
     "update_plan": update_plan,
@@ -2520,6 +2792,8 @@ FUNCTIONS = {
 
 FUNCTION_DESCRIPTIONS = {
     "deep_think": "deep_think(thought: str) -> dict: Record a private deliberate reasoning step, then continue solving with the returned acknowledgement. Available when External thinking is enabled and native thinking is disabled.",
+    "delegate_agent": "delegate_agent(name: str, task: str, timeout: int|float = 240, poll_interval: int|float = 0.25) -> dict: Send a task to an idle named Nexus agent and wait for its final result. The target inherits its own persistent session, tools, MCP, skills, runtime settings, and shared workspace. Returns {ok, agent, status, result|error}.",
+    "notify_agent": "notify_agent(name: str, task: str) -> dict: Start a task in an idle named Nexus agent and return immediately after admission. This is fire-and-forget: do not wait or poll unless the user later asks. Returns {ok, agent, status, pid|error}.",
     "tool_search": "tool_search(query: str, limit: int = 5) -> dict: Search deferred built-in helper names and descriptions. Returns the most relevant exact helper signatures; call a discovered helper in a later execute block.",
     "create_plan": "create_plan(entries: str|list[str]) -> dict: Create a new workspace to-do plan and return the full plan.",
     "update_plan": "update_plan(completed: int|str|list[int|str]|None = None, new_entries: str|list[str]|None = None) -> dict: Mark plan entries completed and/or add new plan entries, then return updated entries and current plan.",
@@ -2599,6 +2873,8 @@ def main() -> int:
         return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--self-test-subagents":
         result = harness.run_subagent_self_test()
+        if result.get("ok"):
+            result = _run_named_agent_tool_self_test()
         print("SUBAGENT_OK" if result.get("ok") else "SUBAGENT_FAIL")
         return 0 if result.get("ok") else 1
     if len(sys.argv) > 1 and sys.argv[1] == "--list-skills-json":

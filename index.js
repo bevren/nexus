@@ -1098,6 +1098,8 @@ const PLAN_MODE_ALLOWED_TOOL_NAMES = new Set([
 ]);
 const SYSTEM_PROMPT_VISIBLE_TOOL_NAMES = new Set([
   "tool_search",
+  "delegate_agent",
+  "notify_agent",
   "mcp_search",
   "list_skills",
   "get_skill",
@@ -1131,6 +1133,10 @@ const SYSTEM_PROMPT_VISIBLE_TOOL_NAMES = new Set([
 const FALLBACK_TOOL_DESCRIPTIONS = {
   deep_think:
     "deep_think(thought: str) -> dict: Record a private deliberate reasoning step, then continue solving with the returned acknowledgement. Available when External thinking is enabled and native thinking is disabled.",
+  delegate_agent:
+    "delegate_agent(name: str, task: str, timeout: int|float = 240, poll_interval: int|float = 0.25) -> dict: Send a task to an idle named Nexus agent and wait for its final result. The target inherits its own persistent session, tools, MCP, skills, runtime settings, and shared workspace. Returns {ok, agent, status, result|error}.",
+  notify_agent:
+    "notify_agent(name: str, task: str) -> dict: Start a task in an idle named Nexus agent and return immediately after admission. This is fire-and-forget: do not wait or poll unless the user later asks. Returns {ok, agent, status, pid|error}.",
   tool_search:
     "tool_search(query: str, limit: int = 5) -> dict: Search deferred built-in helper names and descriptions. Returns only the most relevant helper signatures; call the discovered helper in a later execute block.",
   harness_overview:
@@ -2272,6 +2278,8 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
         ]),
     "",
     "SUBAGENT ORCHESTRATION (MUST FOLLOW):",
+    "- delegate_agent(name, task) hands work to a persistent named Nexus agent and waits for its final result. Use it when your next step depends on that named agent's answer.",
+    "- notify_agent(name, task) starts a persistent named Nexus agent and returns immediately after admission. Use it for fire-and-forget work; do not poll or wait unless the user later asks.",
     "- rlm_spawn children are persistent full Nexus agent processes with no tool-turn ceiling. They inherit the active provider/model, this system prompt, execute-block loop, workspace, and tool chain; they may inspect, create, edit, execute, and verify within the delegated scope.",
     "- rlm_spawn is non-blocking: it returns an admitted handle immediately. End the spawn block, then continue useful independent parent work on subsequent turns. call wait_subagents only later, when the next step truly depends on child completion, because wait_subagents intentionally blocks.",
     "- Delegate independent, non-overlapping tasks and include task-specific context in each prompt. Because all children share the workspace, never assign overlapping file ownership concurrently.",
@@ -7757,6 +7765,28 @@ function buildExecutableCodeForToolCall(toolName, toolArgs) {
 async function executeCodeWithPythonTool(code, options = {}) {
   let tempDir = "";
   const onOutput = typeof options?.onOutput === "function" ? options.onOutput : null;
+  const executionRuntime = options?.runtime && typeof options.runtime === "object"
+    ? options.runtime
+    : {
+        systemPrompt: systemPromptText,
+        model: selectedModel,
+        reasoningEnabled: getReasoningEnabledForModel(selectedModel),
+        reasoningEffort: getThinkingEffort(),
+        collaborationMode,
+        sessionId: currentSessionUid || "",
+        settings: getMainSessionRuntimeSettings(),
+      };
+  const executionSystemPrompt = String(executionRuntime.systemPrompt || systemPromptText || "");
+  const executionModel = String(executionRuntime.model || selectedModel || "");
+  const executionReasoningEnabled = executionRuntime.reasoningEnabled === true;
+  const executionReasoningEffort = normalizeThinkingEffort(executionRuntime.reasoningEffort);
+  const executionCollaborationMode = executionRuntime.collaborationMode === "plan" ? "plan" : "build";
+  const executionSessionId = String(executionRuntime.sessionId || "");
+  const executionSettings = normalizeSessionRuntimeSettings(executionRuntime.settings);
+  const executionTimeoutMs = Math.max(
+    1000,
+    Number.isFinite(Number(options?.timeoutMs)) ? Number(options.timeoutMs) : TOOL_EXEC_TIMEOUT_MS
+  );
   const streamPrefix = "__NEXUS_EXEC_STREAM__";
   const resultPrefix = "__NEXUS_EXEC_RESULT__";
   let liveOutput = "";
@@ -7775,17 +7805,19 @@ import sys
 import tools
 
 MAX_STEPS = ${TOOL_EXEC_MAX_STEPS}
-PLAN_MODE = ${collaborationMode === "plan" ? "True" : "False"}
+PLAN_MODE = ${executionCollaborationMode === "plan" ? "True" : "False"}
 PLAN_ALLOWED_TOOLS = set(${JSON.stringify([...PLAN_MODE_ALLOWED_TOOL_NAMES])})
 _steps = 0
 
 if hasattr(tools, "configure_subagent_runtime"):
     tools.configure_subagent_runtime(
         system_prompt=Path(sys.argv[2]).read_text(encoding="utf-8"),
-        model=${JSON.stringify(selectedModel)},
-        reasoning_enabled=${getReasoningEnabledForModel(selectedModel) ? "True" : "False"},
-        reasoning_effort=${JSON.stringify(getThinkingEffort())},
-        session_id=${JSON.stringify(currentSessionUid || "")},
+        model=${JSON.stringify(executionModel)},
+        reasoning_enabled=${executionReasoningEnabled ? "True" : "False"},
+        reasoning_effort=${JSON.stringify(executionReasoningEffort)},
+        session_id=${JSON.stringify(executionSessionId)},
+        collaboration_mode=${JSON.stringify(executionCollaborationMode)},
+        runtime_settings=json.loads(${JSON.stringify(JSON.stringify(executionSettings))}),
     )
 
 def tracer(frame, event, arg):
@@ -7935,7 +7967,7 @@ sys.__stdout__.flush()
     const codePath = path.join(tempDir, "execute.py.txt");
     const systemPromptPath = path.join(tempDir, "system-prompt.txt");
     await fs.writeFile(codePath, String(code ?? ""), "utf8");
-    await fs.writeFile(systemPromptPath, String(systemPromptText || ""), "utf8");
+    await fs.writeFile(systemPromptPath, executionSystemPrompt, "utf8");
     let protocolBuffer = "";
     let resultJson = "";
     const consumeProtocolLine = (line) => {
@@ -7954,7 +7986,7 @@ sys.__stdout__.flush()
       }
     };
     const { stdout } = await spawnPythonCommandStreaming(["-c", runner, codePath, systemPromptPath], {
-      timeout: TOOL_EXEC_TIMEOUT_MS,
+      timeout: executionTimeoutMs,
       maxBuffer: 2 * 1024 * 1024,
       onStdout: (chunk) => {
         protocolBuffer += chunk;
@@ -8001,7 +8033,7 @@ sys.__stdout__.flush()
       return {
         ok: false,
         output: "",
-        error: `Tool execution timed out after ${Math.round(TOOL_EXEC_TIMEOUT_MS / 1000)}s`,
+        error: `Tool execution timed out after ${Math.round(executionTimeoutMs / 1000)}s`,
         traceback: "",
         editEvents: [],
         editSummaries: [],
@@ -10840,16 +10872,26 @@ function normalizeNamedAgentName(value) {
   return name;
 }
 
-function parseMainAgentMention(value) {
-  const match = String(value || "").match(/^\s*@([A-Za-z0-9][A-Za-z0-9._-]{0,47})\s+([\s\S]*\S)\s*$/);
+function parseAgentDelegationInput(value) {
+  let source = String(value || "").trim();
+  let mode = "delegate";
+  let waitForUser = false;
+  const directive = source.match(/\s+-(notify|wait)\s*$/i);
+  if (directive) {
+    mode = directive[1].toLowerCase() === "notify" ? "notify" : "delegate";
+    waitForUser = directive[1].toLowerCase() === "wait";
+    source = source.slice(0, directive.index).trimEnd();
+  }
+  const match = source.match(/^\s*@([A-Za-z0-9][A-Za-z0-9._-]{0,47})\s+([\s\S]*\S)\s*$/);
   if (!match) return null;
   const name = normalizeNamedAgentName(match[1]);
   const task = String(match[2] || "").trim();
-  return name && task ? { name, task } : null;
+  return name && task ? { name, task, mode, waitForUser } : null;
 }
 
-function buildAgentHandoffExecuteMessage(name, task) {
-  const code = `delegate_agent(name=${JSON.stringify(String(name || ""))}, task=${JSON.stringify(String(task || ""))})`;
+function buildAgentHandoffExecuteMessage(name, task, toolName = "delegate_agent") {
+  const normalizedToolName = toolName === "notify_agent" ? "notify_agent" : "delegate_agent";
+  const code = `${normalizedToolName}(name=${JSON.stringify(String(name || ""))}, task=${JSON.stringify(String(task || ""))})`;
   const longestBacktickRun = Math.max(
     0,
     ...Array.from(code.matchAll(/`+/g), (match) => match[0].length)
@@ -10858,6 +10900,32 @@ function buildAgentHandoffExecuteMessage(name, task) {
   return {
     code,
     content: `${fence}execute\n${code}\n${fence}`,
+  };
+}
+
+function getAgentToolExecutionRuntime(agentName = activeAgentName) {
+  const sourceAgent = getAgentHandoffKey(agentName);
+  if (sourceAgent === "main") {
+    return {
+      systemPrompt: systemPromptText,
+      model: selectedModel,
+      reasoningEnabled: getReasoningEnabledForModel(selectedModel),
+      reasoningEffort: getMainSessionRuntimeSettings().thinking_effort,
+      collaborationMode,
+      sessionId: currentSessionUid || "",
+      settings: { ...getMainSessionRuntimeSettings() },
+    };
+  }
+  const agent = getNamedAgentByName(sourceAgent);
+  const runtime = agent ? normalizeNamedAgentSessionRuntime(agent) : null;
+  return {
+    systemPrompt: String(agent?.runtime?.system_prompt || (agent ? buildNamedAgentSystemPrompt(agent, runtime) : systemPromptText) || ""),
+    model: String(runtime?.model || selectedModel || ""),
+    reasoningEnabled: runtime ? getNamedAgentReasoningEnabled(runtime, runtime.model) : true,
+    reasoningEffort: runtime?.settings?.thinking_effort || "low",
+    collaborationMode: runtime?.collaboration_mode || "build",
+    sessionId: String(agent?.runtime?.session_id || `named-${sourceAgent}-${agent?.session_uid || "current"}`),
+    settings: { ...(runtime?.settings || getMainSessionRuntimeSettings()) },
   };
 }
 
@@ -10970,7 +11038,7 @@ function namedAgentMessagesForDisplay(agent) {
         role: "tool",
         name: toolName,
         ...(toolName === "set_reminder" ? { toolInput: "scheduled reminder" } : {}),
-        toolOk: true,
+        toolOk: typeof entry.tool_ok === "boolean" ? entry.tool_ok : true,
         content: content.slice(toolResultMatch[0].length),
       });
       continue;
@@ -11226,7 +11294,11 @@ async function launchNamedAgentRecord(recordPath, record, task, options = {}) {
   const taskContent = toolName
     ? `[tool ${toolName} result]\n${String(task)}`
     : String(task);
-  const taskEntry = { role: "user", content: taskContent };
+  const taskEntry = {
+    role: "user",
+    content: taskContent,
+    ...(toolName && typeof options.toolOk === "boolean" ? { tool_ok: options.toolOk } : {}),
+  };
   if (!normalizeSessionTitle(next.session_title) && isSessionTitleUserEntry(taskEntry)) {
     next.session_title = normalizeSessionTitle(taskEntry.content);
   }
@@ -11337,6 +11409,35 @@ function formatAgentHandoffResult(state, record) {
   return { ok: false, text: `${state.agentName} failed: ${reason}` };
 }
 
+function getAgentHandoffToolPayload(state, record) {
+  if (record?.toolPayload && typeof record.toolPayload === "object") {
+    return record.toolPayload;
+  }
+  const outcome = formatAgentHandoffResult(state, record);
+  return {
+    displayText: outcome.text,
+    historyText: outcome.text,
+    uiKind: "",
+    uiSections: [],
+    toolOk: outcome.ok,
+  };
+}
+
+async function appendNamedAgentToolResult(recordPath, sessionUid, payload) {
+  const record = await readJsonObject(recordPath);
+  if (!record || (sessionUid && String(record.session_uid || "") !== String(sessionUid))) return false;
+  record.messages = Array.isArray(record.messages) ? record.messages : [];
+  record.messages.push({
+    role: "user",
+    content: `[tool code_execution result]\n${String(payload.historyText || "(no output)")}`,
+    tool_ok: payload.toolOk === true,
+  });
+  record.updated_at = Date.now() / 1000;
+  await writeJsonAtomic(recordPath, record);
+  await refreshNamedAgents();
+  return true;
+}
+
 async function finishAgentHandoff(state, record) {
   if (getActiveAgentHandoff(state.sourceAgent) !== state) return;
   const generation = state.generation;
@@ -11349,33 +11450,46 @@ async function finishAgentHandoff(state, record) {
     return;
   }
 
-  const outcome = formatAgentHandoffResult(state, record);
+  const outcome = getAgentHandoffToolPayload(state, record);
   if (state.sourceAgent === "main") {
     appendToolMessages(
       "code_execution",
       state.executeCode,
       state.executeCode,
-      outcome.text,
-      outcome.text,
+      outcome.displayText,
+      outcome.historyText,
       `agent-handoff-${state.id}`,
-      outcome.ok,
-      generation
+      outcome.toolOk,
+      generation,
+      outcome.uiKind,
+      outcome.uiSections
     );
     for (const entry of queued) appendSubmittedUserMessage(entry.submission);
     pendingHookContext = mergeAgentHandoffHookContext(state);
     activeAgentHandoffs.delete("main");
     updateThinkingAnimationState();
-    queueAssistantReply(state.modelId);
+    if (!state.waitForUser || queued.length > 0) {
+      queueAssistantReply(state.modelId);
+    }
   } else {
     const sourceAgent = getNamedAgentByName(state.sourceAgent);
     const sourceRecordPath = sourceAgent?.recordPath || getNamedAgentRecordPath(state.sourceAgent);
     const sourceRecord = await readJsonObject(sourceRecordPath, sourceAgent);
     activeAgentHandoffs.delete(getAgentHandoffKey(state.sourceAgent));
     if (sourceRecord) {
-      await launchNamedAgentRecord(sourceRecordPath, sourceRecord, outcome.text, {
-        toolName: "code_execution",
-        followUpTasks: queued.map((entry) => entry.submission.resolvedContent),
-      });
+      if (state.waitForUser && queued.length === 0) {
+        await appendNamedAgentToolResult(
+          sourceRecordPath,
+          state.sessionUid,
+          outcome
+        );
+      } else {
+        await launchNamedAgentRecord(sourceRecordPath, sourceRecord, outcome.historyText, {
+          toolName: "code_execution",
+          toolOk: outcome.toolOk,
+          followUpTasks: queued.map((entry) => entry.submission.resolvedContent),
+        });
+      }
     }
     updateThinkingAnimationState();
   }
@@ -11384,22 +11498,7 @@ async function finishAgentHandoff(state, record) {
   scheduleRemoteControlBroadcast({ force: true });
 }
 
-async function watchAgentHandoff(state, recordPath) {
-  while (getActiveAgentHandoff(state.sourceAgent) === state && !state.cancelled) {
-    const record = await readJsonObject(recordPath);
-    const rawStatus = String(record?.status || "").toLowerCase();
-    if (
-      record?.main_handoff_id === state.id &&
-      ["done", "error", "stopped"].includes(rawStatus)
-    ) {
-      await finishAgentHandoff(state, record);
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-}
-
-async function appendNamedAgentHandoffPrompt(agentName, content, mention) {
+async function appendNamedAgentHandoffPrompt(agentName, content, mention, options = {}) {
   const agent = getNamedAgentByName(agentName);
   if (!agent) return { ok: false, error: `Agent ${agentName} was not found` };
   if (getNamedAgentStatus(agent) === "running") {
@@ -11408,13 +11507,19 @@ async function appendNamedAgentHandoffPrompt(agentName, content, mention) {
   const record = await readJsonObject(agent.recordPath, agent);
   const entry = { role: "user", content: String(content) };
   record.messages = Array.isArray(record.messages) ? record.messages : [];
-  if (!normalizeSessionTitle(record.session_title) && isSessionTitleUserEntry(entry)) {
-    record.session_title = normalizeSessionTitle(entry.content);
+  if (options.includeUser !== false) {
+    if (!normalizeSessionTitle(record.session_title) && isSessionTitleUserEntry(entry)) {
+      record.session_title = normalizeSessionTitle(entry.content);
+    }
+    record.messages.push(entry);
   }
-  record.messages.push(entry);
   record.messages.push({
     role: "assistant",
-    content: buildAgentHandoffExecuteMessage(mention?.name, mention?.task).content,
+    content: buildAgentHandoffExecuteMessage(
+      mention?.name,
+      mention?.task,
+      options.toolName
+    ).content,
   });
   record.updated_at = Date.now() / 1000;
   await writeJsonAtomic(agent.recordPath, record);
@@ -11465,29 +11570,13 @@ async function runAgentHandoff(state) {
     await runMainTargetForAgentHandoff(state);
     return;
   }
-  const taskStartedAt = Date.now() / 1000;
-  const result = await dispatchNamedAgentTask(state.agentName, state.task, {
-    requireIdle: true,
-    taskStartedAt,
-    mainHandoffId: state.id,
+  const result = await executeCodeWithPythonTool(state.executeCode, {
+    runtime: state.executionRuntime,
+    timeoutMs: Math.max(TOOL_EXEC_TIMEOUT_MS, 250000),
   });
   if (getActiveAgentHandoff(state.sourceAgent) !== state || state.cancelled) return;
-  if (!result.ok) {
-    await finishAgentHandoff(state, {
-      status: "error",
-      error: result.error || `Could not start ${state.agentName}`,
-    });
-    return;
-  }
-  state.agentName = result.name || state.agentName;
-  state.taskStartedAt = taskStartedAt * 1000;
   await refreshNamedAgents();
-  watchAgentHandoff(state, result.recordPath).catch((error) => {
-    finishAgentHandoff(state, {
-      status: "error",
-      error: error?.message || String(error),
-    }).catch(() => {});
-  });
+  await finishAgentHandoff(state, { toolPayload: buildToolResultPayload(result) });
 }
 
 function startAgentHandoff(mention, options = {}) {
@@ -11507,6 +11596,8 @@ function startAgentHandoff(mention, options = {}) {
     sessionUid: getAgentSessionUid(sourceAgent),
     startedAt: Date.now(),
     taskStartedAt: 0,
+    waitForUser: mention.waitForUser === true,
+    executionRuntime: getAgentToolExecutionRuntime(sourceAgent),
     queuedSubmissions: [],
     cancelled: false,
   };
@@ -11527,6 +11618,68 @@ function startAgentHandoff(mention, options = {}) {
     }).catch(() => {});
   });
   return true;
+}
+
+async function runAgentNotification(mention, options = {}) {
+  const sourceAgent = getAgentHandoffKey(options.sourceAgent || activeAgentName);
+  const executeMessage = buildAgentHandoffExecuteMessage(
+    mention?.name,
+    mention?.task,
+    "notify_agent"
+  );
+  const generation = chatGeneration;
+  const sessionUid = getAgentSessionUid(sourceAgent);
+  let sourceRecordPath = "";
+  if (sourceAgent === "main") {
+    appendAssistantMessage(executeMessage.content);
+  } else {
+    const source = getNamedAgentByName(sourceAgent);
+    sourceRecordPath = source?.recordPath || getNamedAgentRecordPath(sourceAgent);
+    const appended = await appendNamedAgentHandoffPrompt(
+      sourceAgent,
+      "",
+      mention,
+      { includeUser: false, toolName: "notify_agent" }
+    );
+    if (!appended.ok) return appended;
+  }
+  markDirty();
+  renderFrame(false);
+  scheduleRemoteControlBroadcast({ force: true });
+
+  const result = await executeCodeWithPythonTool(executeMessage.code, {
+    runtime: getAgentToolExecutionRuntime(sourceAgent),
+  });
+  const payload = buildToolResultPayload(result);
+  if (
+    sourceAgent === "main" &&
+    generation === chatGeneration &&
+    sessionUid === currentSessionUid
+  ) {
+    appendToolMessages(
+      "code_execution",
+      executeMessage.code,
+      executeMessage.code,
+      payload.displayText,
+      payload.historyText,
+      `agent-notify-${createSessionUid()}`,
+      payload.toolOk,
+      generation,
+      payload.uiKind,
+      payload.uiSections
+    );
+  } else if (sourceAgent !== "main") {
+    await appendNamedAgentToolResult(sourceRecordPath, sessionUid, payload);
+  }
+  await refreshNamedAgents();
+  markDirty();
+  renderFrame(true);
+  scheduleRemoteControlBroadcast({ force: true });
+  return {
+    ok: payload.toolOk,
+    notified: true,
+    agent: mention?.name,
+  };
 }
 
 async function cancelAgentHandoff(sourceAgent = activeAgentName, options = {}) {
@@ -13984,9 +14137,15 @@ async function submitRemoteControlPrompt(rawText) {
       return { ok: true, queued: true };
     }
     const agentMention = !isActiveNamedAgentRunning()
-      ? parseMainAgentMention(trimmedInput)
+      ? parseAgentDelegationInput(trimmedInput)
       : null;
     if (agentMention) {
+      if (agentMention.mode === "notify") {
+        commitSubmittedInputHistory(normalized);
+        const result = await runAgentNotification(agentMention, { sourceAgent });
+        scheduleRemoteControlBroadcast({ force: true });
+        return result;
+      }
       const appended = await appendNamedAgentHandoffPrompt(sourceAgent, normalized, agentMention);
       if (!appended.ok) return appended;
       startAgentHandoff(agentMention, {
@@ -14003,7 +14162,7 @@ async function submitRemoteControlPrompt(rawText) {
   }
 
   const queueBehindActiveTurn = isAssistantThinking();
-  const agentMention = queueBehindActiveTurn ? null : parseMainAgentMention(trimmedInput);
+  const agentMention = queueBehindActiveTurn ? null : parseAgentDelegationInput(trimmedInput);
   const promptHookRun = await runHooks({
     eventName: "UserPromptSubmit",
     input: { prompt: trimmedInput, source: "remote-control" },
@@ -14020,7 +14179,7 @@ async function submitRemoteControlPrompt(rawText) {
 
   const submission = { submittedInput: normalized, resolvedContent: normalized };
   commitSubmittedInputHistory(normalized);
-  if (!queueBehindActiveTurn) {
+  if (!queueBehindActiveTurn && agentMention?.mode !== "notify") {
     if (promptHookRun.additionalContext && !agentMention) {
       pendingHookContext = promptHookRun.additionalContext;
     }
@@ -14033,10 +14192,14 @@ async function submitRemoteControlPrompt(rawText) {
       promptHookRun.additionalContext || ""
     );
   } else if (agentMention) {
-    startAgentHandoff(agentMention, {
-      modelId: selectedModel,
-      hookContext: promptHookRun.additionalContext || "",
-    });
+    if (agentMention.mode === "notify") {
+      await runAgentNotification(agentMention, { sourceAgent: "main" });
+    } else {
+      startAgentHandoff(agentMention, {
+        modelId: selectedModel,
+        hookContext: promptHookRun.additionalContext || "",
+      });
+    }
   } else {
     queueAssistantReply(selectedModel, {
       queuedPrompt: queueBehindActiveTurn ? trimmedInput : "",
@@ -18245,7 +18408,9 @@ async function runClarify() {
     return false;
   }
   const raw = input;
-  const text = raw.replace(/-clarify\s*$/, "").replace(/\s+$/, "");
+  const withoutClarify = raw.replace(/-clarify\s*$/i, "").replace(/\s+$/, "");
+  const delegation = parseAgentDelegationInput(withoutClarify);
+  const text = delegation?.task || withoutClarify;
   if (!/\S/.test(text)) {
     return false;
   }
@@ -18294,7 +18459,12 @@ async function runClarify() {
       inputCursorIndex = input.length;
       return false;
     }
-    input = clarified;
+    const delegationSuffix = delegation?.mode === "notify"
+      ? " -notify"
+      : delegation?.waitForUser ? " -wait" : "";
+    input = delegation
+      ? `@${delegation.name} ${clarified}${delegationSuffix}`
+      : clarified;
     inputCursorIndex = input.length;
     syncImagePasteCounter();
     markDirty();
@@ -18322,7 +18492,7 @@ function submit(options = {}) {
 
   // -clarify: intercept, rewrite the input via a separate LLM request, and
   // leave the clarified text in the input box for review. Never submit.
-  if (/-clarify\s*$/.test(input)) {
+  if (/-clarify\s*$/i.test(input)) {
     runClarify();
     return false;
   }
@@ -19181,7 +19351,7 @@ function runFormatSelfTest() {
       out("FORMAT_FAIL: named agent runtime state leaked into the main session\n");
       return 1;
     }
-    const mentionFixture = parseMainAgentMention(
+    const mentionFixture = parseAgentDelegationInput(
       "@price_checker_agent hey please get current gold prices."
     );
     const handoffExecuteFixture = buildAgentHandoffExecuteMessage(
@@ -19189,7 +19359,18 @@ function runFormatSelfTest() {
       "read ```nested``` markdown"
     );
     const handoffExecuteEntries = extractAllPythonCodeBlockEntries(handoffExecuteFixture.content);
-    const invalidMentionFixture = parseMainAgentMention("email me at user@example.com");
+    const notifyMentionFixture = parseAgentDelegationInput(
+      "@Kral check the weather -notify"
+    );
+    const waitMentionFixture = parseAgentDelegationInput(
+      "@Kral check the weather -wait"
+    );
+    const notifyExecuteFixture = buildAgentHandoffExecuteMessage(
+      "Kral",
+      "check the weather",
+      "notify_agent"
+    );
+    const invalidMentionFixture = parseAgentDelegationInput("email me at user@example.com");
     const savedMainAgentHandoff = getActiveAgentHandoff("main");
     const savedHandoffAgentName = activeAgentName;
     activeAgentName = "main";
@@ -19231,6 +19412,11 @@ function runFormatSelfTest() {
       handoffExecuteEntries[0].complete !== true ||
       handoffExecuteEntries[0].code !== handoffExecuteFixture.code ||
       !handoffExecuteFixture.code.includes('delegate_agent(name="price_checker_agent"') ||
+      notifyMentionFixture?.mode !== "notify" ||
+      notifyMentionFixture?.task !== "check the weather" ||
+      waitMentionFixture?.mode !== "delegate" ||
+      waitMentionFixture?.waitForUser !== true ||
+      !notifyExecuteFixture.code.startsWith('notify_agent(name="Kral"') ||
       invalidMentionFixture !== null ||
       !handoffThinkingFixture ||
       handoffStatusFixture.label !== "Working price_checker_agent..." ||
@@ -19742,6 +19928,9 @@ function runFormatSelfTest() {
       !deferredPrompt.includes("record_refinement(summary") ||
       !deferredPrompt.includes("refine_reflection(auto") ||
       !deferredPrompt.includes("set_reminder(when") ||
+      !deferredPrompt.includes("delegate_agent(name") ||
+      !deferredPrompt.includes("notify_agent(name") ||
+      !deferredPrompt.includes("fire-and-forget") ||
       !deferredPrompt.includes("web_search(query") ||
       !deferredPrompt.includes("fetch_url(url") ||
       !deferredPrompt.includes("run_shell(..., background=True)") ||
@@ -23103,9 +23292,17 @@ process.stdin.on("keypress", async (str, key) => {
         await compactionBarrier.catch(() => {});
       }
       const agentMention = !isActiveNamedAgentRunning()
-        ? parseMainAgentMention(trimmedInput)
+        ? parseAgentDelegationInput(trimmedInput)
         : null;
       if (agentMention) {
+        if (agentMention.mode === "notify") {
+          const result = await runAgentNotification(agentMention, { sourceAgent: targetAgent });
+          agentsMessage = result.ok ? "" : result.error || "Could not notify the agent";
+          scrollChatToBottom();
+          markDirty();
+          renderFrame(true);
+          return;
+        }
         const appended = await appendNamedAgentHandoffPrompt(targetAgent, trimmedInput, agentMention);
         if (!appended.ok) {
           agentsMessage = appended.error || "Could not start the agent handoff";
@@ -23140,7 +23337,7 @@ process.stdin.on("keypress", async (str, key) => {
     burstMode = false;
     const compactionBarrier = getActiveSessionCompactionPromise("main");
     const queueBehindActiveTurn = isAssistantThinking() || Boolean(compactionBarrier);
-    const agentMention = queueBehindActiveTurn ? null : parseMainAgentMention(trimmedInput);
+    const agentMention = queueBehindActiveTurn ? null : parseAgentDelegationInput(trimmedInput);
     // UserPromptSubmit hook: deterministic pre-prompt hooks (e.g. inject
     // context, block prompts). exit code 2 blocks the turn.
     const promptHookRun = await runHooks({
@@ -23167,7 +23364,9 @@ process.stdin.on("keypress", async (str, key) => {
     // Reminders go through the model via the set_reminder tool, which the
     // agent calls when the user asks to be reminded ("remind me in 5 min").
     const modelAtSubmit = selectedModel;
-    const submission = submit({ deferAppend: queueBehindActiveTurn });
+    const submission = submit({
+      deferAppend: queueBehindActiveTurn || agentMention?.mode === "notify",
+    });
     if (submission) {
       if (APPEND_CHAT_TO_SCROLLBACK && !queueBehindActiveTurn) {
         appendTranscriptNow();
@@ -23175,10 +23374,14 @@ process.stdin.on("keypress", async (str, key) => {
       if (getActiveAgentHandoff("main") && queueBehindActiveTurn) {
         queueAgentHandoffSubmission(submission, trimmedInput, queuedHookContext);
       } else if (agentMention) {
-        startAgentHandoff(agentMention, {
-          modelId: modelAtSubmit,
-          hookContext: promptHookRun.additionalContext || "",
-        });
+        if (agentMention.mode === "notify") {
+          await runAgentNotification(agentMention, { sourceAgent: "main" });
+        } else {
+          startAgentHandoff(agentMention, {
+            modelId: modelAtSubmit,
+            hookContext: promptHookRun.additionalContext || "",
+          });
+        }
       } else {
         queueAssistantReply(modelAtSubmit, {
           queuedPrompt: queueBehindActiveTurn ? trimmedInput : "",
