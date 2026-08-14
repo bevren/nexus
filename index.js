@@ -1411,6 +1411,7 @@ let focusReportingEnabled = false;
 let keyboardProtocolModeEnabled = false;
 let thinkingStartedAt = 0;
 let activeToolRun = null; // { label, startedAt, done, ok }
+const activeAgentHandoffs = new Map();
 let clarifyingActive = false;
 let clarifyingStartedAt = 0;
 let stopRequested = false;
@@ -9183,6 +9184,7 @@ function queueAssistantReply(modelId, options = {}) {
           });
       }
     });
+  return assistantRequestChain;
 }
 
 function completeAssistantRequestLifecycle() {
@@ -10838,6 +10840,41 @@ function normalizeNamedAgentName(value) {
   return name;
 }
 
+function parseMainAgentMention(value) {
+  const match = String(value || "").match(/^\s*@([A-Za-z0-9][A-Za-z0-9._-]{0,47})\s+([\s\S]*\S)\s*$/);
+  if (!match) return null;
+  const name = normalizeNamedAgentName(match[1]);
+  const task = String(match[2] || "").trim();
+  return name && task ? { name, task } : null;
+}
+
+function buildAgentHandoffExecuteMessage(name, task) {
+  const code = `delegate_agent(name=${JSON.stringify(String(name || ""))}, task=${JSON.stringify(String(task || ""))})`;
+  const longestBacktickRun = Math.max(
+    0,
+    ...Array.from(code.matchAll(/`+/g), (match) => match[0].length)
+  );
+  const fence = "`".repeat(Math.max(4, longestBacktickRun + 1));
+  return {
+    code,
+    content: `${fence}execute\n${code}\n${fence}`,
+  };
+}
+
+function getAgentHandoffKey(name = activeAgentName) {
+  return String(name || "main").trim().toLowerCase() || "main";
+}
+
+function getActiveAgentHandoff(name = activeAgentName) {
+  return activeAgentHandoffs.get(getAgentHandoffKey(name)) || null;
+}
+
+function getAgentSessionUid(name = activeAgentName) {
+  const key = getAgentHandoffKey(name);
+  if (key === "main") return currentSessionUid;
+  return String(getNamedAgentByName(key)?.session_uid || "");
+}
+
 function getNamedAgentRecordPath(name) {
   const key = String(name || "").toLowerCase();
   const digest = createHash("sha256").update(key).digest("hex").slice(0, 12);
@@ -10987,11 +11024,15 @@ function isActiveNamedAgentRunning() {
 }
 
 function isCurrentChatThinking() {
-  return activeAgentName === "main" ? isAssistantThinking() : isActiveNamedAgentRunning();
+  return activeAgentName === "main"
+    ? isAssistantThinking()
+    : isActiveNamedAgentRunning() || Boolean(getActiveAgentHandoff());
 }
 
 function isAnyAgentWorking() {
-  return isAssistantThinking() || namedAgents.some((agent) => getNamedAgentStatus(agent) === "running");
+  return isAssistantThinking() ||
+    activeAgentHandoffs.size > 0 ||
+    namedAgents.some((agent) => getNamedAgentStatus(agent) === "running");
 }
 
 async function readNamedAgentQueue(recordPath) {
@@ -11190,13 +11231,18 @@ async function launchNamedAgentRecord(recordPath, record, task, options = {}) {
     next.session_title = normalizeSessionTitle(taskEntry.content);
   }
   next.messages.push(taskEntry);
+  for (const followUpTask of Array.from(options.followUpTasks || [])) {
+    const content = String(followUpTask || "").trim();
+    if (content) next.messages.push({ role: "user", content });
+  }
   next.prompt = String(task);
   next.status = "admitted";
   next.result = null;
   next.error = null;
   next.pid = null;
-  next.task_started_at = Date.now() / 1000;
+  next.task_started_at = Number(options.taskStartedAt) || Date.now() / 1000;
   next.active_loop_id = String(options.sourceLoopId || "");
+  next.main_handoff_id = String(options.mainHandoffId || "");
   await writeJsonAtomic(recordPath, next);
   refreshNamedAgents().catch(() => {});
   runPythonCommand([TOOLS_SCRIPT_PATH, "--launch-subagent", recordPath], { timeout: 10000 })
@@ -11228,6 +11274,15 @@ async function dispatchNamedAgentTask(name, task, options = {}) {
     return { ok: true, created: true, queued: false, name: record.name };
   }
   if (getNamedAgentStatus(record) === "running" || namedAgentDispatching.has(recordPath)) {
+    if (options.requireIdle) {
+      return {
+        ok: false,
+        busy: true,
+        queued: false,
+        name: record.name,
+        error: `Agent ${record.name} is already working`,
+      };
+    }
     if (options.sourceLoopId) {
       return { ok: false, busy: true, queued: false, name: record.name };
     }
@@ -11243,7 +11298,276 @@ async function dispatchNamedAgentTask(name, task, options = {}) {
   } finally {
     namedAgentDispatching.delete(recordPath);
   }
-  return { ok: true, created: false, queued: false, name: record.name };
+  return {
+    ok: true,
+    created: false,
+    queued: false,
+    name: record.name,
+    recordPath,
+    taskStartedAt: Number(options.taskStartedAt) || 0,
+    mainHandoffId: String(options.mainHandoffId || ""),
+  };
+}
+
+function mergeAgentHandoffHookContext(state) {
+  return [state?.initialHookContext, ...(state?.queuedSubmissions || []).map((entry) => entry.hookContext)]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function queueAgentHandoffSubmission(submission, prompt, hookContext = "") {
+  const state = getActiveAgentHandoff();
+  if (!state || !submission) return false;
+  const previewEntry = addQueuedBusyPrompt(prompt, state.sourceAgent, state.sessionUid);
+  state.queuedSubmissions.push({ submission, hookContext, previewEntry });
+  markDirty();
+  renderFrame(false);
+  scheduleRemoteControlBroadcast({ force: true });
+  return true;
+}
+
+function formatAgentHandoffResult(state, record) {
+  const rawStatus = String(record?.status || "error").toLowerCase();
+  if (rawStatus === "done") {
+    const result = String(record?.result || "").trim();
+    return { ok: true, text: result || `${state.agentName} completed without a text response.` };
+  }
+  const reason = String(record?.error || "Agent stopped before completing the task.").trim();
+  return { ok: false, text: `${state.agentName} failed: ${reason}` };
+}
+
+async function finishAgentHandoff(state, record) {
+  if (getActiveAgentHandoff(state.sourceAgent) !== state) return;
+  const generation = state.generation;
+  const queued = [...state.queuedSubmissions];
+  for (const entry of queued) removeQueuedBusyPrompt(entry.previewEntry);
+
+  if (state.sourceAgent === "main" && (generation !== chatGeneration || state.sessionUid !== currentSessionUid)) {
+    activeAgentHandoffs.delete(getAgentHandoffKey(state.sourceAgent));
+    updateThinkingAnimationState();
+    return;
+  }
+
+  const outcome = formatAgentHandoffResult(state, record);
+  if (state.sourceAgent === "main") {
+    appendToolMessages(
+      "code_execution",
+      state.executeCode,
+      state.executeCode,
+      outcome.text,
+      outcome.text,
+      `agent-handoff-${state.id}`,
+      outcome.ok,
+      generation
+    );
+    for (const entry of queued) appendSubmittedUserMessage(entry.submission);
+    pendingHookContext = mergeAgentHandoffHookContext(state);
+    activeAgentHandoffs.delete("main");
+    updateThinkingAnimationState();
+    queueAssistantReply(state.modelId);
+  } else {
+    const sourceAgent = getNamedAgentByName(state.sourceAgent);
+    const sourceRecordPath = sourceAgent?.recordPath || getNamedAgentRecordPath(state.sourceAgent);
+    const sourceRecord = await readJsonObject(sourceRecordPath, sourceAgent);
+    activeAgentHandoffs.delete(getAgentHandoffKey(state.sourceAgent));
+    if (sourceRecord) {
+      await launchNamedAgentRecord(sourceRecordPath, sourceRecord, outcome.text, {
+        toolName: "code_execution",
+        followUpTasks: queued.map((entry) => entry.submission.resolvedContent),
+      });
+    }
+    updateThinkingAnimationState();
+  }
+  markDirty();
+  renderFrame(true);
+  scheduleRemoteControlBroadcast({ force: true });
+}
+
+async function watchAgentHandoff(state, recordPath) {
+  while (getActiveAgentHandoff(state.sourceAgent) === state && !state.cancelled) {
+    const record = await readJsonObject(recordPath);
+    const rawStatus = String(record?.status || "").toLowerCase();
+    if (
+      record?.main_handoff_id === state.id &&
+      ["done", "error", "stopped"].includes(rawStatus)
+    ) {
+      await finishAgentHandoff(state, record);
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+}
+
+async function appendNamedAgentHandoffPrompt(agentName, content, mention) {
+  const agent = getNamedAgentByName(agentName);
+  if (!agent) return { ok: false, error: `Agent ${agentName} was not found` };
+  if (getNamedAgentStatus(agent) === "running") {
+    return { ok: false, error: `Agent ${agent.name} is already working` };
+  }
+  const record = await readJsonObject(agent.recordPath, agent);
+  const entry = { role: "user", content: String(content) };
+  record.messages = Array.isArray(record.messages) ? record.messages : [];
+  if (!normalizeSessionTitle(record.session_title) && isSessionTitleUserEntry(entry)) {
+    record.session_title = normalizeSessionTitle(entry.content);
+  }
+  record.messages.push(entry);
+  record.messages.push({
+    role: "assistant",
+    content: buildAgentHandoffExecuteMessage(mention?.name, mention?.task).content,
+  });
+  record.updated_at = Date.now() / 1000;
+  await writeJsonAtomic(agent.recordPath, record);
+  await refreshNamedAgents();
+  return { ok: true, name: record.name || agent.name };
+}
+
+async function runMainTargetForAgentHandoff(state) {
+  if (pendingAssistantRequests > 0 || getActiveAgentHandoff("main")) {
+    await finishAgentHandoff(state, {
+      status: "error",
+      error: "The main agent is already working",
+    });
+    return;
+  }
+  const delegatedPrompt = `[Delegated by agent ${state.sourceAgent}]\n${state.task}`;
+  const submission = { submittedInput: delegatedPrompt, resolvedContent: delegatedPrompt };
+  appendSubmittedUserMessage(submission);
+  const turnStartIndex = messages.length;
+  await queueAssistantReply(selectedModel);
+  const response = messages
+    .slice(turnStartIndex)
+    .filter((entry) =>
+      entry &&
+      entry.ephemeral !== true &&
+      (entry.role === "assistant" || entry.role === "error") &&
+      String(entry.content || "").trim()
+    )
+    .at(-1);
+  await finishAgentHandoff(state, response
+    ? {
+        status: response.role === "error" ? "error" : "done",
+        result: String(response.content || ""),
+        error: response.role === "error" ? String(response.content || "") : "",
+      }
+    : { status: "error", error: "The main agent returned no response" });
+}
+
+async function runAgentHandoff(state) {
+  if (state.agentName.toLowerCase() === state.sourceAgent.toLowerCase()) {
+    await finishAgentHandoff(state, {
+      status: "error",
+      error: "An agent cannot hand a task to itself",
+    });
+    return;
+  }
+  if (state.agentName.toLowerCase() === "main") {
+    await runMainTargetForAgentHandoff(state);
+    return;
+  }
+  const taskStartedAt = Date.now() / 1000;
+  const result = await dispatchNamedAgentTask(state.agentName, state.task, {
+    requireIdle: true,
+    taskStartedAt,
+    mainHandoffId: state.id,
+  });
+  if (getActiveAgentHandoff(state.sourceAgent) !== state || state.cancelled) return;
+  if (!result.ok) {
+    await finishAgentHandoff(state, {
+      status: "error",
+      error: result.error || `Could not start ${state.agentName}`,
+    });
+    return;
+  }
+  state.agentName = result.name || state.agentName;
+  state.taskStartedAt = taskStartedAt * 1000;
+  await refreshNamedAgents();
+  watchAgentHandoff(state, result.recordPath).catch((error) => {
+    finishAgentHandoff(state, {
+      status: "error",
+      error: error?.message || String(error),
+    }).catch(() => {});
+  });
+}
+
+function startAgentHandoff(mention, options = {}) {
+  const sourceAgent = getAgentHandoffKey(options.sourceAgent || activeAgentName);
+  if (!mention || getActiveAgentHandoff(sourceAgent)) return false;
+  if (sourceAgent === "main" && pendingAssistantRequests > 0) return false;
+  const executeMessage = buildAgentHandoffExecuteMessage(mention.name, mention.task);
+  const state = {
+    id: createSessionUid(),
+    agentName: mention.name,
+    sourceAgent,
+    task: mention.task,
+    executeCode: executeMessage.code,
+    modelId: options.modelId || selectedModel,
+    initialHookContext: String(options.hookContext || ""),
+    generation: chatGeneration,
+    sessionUid: getAgentSessionUid(sourceAgent),
+    startedAt: Date.now(),
+    taskStartedAt: 0,
+    queuedSubmissions: [],
+    cancelled: false,
+  };
+  activeAgentHandoffs.set(sourceAgent, state);
+  if (sourceAgent === "main") {
+    appendAssistantMessage(executeMessage.content);
+  }
+  thinkingStartedAt = state.startedAt;
+  resetStopRequested();
+  updateThinkingAnimationState();
+  markDirty();
+  renderFrame(false);
+  scheduleRemoteControlBroadcast({ force: true });
+  runAgentHandoff(state).catch((error) => {
+    finishAgentHandoff(state, {
+      status: "error",
+      error: error?.message || String(error),
+    }).catch(() => {});
+  });
+  return true;
+}
+
+async function cancelAgentHandoff(sourceAgent = activeAgentName, options = {}) {
+  const state = getActiveAgentHandoff(sourceAgent);
+  if (!state) return false;
+  state.cancelled = true;
+  for (const entry of state.queuedSubmissions) removeQueuedBusyPrompt(entry.previewEntry);
+  activeAgentHandoffs.delete(getAgentHandoffKey(state.sourceAgent));
+  if (state.sourceAgent === "main") {
+    for (const entry of state.queuedSubmissions) appendSubmittedUserMessage(entry.submission);
+  } else {
+    const source = getNamedAgentByName(state.sourceAgent);
+    const sourceRecord = source
+      ? await readJsonObject(source.recordPath, source)
+      : null;
+    if (sourceRecord) {
+      sourceRecord.messages = Array.isArray(sourceRecord.messages) ? sourceRecord.messages : [];
+      for (const entry of state.queuedSubmissions) {
+        sourceRecord.messages.push({ role: "user", content: entry.submission.resolvedContent });
+      }
+      if (options.notice) {
+        sourceRecord.messages.push({ role: "assistant", content: String(options.notice) });
+      }
+      sourceRecord.updated_at = Date.now() / 1000;
+      await writeJsonAtomic(source.recordPath, sourceRecord);
+    }
+  }
+  if (state.agentName.toLowerCase() === "main") {
+    activeLlmAbortController?.abort();
+  } else {
+    const target = getNamedAgentByName(state.agentName);
+    if (target && getNamedAgentStatus(target) === "running") {
+      await stopNamedAgent(target, { error: "Stopped from the agent handoff" });
+    }
+  }
+  await refreshNamedAgents();
+  updateThinkingAnimationState();
+  markDirty();
+  renderFrame(true);
+  scheduleRemoteControlBroadcast({ force: true });
+  return true;
 }
 
 async function launchNextQueuedNamedAgentTask(agent) {
@@ -12794,7 +13118,7 @@ function getAgentsListEntries() {
     },
     ...namedAgents.map((agent) => ({
       ...agent,
-      status: getNamedAgentStatus(agent),
+      status: getActiveAgentHandoff(agent.name) ? "running" : getNamedAgentStatus(agent),
       current: String(agent.name).toLowerCase() === activeAgentName.toLowerCase(),
     })),
   ].filter((agent) => !agentsSearch || String(agent.name).toLowerCase().includes(agentsSearch.toLowerCase()));
@@ -13278,6 +13602,14 @@ function buildRemoteControlStatus() {
   if (!isCurrentChatThinking()) {
     return { phase: "idle", label: "Connected", startedAt: 0 };
   }
+  const activeHandoff = getActiveAgentHandoff();
+  if (activeHandoff) {
+    return {
+      phase: "thinking",
+      label: `Working ${activeHandoff.agentName}...`,
+      startedAt: activeHandoff.taskStartedAt || activeHandoff.startedAt,
+    };
+  }
   if (activeAgentName !== "main") {
     const agent = getNamedAgentByName();
     return {
@@ -13644,6 +13976,26 @@ async function submitRemoteControlPrompt(rawText) {
   }
 
   if (activeAgentName !== "main") {
+    const sourceAgent = activeAgentName;
+    if (getActiveAgentHandoff(sourceAgent)) {
+      const submission = { submittedInput: normalized, resolvedContent: normalized };
+      queueAgentHandoffSubmission(submission, trimmedInput);
+      scheduleRemoteControlBroadcast({ force: true });
+      return { ok: true, queued: true };
+    }
+    const agentMention = !isActiveNamedAgentRunning()
+      ? parseMainAgentMention(trimmedInput)
+      : null;
+    if (agentMention) {
+      const appended = await appendNamedAgentHandoffPrompt(sourceAgent, normalized, agentMention);
+      if (!appended.ok) return appended;
+      startAgentHandoff(agentMention, {
+        sourceAgent,
+        modelId: getActiveSessionModel(),
+      });
+      scheduleRemoteControlBroadcast({ force: true });
+      return { ok: true, handoff: true, agent: agentMention.name };
+    }
     const result = await dispatchNamedAgentTask(activeAgentName, trimmedInput);
     await refreshNamedAgents();
     scheduleRemoteControlBroadcast({ force: true });
@@ -13651,6 +14003,7 @@ async function submitRemoteControlPrompt(rawText) {
   }
 
   const queueBehindActiveTurn = isAssistantThinking();
+  const agentMention = queueBehindActiveTurn ? null : parseMainAgentMention(trimmedInput);
   const promptHookRun = await runHooks({
     eventName: "UserPromptSubmit",
     input: { prompt: trimmedInput, source: "remote-control" },
@@ -13668,14 +14021,29 @@ async function submitRemoteControlPrompt(rawText) {
   const submission = { submittedInput: normalized, resolvedContent: normalized };
   commitSubmittedInputHistory(normalized);
   if (!queueBehindActiveTurn) {
-    if (promptHookRun.additionalContext) pendingHookContext = promptHookRun.additionalContext;
+    if (promptHookRun.additionalContext && !agentMention) {
+      pendingHookContext = promptHookRun.additionalContext;
+    }
     appendSubmittedUserMessage(submission);
   }
-  queueAssistantReply(selectedModel, {
-    queuedPrompt: queueBehindActiveTurn ? trimmedInput : "",
-    deferredUserMessage: queueBehindActiveTurn ? submission : null,
-    deferredHookContext: queueBehindActiveTurn ? promptHookRun.additionalContext || "" : "",
-  });
+  if (getActiveAgentHandoff("main") && queueBehindActiveTurn) {
+    queueAgentHandoffSubmission(
+      submission,
+      trimmedInput,
+      promptHookRun.additionalContext || ""
+    );
+  } else if (agentMention) {
+    startAgentHandoff(agentMention, {
+      modelId: selectedModel,
+      hookContext: promptHookRun.additionalContext || "",
+    });
+  } else {
+    queueAssistantReply(selectedModel, {
+      queuedPrompt: queueBehindActiveTurn ? trimmedInput : "",
+      deferredUserMessage: queueBehindActiveTurn ? submission : null,
+      deferredHookContext: queueBehindActiveTurn ? promptHookRun.additionalContext || "" : "",
+    });
+  }
   markDirty();
   renderFrame(false);
   scheduleRemoteControlBroadcast({ force: true });
@@ -13780,7 +14148,11 @@ function handleRemoteControlSocketMessage(client, rawData) {
   }
   if (payload?.type === "stop") {
     if (activeAgentName !== "main") {
-      stopNamedAgent().catch(() => {});
+      if (getActiveAgentHandoff()) {
+        cancelAgentHandoff(activeAgentName, { notice: "■ Stopped by user." }).catch(() => {});
+      } else {
+        stopNamedAgent().catch(() => {});
+      }
     } else if (isAssistantThinking()) {
       handleStopRequest();
     }
@@ -15321,7 +15693,7 @@ function getAppendReservedBottomRows(cols, includeStatus = true) {
 }
 
 function isAssistantThinking() {
-  return pendingAssistantRequests > 0;
+  return pendingAssistantRequests > 0 || Boolean(getActiveAgentHandoff("main"));
 }
 
 function getActiveSessionCompactionPromise(agentName = activeAgentName) {
@@ -15332,7 +15704,7 @@ function getActiveSessionCompactionPromise(agentName = activeAgentName) {
     : null;
 }
 
-function addQueuedBusyPrompt(text) {
+function addQueuedBusyPrompt(text, agentName = "main", sessionUid = getAgentSessionUid(agentName)) {
   const normalized = String(text || "").replace(/\s+/g, " ").trim();
   if (!normalized) return null;
   const characters = Array.from(normalized);
@@ -15342,7 +15714,8 @@ function addQueuedBusyPrompt(text) {
   const entry = {
     id: ++queuedBusyPromptSequence,
     text: preview,
-    sessionUid: currentSessionUid,
+    sessionUid: String(sessionUid || ""),
+    agentName: getAgentHandoffKey(agentName),
   };
   queuedBusyPrompts.push(entry);
   return entry;
@@ -15356,13 +15729,17 @@ function removeQueuedBusyPrompt(entry) {
 
 function hasQueuedPromptForToolBoundary(generation = chatGeneration) {
   if (generation !== chatGeneration) return false;
-  return queuedBusyPrompts.some((entry) => entry.sessionUid === currentSessionUid);
+  return queuedBusyPrompts.some((entry) =>
+    entry.sessionUid === currentSessionUid && entry.agentName === "main"
+  );
 }
 
 function getQueuedBusyPromptStatusLines(cols) {
-  if (!isAssistantThinking() || queuedBusyPrompts.length === 0) return [];
+  if (!isCurrentChatThinking() || queuedBusyPrompts.length === 0) return [];
   const sessionPrompts = queuedBusyPrompts.filter(
-    (entry) => entry.sessionUid === currentSessionUid
+    (entry) =>
+      entry.sessionUid === getAgentSessionUid(activeAgentName) &&
+      entry.agentName === getAgentHandoffKey(activeAgentName)
   );
   if (sessionPrompts.length === 0) return [];
   const terminalWidth = Math.max(
@@ -15407,14 +15784,12 @@ function styleQueuedBusyHeaderLine(line) {
 function getMainStatusRowCount() {
   const baseVisible = isCurrentChatThinking() || isMcpStartupStatusVisible() || solveStartupActive;
   if (!baseVisible) return 0;
-  const queuedRows = activeAgentName === "main"
-    ? getQueuedBusyPromptStatusLines(process.stdout.columns || 80).length
-    : 0;
+  const queuedRows = getQueuedBusyPromptStatusLines(process.stdout.columns || 80).length;
   return STATUS_BAR_ROWS + (queuedRows > 0 ? 1 + queuedRows : 0);
 }
 
 function getMainStatusInputGapRows(cols = process.stdout.columns || 80) {
-  return activeAgentName === "main" && getQueuedBusyPromptStatusLines(cols).length > 0 ? 0 : STATUS_INPUT_GAP;
+  return getQueuedBusyPromptStatusLines(cols).length > 0 ? 0 : STATUS_INPUT_GAP;
 }
 
 function isMcpStartupStatusVisible() {
@@ -15446,6 +15821,13 @@ function handleStopRequest(options = {}) {
   }
   stopNoticeOverride = String(options.notice || "");
   stopRequested = true;
+
+  if (getActiveAgentHandoff()) {
+    cancelAgentHandoff()
+      .catch(() => {})
+      .finally(() => emitStopNotice());
+    return;
+  }
 
   const toolRunning =
     activeToolRun && !activeToolRun.done && isAssistantThinking();
@@ -15528,6 +15910,15 @@ function getStatusBarText() {
       ? Math.max(0, Math.floor((Date.now() - clarifyingStartedAt) / 1000))
       : 0;
     return `${frame} ${BOLD_WHITE}Clarifying${RESET_COLOR}${PLACEHOLDER_COLOR} (${elapsed}s)${RESET_COLOR}`;
+  }
+
+  const activeHandoff = getActiveAgentHandoff();
+  if (activeHandoff) {
+    const frame = SPINNER_FRAMES[spinnerFrameIndex % SPINNER_FRAMES.length];
+    const startedAt = activeHandoff.taskStartedAt || activeHandoff.startedAt;
+    const elapsed = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+    const text = `Working ${activeHandoff.agentName}...`;
+    return `${frame} ${applyShineEffect(text, shineFrameIndex, 7)} (${elapsed}s)`;
   }
 
   if (activeAgentName !== "main") {
@@ -17260,7 +17651,7 @@ function renderFrame(forceChatRefresh = false) {
   const frameHeight = inputVisualLines.length;
   const cursorMetrics = getInputCursorMetrics(cols);
   const statusText = getStatusBarText();
-  const queuedStatusLines = activeAgentName === "main" ? getQueuedBusyPromptStatusLines(cols) : [];
+  const queuedStatusLines = getQueuedBusyPromptStatusLines(cols);
   const statusLines = statusText
     ? [statusText, ...(queuedStatusLines.length > 0 ? ["", ...queuedStatusLines] : [])]
     : [];
@@ -18788,6 +19179,67 @@ function runFormatSelfTest() {
     }
     if (!namedRuntimeIsolationOk) {
       out("FORMAT_FAIL: named agent runtime state leaked into the main session\n");
+      return 1;
+    }
+    const mentionFixture = parseMainAgentMention(
+      "@price_checker_agent hey please get current gold prices."
+    );
+    const handoffExecuteFixture = buildAgentHandoffExecuteMessage(
+      "price_checker_agent",
+      "read ```nested``` markdown"
+    );
+    const handoffExecuteEntries = extractAllPythonCodeBlockEntries(handoffExecuteFixture.content);
+    const invalidMentionFixture = parseMainAgentMention("email me at user@example.com");
+    const savedMainAgentHandoff = getActiveAgentHandoff("main");
+    const savedHandoffAgentName = activeAgentName;
+    activeAgentName = "main";
+    activeAgentHandoffs.set("main", {
+      id: "handoff-test",
+      agentName: "price_checker_agent",
+      sourceAgent: "main",
+      task: "get prices",
+      startedAt: Date.now(),
+      taskStartedAt: Date.now(),
+      queuedSubmissions: [],
+    });
+    const handoffStatusFixture = buildRemoteControlStatus();
+    const handoffThinkingFixture = isAssistantThinking();
+    if (savedMainAgentHandoff) activeAgentHandoffs.set("main", savedMainAgentHandoff);
+    else activeAgentHandoffs.delete("main");
+    activeAgentName = savedHandoffAgentName;
+    const handoffResultFixture = formatAgentHandoffResult(
+      { agentName: "price_checker_agent" },
+      { status: "done", result: "Gold is 100." }
+    );
+    activeAgentName = "worker-a";
+    activeAgentHandoffs.set("worker-a", {
+      id: "named-handoff-test",
+      agentName: "main",
+      sourceAgent: "worker-a",
+      startedAt: Date.now(),
+      taskStartedAt: Date.now(),
+      queuedSubmissions: [],
+    });
+    const namedHandoffStatusFixture = buildRemoteControlStatus();
+    const namedHandoffThinkingFixture = isCurrentChatThinking();
+    activeAgentHandoffs.delete("worker-a");
+    activeAgentName = savedHandoffAgentName;
+    if (
+      mentionFixture?.name !== "price_checker_agent" ||
+      mentionFixture?.task !== "hey please get current gold prices." ||
+      handoffExecuteEntries.length !== 1 ||
+      handoffExecuteEntries[0].complete !== true ||
+      handoffExecuteEntries[0].code !== handoffExecuteFixture.code ||
+      !handoffExecuteFixture.code.includes('delegate_agent(name="price_checker_agent"') ||
+      invalidMentionFixture !== null ||
+      !handoffThinkingFixture ||
+      handoffStatusFixture.label !== "Working price_checker_agent..." ||
+      !namedHandoffThinkingFixture ||
+      namedHandoffStatusFixture.label !== "Working main..." ||
+      handoffResultFixture.ok !== true ||
+      handoffResultFixture.text !== "Gold is 100."
+    ) {
+      out("FORMAT_FAIL: main-agent @mention handoff parsing or status is incorrect\n");
       return 1;
     }
     const planToBuildFixture = {
@@ -21624,7 +22076,9 @@ process.stdin.on("keypress", async (str, key) => {
     (key?.name === "escape" || key?.sequence === "\u001b" || str === "\u001b");
   if (isMainBufferEscape) {
     if (activeAgentName !== "main") {
-      if (isActiveNamedAgentRunning()) {
+      if (getActiveAgentHandoff()) {
+        await cancelAgentHandoff(activeAgentName, { notice: "■ Stopped by user." });
+      } else if (isActiveNamedAgentRunning()) {
         await stopNamedAgent();
       }
       return;
@@ -22628,17 +23082,44 @@ process.stdin.on("keypress", async (str, key) => {
     if (activeAgentName !== "main") {
       if (!trimmedInput) return;
       const targetAgent = activeAgentName;
+      const activeHandoff = getActiveAgentHandoff(targetAgent);
       const compactionBarrier = getActiveSessionCompactionPromise(targetAgent);
       commitSubmittedInputHistory(input);
       input = "";
       inputCursorIndex = 0;
       pendingPastedPayloads = [];
       activeBlockedPastePayloadIndex = -1;
+      if (activeHandoff) {
+        queueAgentHandoffSubmission(
+          { submittedInput: trimmedInput, resolvedContent: trimmedInput },
+          trimmedInput
+        );
+        return;
+      }
       if (compactionBarrier) {
         agentsMessage = `Queued for ${targetAgent}`;
         markDirty();
         renderFrame(false);
         await compactionBarrier.catch(() => {});
+      }
+      const agentMention = !isActiveNamedAgentRunning()
+        ? parseMainAgentMention(trimmedInput)
+        : null;
+      if (agentMention) {
+        const appended = await appendNamedAgentHandoffPrompt(targetAgent, trimmedInput, agentMention);
+        if (!appended.ok) {
+          agentsMessage = appended.error || "Could not start the agent handoff";
+        } else {
+          startAgentHandoff(agentMention, {
+            sourceAgent: targetAgent,
+            modelId: getActiveSessionModel(),
+          });
+          agentsMessage = "";
+        }
+        scrollChatToBottom();
+        markDirty();
+        renderFrame(true);
+        return;
       }
       const result = await dispatchNamedAgentTask(targetAgent, trimmedInput);
       if (!result.ok) {
@@ -22659,6 +23140,7 @@ process.stdin.on("keypress", async (str, key) => {
     burstMode = false;
     const compactionBarrier = getActiveSessionCompactionPromise("main");
     const queueBehindActiveTurn = isAssistantThinking() || Boolean(compactionBarrier);
+    const agentMention = queueBehindActiveTurn ? null : parseMainAgentMention(trimmedInput);
     // UserPromptSubmit hook: deterministic pre-prompt hooks (e.g. inject
     // context, block prompts). exit code 2 blocks the turn.
     const promptHookRun = await runHooks({
@@ -22678,7 +23160,7 @@ process.stdin.on("keypress", async (str, key) => {
     const queuedHookContext = queueBehindActiveTurn
       ? promptHookRun.additionalContext || ""
       : "";
-    if (promptHookRun.additionalContext && !queueBehindActiveTurn) {
+    if (promptHookRun.additionalContext && !queueBehindActiveTurn && !agentMention) {
       pendingHookContext = promptHookRun.additionalContext;
     }
 
@@ -22690,12 +23172,21 @@ process.stdin.on("keypress", async (str, key) => {
       if (APPEND_CHAT_TO_SCROLLBACK && !queueBehindActiveTurn) {
         appendTranscriptNow();
       }
-      queueAssistantReply(modelAtSubmit, {
-        queuedPrompt: queueBehindActiveTurn ? trimmedInput : "",
-        deferredUserMessage: queueBehindActiveTurn ? submission : null,
-        deferredHookContext: queuedHookContext,
-        deferredUntil: compactionBarrier,
-      });
+      if (getActiveAgentHandoff("main") && queueBehindActiveTurn) {
+        queueAgentHandoffSubmission(submission, trimmedInput, queuedHookContext);
+      } else if (agentMention) {
+        startAgentHandoff(agentMention, {
+          modelId: modelAtSubmit,
+          hookContext: promptHookRun.additionalContext || "",
+        });
+      } else {
+        queueAssistantReply(modelAtSubmit, {
+          queuedPrompt: queueBehindActiveTurn ? trimmedInput : "",
+          deferredUserMessage: queueBehindActiveTurn ? submission : null,
+          deferredHookContext: queuedHookContext,
+          deferredUntil: compactionBarrier,
+        });
+      }
     }
     markDirty();
     renderFrame(false);
