@@ -14888,6 +14888,7 @@ function openAgentsBuffer() {
 }
 
 function closeAgentsBuffer(options = {}) {
+  const reuseAltScreen = altScreenActive;
   exitAltScreenIfNeeded({ preserveRestoredScreen: true });
   activeBuffer = "main";
   lastAgentsRenderedRows = [];
