@@ -40,6 +40,201 @@ BACKGROUND_JOB_EVENT_LOG: list[dict[str, object]] = []
 SHELL_STREAM_WRITER = None
 
 
+def _emit_voice_capture_event(event: str, **payload) -> None:
+    print(json.dumps({"event": event, **payload}, ensure_ascii=False), flush=True)
+
+
+def _run_voice_capture_helper(temp_directory: str, parent_pid: int) -> int:
+    """Monitor hold-to-talk Alt state and capture the default Windows microphone."""
+    if os.name != "nt":
+        _emit_voice_capture_event("unavailable", error="push-to-talk is currently supported on Windows")
+        return 1
+
+    import ctypes
+
+    target_dir = Path(temp_directory).resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    winmm = ctypes.WinDLL("winmm", use_last_error=True)
+    user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    user32.GetAsyncKeyState.restype = ctypes.c_short
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_uint]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    winmm.mciSendStringW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_uint,
+        ctypes.c_void_p,
+    ]
+    winmm.mciSendStringW.restype = ctypes.c_uint
+    winmm.mciGetErrorStringW.argtypes = [ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_uint]
+    winmm.mciGetErrorStringW.restype = ctypes.c_int
+
+    SYNCHRONIZE = 0x00100000
+    WAIT_TIMEOUT = 0x00000102
+    parent_handle = kernel32.OpenProcess(SYNCHRONIZE, False, int(parent_pid))
+    control = {"enabled": False, "stop": False}
+    control_lock = threading.Lock()
+
+    def read_control() -> None:
+        try:
+            for line in sys.stdin:
+                try:
+                    message = json.loads(line)
+                except Exception:
+                    continue
+                with control_lock:
+                    if "enabled" in message:
+                        control["enabled"] = bool(message["enabled"])
+                    if message.get("stop") is True:
+                        control["stop"] = True
+                        return
+        finally:
+            with control_lock:
+                control["stop"] = True
+
+    threading.Thread(target=read_control, daemon=True).start()
+
+    alias = f"nexusvoice{os.getpid()}"
+    recording = False
+    recording_path: Path | None = None
+    recording_started_at = 0.0
+    alt_was_down = False
+    chorded = False
+
+    def mci(command: str) -> None:
+        error_code = int(winmm.mciSendStringW(command, None, 0, None))
+        if error_code:
+            buffer = ctypes.create_unicode_buffer(512)
+            winmm.mciGetErrorStringW(error_code, buffer, len(buffer))
+            raise RuntimeError(buffer.value or f"Windows audio error {error_code}")
+
+    def close_recording(save: bool) -> tuple[str, int]:
+        nonlocal recording, recording_path, recording_started_at
+        path_value = str(recording_path or "")
+        duration_ms = max(0, int((time.monotonic() - recording_started_at) * 1000))
+        try:
+            mci(f"stop {alias}")
+            if save and recording_path is not None:
+                escaped = str(recording_path).replace('"', '')
+                mci(f'save {alias} "{escaped}"')
+        finally:
+            try:
+                mci(f"close {alias}")
+            except Exception:
+                pass
+            recording = False
+            recording_path = None
+            recording_started_at = 0.0
+        if not save and path_value:
+            try:
+                Path(path_value).unlink(missing_ok=True)
+            except Exception:
+                pass
+        return path_value, duration_ms
+
+    def has_non_modifier_key_down() -> bool:
+        ignored = {
+            0x01, 0x02, 0x04, 0x05, 0x06,  # mouse buttons
+            0x10, 0x11, 0x12,              # Shift, Ctrl, Alt
+            0x14, 0x90, 0x91,              # lock keys
+            0x5B, 0x5C,                    # Windows keys
+            0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,
+        }
+        return any(
+            virtual_key not in ignored and bool(user32.GetAsyncKeyState(virtual_key) & 0x8000)
+            for virtual_key in range(0x08, 0xFF)
+        )
+
+    _emit_voice_capture_event("ready")
+    try:
+        while True:
+            with control_lock:
+                enabled = control["enabled"]
+                should_stop = control["stop"]
+            if should_stop:
+                break
+            if parent_handle and kernel32.WaitForSingleObject(parent_handle, 0) != WAIT_TIMEOUT:
+                break
+
+            alt_down = bool(user32.GetAsyncKeyState(0x12) & 0x8000)
+            if not enabled:
+                if recording:
+                    close_recording(False)
+                    _emit_voice_capture_event("recording_cancelled")
+                alt_was_down = alt_down
+                chorded = False
+                time.sleep(0.012)
+                continue
+
+            if alt_down and not alt_was_down:
+                chorded = False
+                recording_path = target_dir / f"recording-{int(time.time() * 1000)}.wav"
+                try:
+                    mci(f"open new type waveaudio alias {alias}")
+                    mci(
+                        f"set {alias} time format milliseconds samplespersec 16000 "
+                        "channels 1 bitspersample 16 bytespersec 32000 alignment 2"
+                    )
+                    mci(f"record {alias}")
+                    recording = True
+                    recording_started_at = time.monotonic()
+                    _emit_voice_capture_event("recording_started", path=str(recording_path))
+                except Exception as exc:
+                    try:
+                        mci(f"close {alias}")
+                    except Exception:
+                        pass
+                    recording = False
+                    recording_path = None
+                    _emit_voice_capture_event("error", error=str(exc))
+
+            if alt_down and recording and has_non_modifier_key_down():
+                chorded = True
+                close_recording(False)
+                _emit_voice_capture_event("recording_cancelled")
+
+            if alt_down and recording and (time.monotonic() - recording_started_at) * 1000 >= 300000:
+                path_value, duration_ms = close_recording(True)
+                _emit_voice_capture_event(
+                    "recording_stopped",
+                    path=path_value,
+                    duration_ms=duration_ms,
+                    reason="maximum duration reached",
+                )
+                chorded = True
+
+            if not alt_down and alt_was_down:
+                if recording and not chorded:
+                    try:
+                        path_value, duration_ms = close_recording(True)
+                        _emit_voice_capture_event(
+                            "recording_stopped",
+                            path=path_value,
+                            duration_ms=duration_ms,
+                        )
+                    except Exception as exc:
+                        _emit_voice_capture_event("error", error=str(exc))
+                chorded = False
+
+            alt_was_down = alt_down
+            time.sleep(0.012)
+    finally:
+        if recording:
+            try:
+                close_recording(False)
+            except Exception:
+                pass
+        if parent_handle:
+            kernel32.CloseHandle(parent_handle)
+    return 0
+
+
 def set_shell_stream_writer(writer) -> None:
     """Set an execute-transport-only callback for live foreground shell output."""
     global SHELL_STREAM_WRITER
@@ -2615,7 +2810,7 @@ def set_reminder(when: str, prompt: str) -> dict:
         return {"ok": False, "error": f"set_reminder: bridge request failed: {exc}"}
 
 
-def _bridge_request(method: str, payload: dict) -> dict:
+def _bridge_request(method: str, payload: dict, timeout: float = 180) -> dict:
     """POST a raw request to the TUI bridge and return the parsed JSON."""
     import urllib.request
 
@@ -2631,10 +2826,120 @@ def _bridge_request(method: str, payload: dict) -> dict:
         req = urllib.request.Request(
             url, data=body, headers={"Content-Type": "application/json"}, method="POST"
         )
-        with urllib.request.urlopen(req, timeout=180) as resp:
+        with urllib.request.urlopen(req, timeout=max(1.0, float(timeout))) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
         return {"ok": False, "error": f"bridge request failed: {exc}"}
+
+
+def _expand_workspace_media_paths(value, extensions: set[str], tool_name: str) -> list[str]:
+    if isinstance(value, (str, os.PathLike)):
+        requested = [str(value)]
+    elif isinstance(value, (list, tuple, set)):
+        requested = [str(item) for item in value]
+    else:
+        raise ValueError(f"{tool_name}: expected a path or list of paths")
+
+    resolved: list[Path] = []
+    for item in requested:
+        candidate = _resolve_workspace_path(item)
+        if not candidate.exists():
+            raise ValueError(f"{tool_name}: path does not exist: {item}")
+        if candidate.is_dir():
+            resolved.extend(
+                child.resolve()
+                for child in sorted(candidate.rglob("*"), key=lambda path_value: str(path_value).lower())
+                if child.is_file() and child.suffix.lower() in extensions
+            )
+        elif candidate.is_file():
+            if candidate.suffix.lower() not in extensions:
+                raise ValueError(f"{tool_name}: unsupported file format: {candidate.suffix or 'none'}")
+            resolved.append(candidate)
+        else:
+            raise ValueError(f"{tool_name}: path is not a file or directory: {item}")
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for candidate in resolved:
+        checked = _resolve_workspace_path(str(candidate))
+        key = str(checked).casefold() if os.name == "nt" else str(checked)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(checked.relative_to(WORKSPACE_ROOT).as_posix())
+    if not unique:
+        supported = ", ".join(sorted(extensions))
+        raise ValueError(f"{tool_name}: no supported files found ({supported})")
+    if len(unique) > 20:
+        raise ValueError(f"{tool_name}: at most 20 files can be processed per call")
+    return unique
+
+
+def _media_runtime_payload(setting_key: str) -> tuple[str, str, int]:
+    runtime = harness.get_agent_runtime()
+    settings = runtime.get("settings") if isinstance(runtime.get("settings"), dict) else {}
+    profile = str(settings.get(setting_key) or "").strip()
+    session_id = str(runtime.get("session_id") or "")
+    try:
+        timeout_ms = max(1_000, int(settings.get("request_timeout_ms") or 600_000))
+    except (TypeError, ValueError):
+        timeout_ms = 600_000
+    return profile, session_id, timeout_ms
+
+
+def transcribe_audio(audios, language: str = "") -> dict:
+    """Transcribe workspace audio using the Speech to text profile selected in /settings."""
+    try:
+        paths = _expand_workspace_media_paths(
+            audios,
+            {".wav", ".mp3", ".flac", ".m4a", ".ogg", ".webm", ".aac"},
+            "transcribe_audio",
+        )
+        profile, session_id, timeout_ms = _media_runtime_payload("speech_to_text_model")
+        bridge_timeout = min(3_600.0, max(180.0, timeout_ms / 1000 * len(paths) + 30))
+        return _bridge_request(
+            "media",
+            {
+                "action": "transcribe_audio",
+                "paths": paths,
+                "profile": profile,
+                "session_id": session_id,
+                "timeout_ms": timeout_ms,
+                "language": str(language or "").strip(),
+            },
+            timeout=bridge_timeout,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"transcribe_audio: {exc}"}
+
+
+def describe_image(images, prompt: str = "Describe this image accurately and concisely.") -> dict:
+    """Describe workspace images using the Vision model profile selected in /settings."""
+    try:
+        paths = _expand_workspace_media_paths(
+            images,
+            {".png", ".jpg", ".jpeg", ".webp", ".gif"},
+            "describe_image",
+        )
+        clean_prompt = str(prompt or "").strip()
+        if not clean_prompt:
+            raise ValueError("prompt must be non-empty")
+        profile, session_id, timeout_ms = _media_runtime_payload("vision_model")
+        bridge_timeout = min(3_600.0, max(180.0, timeout_ms / 1000 * len(paths) + 30))
+        return _bridge_request(
+            "media",
+            {
+                "action": "describe_image",
+                "paths": paths,
+                "profile": profile,
+                "session_id": session_id,
+                "timeout_ms": timeout_ms,
+                "prompt": clean_prompt,
+            },
+            timeout=bridge_timeout,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"describe_image: {exc}"}
 
 
 def kernel_exec(code: str) -> dict:
@@ -2909,6 +3214,8 @@ FUNCTIONS = {
     "get_git_log": get_git_log,
     "read_file_summary": read_file_summary,
     "fetch_url": fetch_url,
+    "transcribe_audio": transcribe_audio,
+    "describe_image": describe_image,
     "list_skills": list_skills,
     "get_skill": get_skill,
     "manage_skill": manage_skill,
@@ -2960,6 +3267,8 @@ FUNCTION_DESCRIPTIONS = {
     "get_git_log": "get_git_log(max_count: int = 20) -> dict: Return recent git commits.",
     "read_file_summary": "async read_file_summary(path: str) -> dict: Return summary/preview for large files.",
     "fetch_url": "fetch_url(url: str, max_chars: int = 20000) -> dict: Fetch a URL and extract visible text content (HTML stripped). Returns {url, title, text, truncated, error}.",
+    "transcribe_audio": "transcribe_audio(audios: str|list[str], language: str = '') -> dict: Transcribe one audio file, multiple files, or every supported audio file in a workspace directory using the Speech to text profile selected in /settings. Supported formats: wav, mp3, flac, m4a, ogg, webm, aac. Returns {ok, profile, model, results: [{ok, path, transcript|error}]}.",
+    "describe_image": "describe_image(images: str|list[str], prompt: str = 'Describe this image accurately and concisely.') -> dict: Describe one image, multiple images, or every supported image in a workspace directory using the Vision model profile selected in /settings. Supported formats: png, jpg, jpeg, webp, gif. Returns {ok, profile, model, results: [{ok, path, description|error}]}.",
     "skill_python_path": "skill_python_path() -> str: Return the shared skill venv python executable (creates venv if needed). Use with run_shell to run skill scripts that depend on requirements.txt packages.",
     "list_skills": "list_skills() -> dict: List available skills. Returns {skills: [{name, description}], error}.",
     "get_skill": "get_skill(name: str) -> dict: Get a skill by name. Returns {name, description, path, body, error}. Load the body only when using the skill.",
@@ -2996,6 +3305,15 @@ def get_descriptions() -> dict[str, str]:
 
 def main() -> int:
     args = sys.argv[1:]
+    if "--voice-capture" in args:
+        index = args.index("--voice-capture")
+        if index + 2 >= len(args):
+            return 2
+        try:
+            parent_pid = int(args[index + 2])
+        except ValueError:
+            return 2
+        return _run_voice_capture_helper(args[index + 1], parent_pid)
     if "--run-subagent" in args:
         index = args.index("--run-subagent")
         if index + 1 >= len(args):

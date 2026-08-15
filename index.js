@@ -175,6 +175,19 @@ const PASTE_BURST_MIN_CHARS_RAPID_MULTILINE = 24;
 const PASTE_BURST_BLOCK_MS = 250;
 const TOOL_EXEC_TIMEOUT_MS = 300000;
 const TOOL_EXEC_MAX_STEPS = 120000;
+const MEDIA_TOOL_MAX_FILES = 20;
+const MEDIA_TOOL_MAX_AUDIO_BYTES = 50 * 1024 * 1024;
+const MEDIA_TOOL_MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+const VOICE_CAPTURE_STATUS_CLEAR_MS = 5000;
+const VOICE_CAPTURE_MAX_RECORDING_MS = 5 * 60 * 1000;
+const AUDIO_FILE_EXTENSIONS = new Set([".wav", ".mp3", ".flac", ".m4a", ".ogg", ".webm", ".aac"]);
+const IMAGE_FILE_MIME_TYPES = new Map([
+  [".png", "image/png"],
+  [".jpg", "image/jpeg"],
+  [".jpeg", "image/jpeg"],
+  [".webp", "image/webp"],
+  [".gif", "image/gif"],
+]);
 const TOOL_RESULT_TRUNCATE_WRAP_COLS = 120;
 const TOOL_RESULT_TRUNCATE_MAX_LINES = 14;
 const TOOL_RESULT_TRUNCATE_HEAD_LINES = 2;
@@ -1052,7 +1065,7 @@ const FALLBACK_MODELS = [
 ];
 const COMMANDS = [
   { name: "/plan", description: "toggle read-only plan mode: /plan [on|off|status]" },
-  { name: "/providers", description: "manage provider list and credentials" },
+  { name: "/models", description: "manage model providers and credentials" },
   { name: "/settings", description: "view and change runtime settings" },
   { name: "/resume", description: "show session list and resume selected chat" },
   { name: "/clear", description: "clear chat window and delete current session history file" },
@@ -1133,6 +1146,8 @@ const SYSTEM_PROMPT_VISIBLE_TOOL_NAMES = new Set([
   "get_git_diff",
   "web_search",
   "fetch_url",
+  "transcribe_audio",
+  "describe_image",
   "deep_think",
 ]);
 const FALLBACK_TOOL_DESCRIPTIONS = {
@@ -1162,6 +1177,10 @@ const FALLBACK_TOOL_DESCRIPTIONS = {
     "web_search(query: str, max_results: int = 5) -> dict: Search the web and return relevant titles, snippets, and URLs.",
   fetch_url:
     "fetch_url(url: str, max_chars: int = 20000) -> dict: Fetch a URL and extract visible text content. Returns {url, title, text, truncated, error}.",
+  transcribe_audio:
+    "transcribe_audio(audios: str|list[str], language: str = '') -> dict: Transcribe one audio file, multiple files, or every supported audio file in a workspace directory using the Speech to text profile selected in /settings. Returns per-file transcripts.",
+  describe_image:
+    "describe_image(images: str|list[str], prompt: str = 'Describe this image accurately and concisely.') -> dict: Describe one image, multiple images, or every supported image in a workspace directory using the Vision model profile selected in /settings. Returns per-file descriptions.",
   exclude_history_messages:
     "exclude_history_messages(latest_n: int = 0, role: str = '', query: str = '', use_regex: bool = False, case_sensitive: bool = False, regex_flags: str = '', max_matches: int = 200, include_system: bool = False) -> dict: Exclude matching existing chat messages from future LLM requests.",
   create_plan:
@@ -1268,9 +1287,20 @@ let lastRemoteControlRenderedHeight = 0;
 let selectedModel = "";
 let reasoningEnabledByModel = {};
 let sessionRuntimeSettings = {};
+let voiceCaptureProcess = null;
+let voiceCaptureStdoutBuffer = "";
+let voiceCaptureEnabledState = null;
+let voiceCaptureState = "idle";
+let voiceCaptureStatusText = "";
+let voiceCaptureStatusTimer = null;
+let voiceCaptureRecordingPath = "";
+let voiceCaptureContext = null;
+let suppressVoiceEscapeKeypressUntil = 0;
+const VOICE_CAPTURE_TEMP_DIR = path.join(os.tmpdir(), `nexus-voice-${process.pid}`);
 let modelSearch = "";
 let modelSelected = 0;
 let modelScroll = 0;
+let modelPickerContext = null;
 let availableModels = FALLBACK_MODELS.map((id) => ({
   id,
   inputModalities: ["text"],
@@ -1375,6 +1405,7 @@ let suppressKeypressUntil = 0;
 let suppressSolveEscapeKeypressUntil = 0;
 let suppressAgentMentionEscapeKeypressUntil = 0;
 let suppressRemoteControlEscapeKeypressUntil = 0;
+let suppressModelEscapeKeypressUntil = 0;
 let suppressMouseNoiseUntil = 0;
 let ignoreNextProvidersEscape = false;
 let bracketedPasteModeEnabled = false;
@@ -1987,6 +2018,292 @@ function getBundledPythonExe() {
     }
   }
   return "";
+}
+
+function getBundledPythonWorkerExe() {
+  const executableName = path.basename(process.execPath).toLowerCase();
+  if (executableName === "node" || executableName === "node.exe") return "";
+  const candidates = [
+    path.join(path.dirname(process.execPath), "tools-worker.exe"),
+    path.join(__dirname, "tools-worker.exe"),
+    path.join(process.cwd(), "tools-worker.exe"),
+  ];
+  return candidates.find((candidate) => {
+    try { return fsSync.existsSync(candidate); } catch { return false; }
+  }) || "";
+}
+
+function isSafeVoiceCapturePath(filePath) {
+  const root = path.resolve(VOICE_CAPTURE_TEMP_DIR);
+  const candidate = path.resolve(String(filePath || ""));
+  return candidate === root || candidate.startsWith(`${root}${path.sep}`);
+}
+
+function setVoiceCaptureStatus(state, text = "", clearAfterMs = 0) {
+  if (voiceCaptureStatusTimer) {
+    clearTimeout(voiceCaptureStatusTimer);
+    voiceCaptureStatusTimer = null;
+  }
+  voiceCaptureState = state;
+  voiceCaptureStatusText = String(text || "");
+  markDirty();
+  if (hasInitializedScreen) renderFrame(false);
+  if (clearAfterMs > 0) {
+    voiceCaptureStatusTimer = setTimeout(() => {
+      voiceCaptureStatusTimer = null;
+      if (voiceCaptureState !== state) return;
+      voiceCaptureState = "idle";
+      voiceCaptureStatusText = "";
+      markDirty();
+      renderFrame(false);
+    }, clearAfterMs);
+  }
+}
+
+function getVoiceCaptureFooterSegment() {
+  if (voiceCaptureState === "recording") return { text: "Recording", color: RED_COLOR };
+  if (voiceCaptureState === "transcribing") {
+    return { text: voiceCaptureStatusText || "Transcribing", color: GOLDENROD_COLOR };
+  }
+  if (voiceCaptureState === "error" && voiceCaptureStatusText) {
+    return { text: voiceCaptureStatusText, color: RED_COLOR };
+  }
+  return null;
+}
+
+function shouldRenderMainFooter(menuHeight) {
+  return (
+    !APPEND_CHAT_TO_SCROLLBACK &&
+    Number(menuHeight) === 0 &&
+    (input.length === 0 || Boolean(getVoiceCaptureFooterSegment()))
+  );
+}
+
+function syncVoiceCaptureHelperState() {
+  const enabled = Boolean(
+    voiceCaptureProcess &&
+    !voiceCaptureProcess.killed &&
+    activeBuffer === "main" &&
+    terminalHasFocus &&
+    voiceCaptureState !== "transcribing" &&
+    !cleanedUp
+  );
+  if (!voiceCaptureProcess?.stdin?.writable || enabled === voiceCaptureEnabledState) return;
+  voiceCaptureEnabledState = enabled;
+  try {
+    voiceCaptureProcess.stdin.write(`${JSON.stringify({ enabled })}\n`);
+  } catch {
+    // The close handler will clear the unavailable helper.
+  }
+}
+
+function stopVoiceCaptureHelper() {
+  if (voiceCaptureStatusTimer) {
+    clearTimeout(voiceCaptureStatusTimer);
+    voiceCaptureStatusTimer = null;
+  }
+  const child = voiceCaptureProcess;
+  voiceCaptureProcess = null;
+  voiceCaptureEnabledState = null;
+  if (child) {
+    try { child.stdin?.write(`${JSON.stringify({ stop: true })}\n`); } catch {}
+    try { child.kill(); } catch {}
+  }
+  try { fsSync.rmSync(VOICE_CAPTURE_TEMP_DIR, { recursive: true, force: true }); } catch {}
+}
+
+function mergeTranscribedText(currentInput, cursorIndex, text) {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  const source = String(currentInput || "");
+  const cursor = Math.max(0, Math.min(source.length, Number(cursorIndex) || 0));
+  if (!normalized) return { input: source, cursorIndex: cursor, changed: false };
+  const before = source.slice(0, cursor);
+  const after = source.slice(cursor);
+  const leading = before && !/\s$/.test(before) ? " " : "";
+  const trailing = after && !/^\s/.test(after) ? " " : "";
+  const insertion = `${leading}${normalized}${trailing}`;
+  return {
+    input: `${before}${insertion}${after}`,
+    cursorIndex: before.length + insertion.length,
+    changed: true,
+  };
+}
+
+function insertTranscribedText(text) {
+  const merged = mergeTranscribedText(input, inputCursorIndex, text);
+  if (!merged.changed) return false;
+  breakSubmittedInputHistoryNavigation();
+  input = merged.input;
+  inputCursorIndex = merged.cursorIndex;
+  updateCommandMenuState();
+  scrollChatToBottom();
+  markDirty();
+  renderFrame(false);
+  return true;
+}
+
+async function requestVoiceTranscription(filePath, context = {}) {
+  if (!isSafeVoiceCapturePath(filePath)) throw new Error("recording path was rejected");
+  const stat = await fs.stat(filePath);
+  if (!stat.isFile() || stat.size <= 44) throw new Error("recording was empty");
+  if (stat.size > MEDIA_TOOL_MAX_AUDIO_BYTES) throw new Error("recording is too large");
+  const { provider, profileName, model } = resolveMediaProviderProfile(
+    { profile: context.profile, session_id: context.sessionId },
+    "speech_to_text_model",
+    "Speech to text"
+  );
+  const data = await fs.readFile(filePath);
+  const response = await postProviderJson(
+    provider,
+    "audio/transcriptions",
+    {
+      input_audio: { data: data.toString("base64"), format: "wav" },
+      model,
+    },
+    context.timeoutMs
+  );
+  const transcript = String(response?.text || "").trim();
+  if (!transcript) throw new Error(`${profileName} returned an empty transcript`);
+  return transcript;
+}
+
+async function handleVoiceCaptureEvent(event) {
+  const eventName = String(event?.event || "");
+  if (eventName === "ready") {
+    syncVoiceCaptureHelperState();
+    return;
+  }
+  if (eventName === "recording_started") {
+    if (!isSafeVoiceCapturePath(event.path)) return;
+    voiceCaptureRecordingPath = event.path;
+    const settings = getActiveSessionRuntimeSettings();
+    voiceCaptureContext = {
+      agentName: activeAgentName,
+      sessionId: getAgentSessionUid(activeAgentName),
+      profile: normalizeRuntimeModelId(settings.speech_to_text_model),
+      timeoutMs: settings.request_timeout_ms,
+    };
+    suppressVoiceEscapeKeypressUntil = Date.now() + VOICE_CAPTURE_MAX_RECORDING_MS + 1500;
+    setVoiceCaptureStatus("recording", "Recording");
+    return;
+  }
+  if (eventName === "recording_cancelled") {
+    const cancelledPath = voiceCaptureRecordingPath;
+    voiceCaptureRecordingPath = "";
+    voiceCaptureContext = null;
+    suppressVoiceEscapeKeypressUntil = Date.now() + 800;
+    if (cancelledPath && isSafeVoiceCapturePath(cancelledPath)) {
+      await fs.rm(cancelledPath, { force: true }).catch(() => {});
+    }
+    setVoiceCaptureStatus("idle");
+    return;
+  }
+  if (eventName === "recording_stopped") {
+    const recordingPath = String(event.path || voiceCaptureRecordingPath || "");
+    const context = voiceCaptureContext || {};
+    voiceCaptureRecordingPath = "";
+    voiceCaptureContext = null;
+    suppressVoiceEscapeKeypressUntil = Date.now() + 1500;
+    if (!isSafeVoiceCapturePath(recordingPath)) {
+      setVoiceCaptureStatus("error", "Recording path rejected", VOICE_CAPTURE_STATUS_CLEAR_MS);
+      return;
+    }
+    setVoiceCaptureStatus("transcribing", "Transcribing...");
+    try {
+      const transcript = await requestVoiceTranscription(recordingPath, context);
+      voiceCaptureState = "idle";
+      voiceCaptureStatusText = "";
+      insertTranscribedText(transcript);
+    } catch (error) {
+      setVoiceCaptureStatus(
+        "error",
+        `Voice: ${error?.message || String(error)}`,
+        VOICE_CAPTURE_STATUS_CLEAR_MS
+      );
+    } finally {
+      await fs.rm(recordingPath, { force: true }).catch(() => {});
+    }
+    return;
+  }
+  if (eventName === "error" || eventName === "unavailable") {
+    voiceCaptureRecordingPath = "";
+    voiceCaptureContext = null;
+    setVoiceCaptureStatus(
+      "error",
+      `Voice: ${event?.error || "recording failed"}`,
+      VOICE_CAPTURE_STATUS_CLEAR_MS
+    );
+  }
+}
+
+async function startVoiceCaptureHelper() {
+  if (process.platform !== "win32" || !process.stdin.isTTY || voiceCaptureProcess) return false;
+  await fs.mkdir(VOICE_CAPTURE_TEMP_DIR, { recursive: true });
+  const workerExe = getBundledPythonWorkerExe();
+  const helperArgs = [TOOLS_SCRIPT_PATH, "--voice-capture", VOICE_CAPTURE_TEMP_DIR, String(process.pid)];
+  const candidates = workerExe
+    ? [{ file: workerExe, args: helperArgs }]
+    : [
+        { file: "python", args: helperArgs },
+        { file: "py", args: ["-3", ...helperArgs] },
+      ];
+
+  const launch = (index) => {
+    if (index >= candidates.length || cleanedUp) return false;
+    const candidate = candidates[index];
+    let child;
+    try {
+      child = spawn(candidate.file, candidate.args, {
+        cwd: process.cwd(),
+        windowsHide: true,
+        env: getPythonRuntimeEnvironment(),
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch {
+      return launch(index + 1);
+    }
+    let becameReady = false;
+    voiceCaptureProcess = child;
+    voiceCaptureEnabledState = null;
+    child.stdout.setEncoding("utf8");
+    child.stderr.on("data", () => {});
+    child.stdout.on("data", (chunk) => {
+      voiceCaptureStdoutBuffer += String(chunk || "");
+      for (;;) {
+        const newline = voiceCaptureStdoutBuffer.indexOf("\n");
+        if (newline < 0) break;
+        const line = voiceCaptureStdoutBuffer.slice(0, newline).replace(/\r$/, "");
+        voiceCaptureStdoutBuffer = voiceCaptureStdoutBuffer.slice(newline + 1);
+        try {
+          const event = JSON.parse(line);
+          if (event?.event === "ready") becameReady = true;
+          handleVoiceCaptureEvent(event).catch(() => {});
+        } catch {
+          // Ignore non-protocol helper output.
+        }
+      }
+    });
+    child.on("error", () => {
+      if (voiceCaptureProcess === child) voiceCaptureProcess = null;
+    });
+    child.on("close", () => {
+      if (voiceCaptureProcess === child) {
+        voiceCaptureProcess = null;
+        voiceCaptureEnabledState = null;
+      }
+      if (!becameReady && !cleanedUp) launch(index + 1);
+      else if (becameReady && !cleanedUp) {
+        setVoiceCaptureStatus(
+          "error",
+          "Voice recorder stopped",
+          VOICE_CAPTURE_STATUS_CLEAR_MS
+        );
+      }
+    });
+    syncVoiceCaptureHelperState();
+    return true;
+  };
+  return launch(0);
 }
 
 async function runPythonCommand(args, options = {}) {
@@ -3583,6 +3900,227 @@ async function runBackgroundShellSelfTest() {
   }
 }
 
+function getBridgeSessionRuntimeSettings(sessionId) {
+  const runtimeSessionId = String(sessionId || "").trim();
+  if (!runtimeSessionId || runtimeSessionId === String(currentSessionUid || "")) {
+    return getMainSessionRuntimeSettings();
+  }
+  const agent = namedAgents.find((entry) =>
+    String(entry?.runtime?.session_id || "") === runtimeSessionId ||
+    String(entry?.session_runtime?.session_id || "") === runtimeSessionId
+  );
+  return agent ? normalizeNamedAgentSessionRuntime(agent).settings : null;
+}
+
+function getSavedProviderProfile(name) {
+  const key = String(name || "").trim().toLowerCase();
+  if (!key) return null;
+  return providers.find((provider) => String(provider?.name || "").trim().toLowerCase() === key) || null;
+}
+
+function resolveMediaProviderProfile(parsed, settingKey, label) {
+  const runtimeSettings = getBridgeSessionRuntimeSettings(parsed?.session_id);
+  const profileName = String(parsed?.profile || runtimeSettings?.[settingKey] || "").trim();
+  if (!profileName) {
+    throw new Error(`${label} is not configured. Select a saved profile in /settings.`);
+  }
+  const provider = getSavedProviderProfile(profileName);
+  if (!provider) throw new Error(`Saved model profile "${profileName}" was not found in /models.`);
+  const model = normalizeProviderModel(provider.model);
+  const apiKey = String(provider.api_key || "").trim();
+  if (!model) throw new Error(`Saved model profile "${profileName}" has no model configured.`);
+  if (!apiKey) throw new Error(`Saved model profile "${profileName}" has no API key configured.`);
+  return { provider, profileName, model, runtimeSettings };
+}
+
+function buildProviderApiUrl(provider, endpoint) {
+  const baseUrl = String(provider?.base_url || OPENROUTER_BASE_URL).trim().replace(/\/+$/, "");
+  const suffix = String(endpoint || "").replace(/^\/+/, "");
+  return /\/v\d+$/i.test(baseUrl) ? `${baseUrl}/${suffix}` : `${baseUrl}/v1/${suffix}`;
+}
+
+function getProviderRequestHeaders(provider) {
+  const baseUrl = String(provider?.base_url || OPENROUTER_BASE_URL);
+  const headers = {
+    Authorization: `Bearer ${String(provider?.api_key || "").trim()}`,
+    "Content-Type": "application/json",
+  };
+  if (baseUrl.toLowerCase().includes("openrouter.ai")) {
+    if (process.env.OPENROUTER_HTTP_REFERER) headers["HTTP-Referer"] = process.env.OPENROUTER_HTTP_REFERER;
+    if (process.env.OPENROUTER_TITLE) headers["X-OpenRouter-Title"] = process.env.OPENROUTER_TITLE;
+  }
+  return headers;
+}
+
+async function postProviderJson(provider, endpoint, payload, timeoutMs) {
+  if (typeof fetch !== "function") throw new Error("fetch is unavailable in this Nexus build");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), normalizeLlmRequestTimeoutMs(timeoutMs));
+  try {
+    const response = await fetch(buildProviderApiUrl(provider, endpoint), {
+      method: "POST",
+      headers: getProviderRequestHeaders(provider),
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    const responseText = await response.text();
+    let body = {};
+    try { body = responseText ? JSON.parse(responseText) : {}; } catch { body = { text: responseText }; }
+    if (!response.ok) {
+      throw new Error(
+        String(body?.error?.message || body?.error || body?.message || responseText || `HTTP ${response.status}`)
+      );
+    }
+    return body;
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(`Media model request timed out after ${Math.round(normalizeLlmRequestTimeoutMs(timeoutMs) / 1000)}s`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function readWorkspaceMediaFile(requestedPath, allowedExtensions, maxBytes) {
+  const source = String(requestedPath || "").trim();
+  if (!source) throw new Error("media path must be non-empty");
+  const absolutePath = path.resolve(WORKSPACE_ROOT, source);
+  const relativePath = path.relative(WORKSPACE_ROOT, absolutePath);
+  if (relativePath === ".." || relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath)) {
+    throw new Error(`media path must stay inside the workspace: ${source}`);
+  }
+  const extension = path.extname(absolutePath).toLowerCase();
+  if (!allowedExtensions.has(extension)) throw new Error(`unsupported media format: ${extension || "none"}`);
+  const stat = await fs.stat(absolutePath);
+  if (!stat.isFile()) throw new Error(`media path is not a file: ${source}`);
+  if (stat.size > maxBytes) {
+    throw new Error(`media file is too large (${Math.ceil(stat.size / 1024 / 1024)} MB)`);
+  }
+  return {
+    absolutePath,
+    relativePath: relativePath.split(path.sep).join("/"),
+    extension,
+    data: (await fs.readFile(absolutePath)).toString("base64"),
+  };
+}
+
+function extractProviderMessageText(content) {
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => typeof part === "string" ? part : String(part?.text || part?.content || ""))
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+}
+
+async function handleMediaBridgeRequest(parsed) {
+  const action = String(parsed?.action || "");
+  const paths = Array.isArray(parsed?.paths)
+    ? parsed.paths.map((entry) => String(entry || "").trim()).filter(Boolean)
+    : [];
+  if (paths.length === 0) return { ok: false, error: `${action || "media tool"} requires at least one file` };
+  if (paths.length > MEDIA_TOOL_MAX_FILES) {
+    return { ok: false, error: `media tools accept at most ${MEDIA_TOOL_MAX_FILES} files per call` };
+  }
+  const timeoutMs = normalizeLlmRequestTimeoutMs(parsed?.timeout_ms);
+
+  try {
+    if (action === "transcribe_audio") {
+      const { provider, profileName, model } = resolveMediaProviderProfile(
+        parsed,
+        "speech_to_text_model",
+        "Speech to text model"
+      );
+      const language = String(parsed?.language || "").trim();
+      const results = [];
+      for (const requestedPath of paths) {
+        try {
+          const media = await readWorkspaceMediaFile(
+            requestedPath,
+            AUDIO_FILE_EXTENSIONS,
+            MEDIA_TOOL_MAX_AUDIO_BYTES
+          );
+          const payload = {
+            model,
+            input_audio: { data: media.data, format: media.extension.slice(1) },
+          };
+          if (language) payload.language = language;
+          const response = await postProviderJson(provider, "audio/transcriptions", payload, timeoutMs);
+          results.push({
+            ok: true,
+            path: media.relativePath,
+            transcript: String(response?.text || "").trim(),
+            ...(response?.usage ? { usage: response.usage } : {}),
+          });
+        } catch (error) {
+          results.push({ ok: false, path: requestedPath, error: error?.message || String(error) });
+        }
+      }
+      const ok = results.every((result) => result.ok);
+      return {
+        ok,
+        profile: profileName,
+        model,
+        results,
+        ...(ok ? {} : { error: "one or more audio files could not be transcribed" }),
+      };
+    }
+
+    if (action === "describe_image") {
+      const { provider, profileName, model } = resolveMediaProviderProfile(
+        parsed,
+        "vision_model",
+        "Vision model"
+      );
+      const prompt = String(parsed?.prompt || "Describe this image accurately and concisely.").trim();
+      const results = [];
+      for (const requestedPath of paths) {
+        try {
+          const media = await readWorkspaceMediaFile(
+            requestedPath,
+            new Set(IMAGE_FILE_MIME_TYPES.keys()),
+            MEDIA_TOOL_MAX_IMAGE_BYTES
+          );
+          const mimeType = IMAGE_FILE_MIME_TYPES.get(media.extension);
+          const response = await postProviderJson(provider, "chat/completions", {
+            model,
+            messages: [{
+              role: "user",
+              content: [
+                { type: "text", text: prompt },
+                { type: "image_url", image_url: { url: `data:${mimeType};base64,${media.data}` } },
+              ],
+            }],
+          }, timeoutMs);
+          const description = extractProviderMessageText(response?.choices?.[0]?.message?.content);
+          if (!description) throw new Error("vision model returned an empty description");
+          results.push({
+            ok: true,
+            path: media.relativePath,
+            description,
+            ...(response?.usage ? { usage: response.usage } : {}),
+          });
+        } catch (error) {
+          results.push({ ok: false, path: requestedPath, error: error?.message || String(error) });
+        }
+      }
+      const ok = results.every((result) => result.ok);
+      return {
+        ok,
+        profile: profileName,
+        model,
+        results,
+        ...(ok ? {} : { error: "one or more images could not be described" }),
+      };
+    }
+    return { ok: false, error: `unknown media action "${action}"` };
+  } catch (error) {
+    return { ok: false, error: error?.message || String(error) };
+  }
+}
+
 async function handleMcpBridgeRequest(parsed) {
   if (!parsed || typeof parsed !== "object") {
     return { ok: false, error: "bad request" };
@@ -3763,6 +4301,10 @@ async function handleMcpBridgeRequest(parsed) {
 
   if (!serverName) {
     return { ok: false, error: "missing server" };
+  }
+
+  if (parsed.method === "media") {
+    return handleMediaBridgeRequest(parsed);
   }
   if (!isMcpServerAllowedForSession(serverName, runtimeSessionId)) {
     return { ok: false, error: `MCP server "${serverName}" is disabled for this agent session` };
@@ -4192,6 +4734,7 @@ function cleanupTerminal(options = {}) {
     clearInterval(answerRevealTimer);
     answerRevealTimer = null;
   }
+  stopVoiceCaptureHelper();
   if (agentsRefreshTimer) {
     clearTimeout(agentsRefreshTimer);
     agentsRefreshTimer = null;
@@ -4542,15 +5085,28 @@ function normalizeThinkingEffort(value) {
   return THINKING_EFFORT_OPTIONS.includes(normalized) ? normalized : DEFAULT_THINKING_EFFORT;
 }
 
+function normalizeRuntimeModelId(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
 function getDefaultSessionRuntimeSettings() {
   return {
     thinking_blocks: nexusConfig?.show_thinking_blocks !== false,
     external_thinking: nexusConfig?.external_thinking === true,
     thinking_effort: normalizeThinkingEffort(nexusConfig?.thinking_effort),
+    text_to_speech_model: normalizeRuntimeModelId(nexusConfig?.text_to_speech_model),
+    speech_to_text_model: normalizeRuntimeModelId(nexusConfig?.speech_to_text_model),
+    vision_model: normalizeRuntimeModelId(nexusConfig?.vision_model),
     context_window: normalizeModelContextWindow(nexusConfig?.model_context_window_override),
     request_timeout_ms: normalizeLlmRequestTimeoutMs(nexusConfig?.llm_request_timeout_ms),
     mcp_disabled_servers: [],
   };
+}
+
+function copyRuntimeMediaModelsToConfig(settings = getMainSessionRuntimeSettings()) {
+  nexusConfig.text_to_speech_model = normalizeRuntimeModelId(settings?.text_to_speech_model);
+  nexusConfig.speech_to_text_model = normalizeRuntimeModelId(settings?.speech_to_text_model);
+  nexusConfig.vision_model = normalizeRuntimeModelId(settings?.vision_model);
 }
 
 function normalizeMcpDisabledServers(raw) {
@@ -4572,6 +5128,13 @@ function normalizeSessionRuntimeSettings(raw, defaults = getDefaultSessionRuntim
       ? source.external_thinking === true
       : defaults.external_thinking === true,
     thinking_effort: normalizeThinkingEffort(source.thinking_effort ?? defaults.thinking_effort),
+    text_to_speech_model: normalizeRuntimeModelId(
+      source.text_to_speech_model ?? defaults.text_to_speech_model
+    ),
+    speech_to_text_model: normalizeRuntimeModelId(
+      source.speech_to_text_model ?? defaults.speech_to_text_model
+    ),
+    vision_model: normalizeRuntimeModelId(source.vision_model ?? defaults.vision_model),
     context_window: normalizeModelContextWindow(source.context_window ?? defaults.context_window),
     request_timeout_ms: normalizeLlmRequestTimeoutMs(
       source.request_timeout_ms ?? defaults.request_timeout_ms
@@ -4755,6 +5318,9 @@ async function ensureNexusConfigFileReady() {
     thinking_effort: DEFAULT_THINKING_EFFORT,
     show_thinking_blocks: true,
     external_thinking: false,
+    text_to_speech_model: "",
+    speech_to_text_model: "",
+    vision_model: "",
   };
   const content = `${JSON.stringify(initialConfig, null, 2)}\n`;
   try {
@@ -4835,6 +5401,15 @@ async function saveNexusConfig() {
     ),
     show_thinking_blocks: nexusConfig?.show_thinking_blocks !== false,
     external_thinking: nexusConfig?.external_thinking === true,
+    text_to_speech_model: normalizeRuntimeModelId(
+      nexusConfig?.text_to_speech_model ?? current?.text_to_speech_model
+    ),
+    speech_to_text_model: normalizeRuntimeModelId(
+      nexusConfig?.speech_to_text_model ?? current?.speech_to_text_model
+    ),
+    vision_model: normalizeRuntimeModelId(
+      nexusConfig?.vision_model ?? current?.vision_model
+    ),
   };
   nexusConfig = next;
   await fs.writeFile(NEXUS_CONFIG_FILE, `${JSON.stringify(next, null, 2)}\n`, "utf8");
@@ -4862,6 +5437,9 @@ async function loadNexusConfig() {
     thinking_effort: normalizeThinkingEffort(parsed?.thinking_effort),
     show_thinking_blocks: parsed?.show_thinking_blocks !== false,
     external_thinking: parsed?.external_thinking === true,
+    text_to_speech_model: normalizeRuntimeModelId(parsed?.text_to_speech_model),
+    speech_to_text_model: normalizeRuntimeModelId(parsed?.speech_to_text_model),
+    vision_model: normalizeRuntimeModelId(parsed?.vision_model),
   };
   const providerName = typeof parsed.provider === "string" ? parsed.provider.trim() : "";
   if (providerName) {
@@ -7153,7 +7731,7 @@ async function runNamedAgentCompaction(customInstruction = "") {
 
   const latest = await readJsonObject(agent.recordPath, agent);
   const runtime = normalizeNamedAgentSessionRuntime(latest);
-  if (!runtime.model) return { ok: false, error: "Model is not configured. Use /model." };
+  if (!runtime.model) return { ok: false, error: "Model is not configured. Use /models." };
   applyNamedAgentSessionRuntime(latest, runtime);
   const requestMessages = buildNamedAgentCompactionMessages(latest, runtime);
   if (!requestMessages.some((message) => message.role !== "system")) {
@@ -8795,7 +9373,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
   const client = getOpenRouterClient();
   if (!client) {
     const message = OpenAI
-      ? "LLM provider is not configured. Set Base URL and API key in /providers."
+      ? "LLM provider is not configured. Set Base URL and API key in /models."
       : "OpenAI package is unavailable. Please reinstall dependencies.";
     finalizePendingAssistantMessage(pendingIndex, message, generation, {
       role: "error",
@@ -10816,13 +11394,22 @@ function moveCommandBufferSelection(delta) {
   return commandMenuSelected !== previous;
 }
 
+function getModelPickerSource() {
+  if (!modelPickerContext) return availableModels;
+  return providers
+    .filter((provider) => normalizeRuntimeModelId(provider?.name))
+    .map((provider) => ({ id: normalizeRuntimeModelId(provider.name), savedProvider: true }));
+}
+
 function getFilteredModels() {
   const query = modelSearch.trim().toLowerCase();
+  const models = getModelPickerSource();
   if (!query) {
-    return availableModels;
+    return models;
   }
 
-  return availableModels.filter((model) => {
+  return models.filter((model) => {
+    if (model.savedProvider) return model.id.toLowerCase().includes(query);
     const inModes = model.inputModalities.join(", ");
     const outModes = model.outputModalities.join(", ");
     return (
@@ -10835,7 +11422,9 @@ function getFilteredModels() {
 
 function getModelVisibleCount() {
   const rows = process.stdout.rows || 24;
-  const maxByRows = Math.max(1, Math.floor((rows - 4) / 2));
+  if (modelPickerContext) return Math.max(1, Math.min(20, rows - 4));
+  const rowsPerItem = modelPickerContext ? 1 : 2;
+  const maxByRows = Math.max(1, Math.floor((rows - 4) / rowsPerItem));
   return Math.max(1, Math.min(MODEL_LIST_MAX_ITEMS, maxByRows));
 }
 
@@ -10919,7 +11508,9 @@ function getMainFooterText() {
   const modelLabel = activeModel && activeModel.trim().length > 0 ? activeModel.trim() : "no model";
   const effort = normalizeThinkingEffort(getActiveSessionRuntimeSettings().thinking_effort);
   const agentLabel = activeAgentName.toLowerCase() === "main" ? "Main" : activeAgentName;
+  const voiceSegment = getVoiceCaptureFooterSegment();
   return [
+    ...(voiceSegment ? [voiceSegment.text] : []),
     ...(getActiveCollaborationMode() === "plan" ? ["PLAN"] : []),
     `${modelLabel} ${effort}`,
     formatWorkspacePathForFooter(WORKSPACE_ROOT),
@@ -10932,7 +11523,9 @@ function getMainFooterStyledText(maxWidth = Number.POSITIVE_INFINITY) {
   const modelLabel = activeModel && activeModel.trim().length > 0 ? activeModel.trim() : "no model";
   const effort = normalizeThinkingEffort(getActiveSessionRuntimeSettings().thinking_effort);
   const agentLabel = activeAgentName.toLowerCase() === "main" ? "Main" : activeAgentName;
+  const voiceSegment = getVoiceCaptureFooterSegment();
   const segments = [
+    ...(voiceSegment ? [voiceSegment] : []),
     ...(getActiveCollaborationMode() === "plan"
       ? [{ text: "PLAN", color: FOOTER_PLAN_COLOR }]
       : []),
@@ -13482,17 +14075,12 @@ async function runSlashCommand(commandName, commandArgs = "") {
     return true;
   }
 
-  if (commandName === "/model") {
-    openProvidersBuffer();
-    return true;
-  }
-
   if (commandName === "/thinking") {
     appendTuiErrorMessage("/thinking", "deprecated. Use '/settings'");
     return true;
   }
 
-  if (commandName === "/providers") {
+  if (["/models", "/model", "/providers"].includes(commandName)) {
     openProvidersBuffer();
     return true;
   }
@@ -14100,6 +14688,7 @@ function shouldTransitionCommandDirectlyToAltBuffer(commandName, commandArgs = "
   if (
     normalized === "/kernels" ||
     normalized === "/list-agents" ||
+    normalized === "/models" ||
     normalized === "/providers" ||
     normalized === "/settings" ||
     normalized === "/mcp" ||
@@ -14114,7 +14703,17 @@ function shouldTransitionCommandDirectlyToAltBuffer(commandName, commandArgs = "
   );
 }
 
-function openModelBuffer() {
+function openModelBuffer(options = {}) {
+  const reuseAltScreen = altScreenActive;
+  const settingKey = normalizeRuntimeModelId(options.settingKey);
+  modelPickerContext = settingKey
+    ? {
+        returnBuffer: options.returnBuffer === "settings" ? "settings" : "main",
+        settingKey,
+        label: String(options.label || "model").trim() || "model",
+        currentValue: normalizeRuntimeModelId(options.selectedModel),
+      }
+    : null;
   commandBufferQuery = "";
   lastCommandRenderedRows = [];
   lastCommandRenderedCols = 0;
@@ -14131,8 +14730,8 @@ function openModelBuffer() {
   bracketedPasteBuffer = "";
   pasteParserBuffer = "";
   modelSearch = "";
-  const activeModel = getActiveSessionModel();
-  const activeModelIndex = availableModels.findIndex((model) => model?.id === activeModel);
+  const activeModel = normalizeRuntimeModelId(options.selectedModel) || getActiveSessionModel();
+  const activeModelIndex = getModelPickerSource().findIndex((model) => model?.id === activeModel);
   modelSelected = activeModelIndex >= 0 ? activeModelIndex : 0;
   modelScroll = 0;
   lastModelRenderedRows = [];
@@ -14143,14 +14742,30 @@ function openModelBuffer() {
   burstMode = false;
   markDirty();
   renderFrame(true);
+  if (!modelPickerContext) loadModelsFromProvider().catch(() => {});
 }
 
-function closeModelBuffer() {
-  exitAltScreenIfNeeded();
-  activeBuffer = "main";
+function closeModelBuffer(options = {}) {
+  const returnBuffer = modelPickerContext?.returnBuffer || "main";
+  modelPickerContext = null;
   lastModelRenderedRows = [];
   lastModelRenderedCols = 0;
   lastModelRenderedHeight = 0;
+  if (returnBuffer === "settings") {
+    activeBuffer = "settings";
+    if (typeof options.message === "string") settingsMessage = options.message;
+    lastSettingsRenderedRows = [];
+    lastSettingsRenderedCols = 0;
+    lastSettingsRenderedHeight = 0;
+    forceFullClearOnNextRender = false;
+    cancelIdleFlush();
+    burstMode = false;
+    markDirty();
+    renderFrame(true);
+    return;
+  }
+  exitAltScreenIfNeeded();
+  activeBuffer = "main";
   forceFullClearOnNextRender = true;
   cancelIdleFlush();
   burstMode = false;
@@ -14278,7 +14893,7 @@ function closeAgentsBuffer(options = {}) {
   lastAgentsRenderedRows = [];
   lastAgentsRenderedCols = 0;
   lastAgentsRenderedHeight = 0;
-  forceFullClearOnNextRender = true;
+  forceFullClearOnNextRender = !reuseAltScreen;
   markDirty();
   renderFrame(options.refreshChat === true);
 }
@@ -14401,6 +15016,10 @@ function capitalizeSettingLabel(value) {
   return label ? `${label[0].toUpperCase()}${label.slice(1)}` : "";
 }
 
+function formatRuntimeModelSetting(value) {
+  return normalizeRuntimeModelId(value) || "not set";
+}
+
 function getRuntimeSettings() {
   const runtimeSettings = getActiveSessionRuntimeSettings();
   const contextWindow = runtimeSettings.context_window;
@@ -14424,6 +15043,27 @@ function getRuntimeSettings() {
       label: "thinking effort",
       value: runtimeSettings.thinking_effort,
       options: THINKING_EFFORT_OPTIONS,
+    },
+    {
+      key: "text_to_speech_model",
+      label: "text to speech",
+      value: runtimeSettings.text_to_speech_model,
+      picker: "model",
+      format: formatRuntimeModelSetting,
+    },
+    {
+      key: "speech_to_text_model",
+      label: "speech to text",
+      value: runtimeSettings.speech_to_text_model,
+      picker: "model",
+      format: formatRuntimeModelSetting,
+    },
+    {
+      key: "vision_model",
+      label: "vision model",
+      value: runtimeSettings.vision_model,
+      picker: "model",
+      format: formatRuntimeModelSetting,
     },
     {
       key: "context_window",
@@ -15079,6 +15719,7 @@ async function submitRemoteControlPrompt(rawText) {
     const commandName = trimmedInput.split(/\s+/)[0].toLowerCase();
     const isKnownCommand =
       commandName === "/model" ||
+      commandName === "/providers" ||
       commandName === "/thinking" ||
       COMMANDS.some((command) => command.name === commandName);
     if (isKnownCommand) {
@@ -15520,10 +16161,16 @@ function renderSettingsBuffer() {
     const valueColumn = Math.min(28, Math.max(1, panelWidth - value.length));
     const mainText = ` ${marker} ${label}:`.padEnd(valueColumn, " ") + value;
     if (selected) {
-      const options = setting.options
-        .map((option) => setting.format ? setting.format(option) : String(option))
-        .join(", ");
-      const hintText = options ? `       [${options}]` : "";
+      const options = Array.isArray(setting.options)
+        ? setting.options
+            .map((option) => setting.format ? setting.format(option) : String(option))
+            .join(", ")
+        : "";
+      const hintText = setting.picker === "model"
+        ? "       [Enter to choose]"
+        : options
+          ? `       [${options}]`
+          : "";
       const visibleMain = mainText.slice(0, panelWidth);
       const visibleHint = hintText.slice(0, Math.max(0, panelWidth - visibleMain.length));
       const padding = " ".repeat(Math.max(0, panelWidth - visibleMain.length - visibleHint.length));
@@ -15539,7 +16186,11 @@ function renderSettingsBuffer() {
   }
   setPanelRow(
     rows - 1,
-    settingsBusy ? "Updating setting..." : "Enter/Right: next value  Left: previous value  Esc: return",
+    settingsBusy
+      ? "Updating setting..."
+      : getFilteredRuntimeSettings()[settingsSelected]?.picker === "model"
+        ? "Enter: choose model  Up/Down: move  Esc: return"
+        : "Enter/Right: next value  Left: previous value  Esc: return",
     PLACEHOLDER_COLOR
   );
 
@@ -15561,6 +16212,31 @@ function renderSettingsBuffer() {
   readline.cursorTo(process.stdout, cursorX, 0);
   process.stdout.write(SHOW_CURSOR);
   dirty = false;
+}
+
+async function setActiveRuntimeModelSetting(settingKey, modelId) {
+  const supportedKeys = new Set([
+    "text_to_speech_model",
+    "speech_to_text_model",
+    "vision_model",
+  ]);
+  if (!supportedKeys.has(settingKey)) throw new Error("unknown model setting");
+  const normalizedModel = normalizeRuntimeModelId(modelId);
+  if (!normalizedModel) throw new Error("model is not set");
+  if (!providers.some((provider) => normalizeRuntimeModelId(provider?.name) === normalizedModel)) {
+    throw new Error("saved model was not found");
+  }
+  if (activeAgentName === "main") {
+    getMainSessionRuntimeSettings()[settingKey] = normalizedModel;
+    copyRuntimeMediaModelsToConfig();
+    await saveNexusConfig();
+    await rewriteSessionWithCurrentMessages();
+    return normalizedModel;
+  }
+  await updateActiveNamedAgentSessionRuntime((runtime) => {
+    runtime.settings[settingKey] = normalizedModel;
+  });
+  return normalizedModel;
 }
 
 function getMcpVisibleCount() {
@@ -17046,7 +17722,7 @@ function getMainFrameTopForCurrentLayout(rows, cols) {
       reservedTop + appendChatGap + statusChatGapRows + statusRows + statusInputGapRows
     );
   }
-  const footerVisible = !APPEND_CHAT_TO_SCROLLBACK && input.length === 0 && menuHeight === 0;
+  const footerVisible = shouldRenderMainFooter(menuHeight);
   const footerHeight = menuHeight > 0 ? 0 : 1;
   const activeBottomPadding = menuHeight > 0 ? BOTTOM_PADDING : INPUT_BOTTOM_PADDING_NO_MENU;
   const frameHeight = inputVisualLines.length;
@@ -17978,7 +18654,7 @@ function getChatViewportInfo(cols, rows) {
   const inputVisualLines = buildInputVisualLines(cols);
   const menuLines = getCommandMenuVisualLines(cols);
   const menuHeight = menuLines.length;
-  const footerVisible = !APPEND_CHAT_TO_SCROLLBACK && input.length === 0 && menuHeight === 0;
+  const footerVisible = shouldRenderMainFooter(menuHeight);
   const footerHeight = menuHeight > 0 ? 0 : 1;
   const activeBottomPadding = menuHeight > 0 ? BOTTOM_PADDING : INPUT_BOTTOM_PADDING_NO_MENU;
   const frameHeight = inputVisualLines.length;
@@ -18565,7 +19241,92 @@ function renderCommandBuffer() {
   dirty = false;
 }
 
+function renderRuntimeModelPickerBuffer() {
+  process.stdout.write(HIDE_CURSOR);
+  const rows = process.stdout.rows || 24;
+  const cols = process.stdout.columns || 80;
+  const panelWidth = Math.min(Math.max(52, Math.floor(cols * 0.82)), cols);
+  const panelLeft = Math.max(0, Math.floor((cols - panelWidth) / 2));
+  const visibleCount = Math.max(1, Math.min(20, rows - 4));
+  updateModelSelectionState();
+  const entries = getFilteredModels();
+
+  if (!hasInitializedScreen || forceFullClearOnNextRender) {
+    readline.cursorTo(process.stdout, 0, 0);
+    readline.clearScreenDown(process.stdout);
+    hasInitializedScreen = true;
+    forceFullClearOnNextRender = false;
+    lastModelRenderedRows = [];
+  }
+  if (lastModelRenderedCols !== cols || lastModelRenderedHeight !== rows) {
+    lastModelRenderedRows = [];
+    lastModelRenderedCols = cols;
+    lastModelRenderedHeight = rows;
+  }
+
+  const frameRows = Array.from({ length: rows }, () => ({ text: " ".repeat(cols), styledText: "" }));
+  const setRow = (y, plain, styled = "") => {
+    if (y < 0 || y >= rows) return;
+    const clipped = String(plain || "").slice(0, panelWidth).padEnd(panelWidth, " ");
+    const left = " ".repeat(panelLeft);
+    const right = " ".repeat(Math.max(0, cols - panelLeft - panelWidth));
+    frameRows[y] = {
+      text: `${left}${clipped}${right}`.slice(0, cols),
+      styledText: styled ? `${left}${styled}${right}` : "",
+    };
+  };
+
+  const searchPlaceholder = "Type to search";
+  setRow(
+    0,
+    modelSearch || searchPlaceholder,
+    modelSearch ? "" : `${PLACEHOLDER_COLOR}${searchPlaceholder.padEnd(panelWidth, " ")}${RESET_COLOR}`
+  );
+  setRow(1, "");
+  if (entries.length === 0) {
+    const emptyText = modelSearch ? "No matching models" : "No saved models";
+    setRow(2, emptyText, `${PLACEHOLDER_COLOR}${emptyText}${RESET_COLOR}`);
+  }
+  const end = Math.min(entries.length, modelScroll + visibleCount);
+  for (let index = modelScroll; index < end; index += 1) {
+    const entry = entries[index];
+    const selected = index === modelSelected;
+    const current = entry.id === modelPickerContext?.currentValue;
+    const marker = selected ? "\u203a" : current ? "\u25cf" : "\u25cb";
+    const name = String(entry.id || "");
+    const plain = `${marker} ${name}`.slice(0, panelWidth).padEnd(panelWidth, " ");
+    const background = selected
+      ? AGENT_SELECTED_BG_COLOR
+      : index % 2 === 1 ? SESSION_EVEN_BG_COLOR : "";
+    const markerColor = selected || current ? VSCODE_BLUE_COLOR : PLACEHOLDER_COLOR;
+    const nameColor = selected ? WHITE_COLOR : current ? VSCODE_BLUE_COLOR : "";
+    const styled = `${background}${markerColor}${marker}${RESET_COLOR}` +
+      `${background}${nameColor} ${name.slice(0, Math.max(0, panelWidth - 2))}${RESET_COLOR}`;
+    const rowPadding = " ".repeat(Math.max(0, panelWidth - stripAnsiSgr(styled).length));
+    setRow(2 + index - modelScroll, plain, `${styled}${background}${rowPadding}${RESET_COLOR}`);
+  }
+  const footer = "Enter: select model  Esc: return";
+  setRow(rows - 1, footer, `${PLACEHOLDER_COLOR}${footer}${RESET_COLOR}`);
+
+  for (let y = 0; y < rows; y += 1) {
+    const next = frameRows[y];
+    const previous = lastModelRenderedRows[y];
+    if (previous && previous.text === next.text && previous.styledText === next.styledText) continue;
+    if (next.styledText) writeStyledLine(y, next.text, next.styledText, cols);
+    else writeLine(y, next.text, cols);
+  }
+  lastModelRenderedRows = frameRows;
+  const cursorX = Math.min(panelLeft + modelSearch.length, Math.max(0, cols - 1));
+  readline.cursorTo(process.stdout, cursorX, 0);
+  process.stdout.write(SHOW_CURSOR);
+  dirty = false;
+}
+
 function renderModelBuffer() {
+  if (modelPickerContext) {
+    renderRuntimeModelPickerBuffer();
+    return;
+  }
   process.stdout.write(HIDE_CURSOR);
 
   const rows = process.stdout.rows || 24;
@@ -18573,7 +19334,8 @@ function renderModelBuffer() {
   updateModelSelectionState();
   const models = getFilteredModels();
   const visibleCount = getModelVisibleCount();
-  const listHeight = visibleCount * 2;
+  const rowsPerModel = modelPickerContext ? 1 : 2;
+  const listHeight = visibleCount * rowsPerModel;
   const panelWidth = Math.min(Math.max(40, Math.floor(cols * 0.72)), cols);
   const blockHeight = listHeight + 2;
   const blockTop = Math.max(0, Math.floor((rows - blockHeight) / 2));
@@ -18621,13 +19383,18 @@ function renderModelBuffer() {
   if (modelSearch) {
     setPanelRow(searchInputRow, `> ${modelSearch}`);
   } else {
-    setPanelRow(searchInputRow, "> search model", PLACEHOLDER_COLOR);
+    const pickerLabel = modelPickerContext?.label
+      ? capitalizeSettingLabel(modelPickerContext.label)
+      : "model";
+    setPanelRow(searchInputRow, `> search ${pickerLabel}`, PLACEHOLDER_COLOR);
   }
 
   let lines = [];
-  if (isModelsLoading && models.length === 0) {
+  if (modelPickerContext && models.length === 0) {
+    lines = [{ text: "  no saved models", selected: false, muted: true, kind: "status" }];
+  } else if (!modelPickerContext && isModelsLoading && models.length === 0) {
     lines = [{ text: "  loading models...", selected: false, muted: true, kind: "status" }];
-  } else if (modelsLoadError && models.length === 0) {
+  } else if (!modelPickerContext && modelsLoadError && models.length === 0) {
     lines = [{ text: `  ${modelsLoadError}`, selected: false, muted: true, kind: "status" }];
   } else if (models.length === 0) {
     lines = [{ text: "  no models", selected: false, muted: true, kind: "status" }];
@@ -18642,12 +19409,14 @@ function renderModelBuffer() {
         muted: false,
         kind: "model",
       });
-      lines.push({
-        text: formatModelModalities(model),
-        selected: i === modelSelected,
-        muted: true,
-        kind: "modalities",
-      });
+      if (!modelPickerContext) {
+        lines.push({
+          text: formatModelModalities(model),
+          selected: i === modelSelected,
+          muted: true,
+          kind: "modalities",
+        });
+      }
     }
   }
 
@@ -18668,16 +19437,20 @@ function renderModelBuffer() {
     }
   }
 
-  const footer = getMainFooterText();
-  const footerX = Math.max(0, cols - footer.length);
-  if (rows > 0) {
-    const footerLine =
-      `${" ".repeat(footerX)}${footer}`.slice(0, cols).padEnd(cols, " ");
-    frameRows[rows - 1] = {
-      text: footerLine,
-      color: null,
-      styledText: `${" ".repeat(footerX)}${getMainFooterStyledText(cols - footerX)}`,
-    };
+  if (modelPickerContext) {
+    setPanelRow(rows - 1, "Enter: select  Up/Down: move  Esc: settings", PLACEHOLDER_COLOR);
+  } else {
+    const footer = getMainFooterText();
+    const footerX = Math.max(0, cols - footer.length);
+    if (rows > 0) {
+      const footerLine =
+        `${" ".repeat(footerX)}${footer}`.slice(0, cols).padEnd(cols, " ");
+      frameRows[rows - 1] = {
+        text: footerLine,
+        color: null,
+        styledText: `${" ".repeat(footerX)}${getMainFooterStyledText(cols - footerX)}`,
+      };
+    }
   }
 
   for (let y = 0; y < rows; y += 1) {
@@ -18971,7 +19744,7 @@ function renderProvidersBuffer() {
     frameRows[y] = { text: `${left}${clipped}${right}`.slice(0, cols), color };
   };
 
-  setPanelRow(0, "Providers");
+  setPanelRow(0, "Models");
 
   if (isProvidersLoading && providers.length === 0) {
     setPanelRow(2, "loading providers...", PLACEHOLDER_COLOR);
@@ -19117,6 +19890,7 @@ function renderFrame(forceChatRefresh = false) {
     forceChatRefreshFlag = false;
   }
   updateThinkingAnimationState();
+  syncVoiceCaptureHelperState();
 
   if (activeBuffer === "command") {
     renderCommandBuffer();
@@ -19183,7 +19957,7 @@ function renderFrame(forceChatRefresh = false) {
   const inputVisualLines = buildInputVisualLines(cols);
   const menuLines = getCommandMenuVisualLines(cols);
   const menuHeight = menuLines.length;
-  const footerVisible = !APPEND_CHAT_TO_SCROLLBACK && input.length === 0 && menuHeight === 0;
+  const footerVisible = shouldRenderMainFooter(menuHeight);
   const footerHeight = menuHeight > 0 ? 0 : 1;
   const activeBottomPadding = menuHeight > 0 ? BOTTOM_PADDING : INPUT_BOTTOM_PADDING_NO_MENU;
   const frameHeight = inputVisualLines.length;
@@ -20469,6 +21243,98 @@ function runAppendSelfTest() {
   }
 }
 
+async function runMediaToolBridgeSelfTest() {
+  const savedProviders = providers;
+  const savedRuntimeSettings = sessionRuntimeSettings;
+  const savedFetch = globalThis.fetch;
+  const audioName = `.nexus-media-self-test-${process.pid}.wav`;
+  const imageName = `.nexus-media-self-test-${process.pid}.png`;
+  const audioPath = path.join(WORKSPACE_ROOT, audioName);
+  const imagePath = path.join(WORKSPACE_ROOT, imageName);
+  const voicePath = path.join(VOICE_CAPTURE_TEMP_DIR, `voice-self-test-${process.pid}.wav`);
+  const requests = [];
+  try {
+    fsSync.writeFileSync(audioPath, Buffer.from("RIFF-NEXUS-TEST"));
+    fsSync.writeFileSync(imagePath, Buffer.from("PNG-NEXUS-TEST"));
+    fsSync.mkdirSync(VOICE_CAPTURE_TEMP_DIR, { recursive: true });
+    fsSync.writeFileSync(voicePath, Buffer.concat([Buffer.from("RIFF"), Buffer.alloc(64)]));
+    providers = [
+      { name: "Speech Fixture", base_url: "https://openrouter.ai/api/v1", api_key: "secret", model: "fixture/stt" },
+      { name: "Vision Fixture", base_url: "https://openrouter.ai/api/v1", api_key: "secret", model: "fixture/vision" },
+    ];
+    sessionRuntimeSettings = normalizeSessionRuntimeSettings({
+      ...getMainSessionRuntimeSettings(),
+      speech_to_text_model: "Speech Fixture",
+      vision_model: "Vision Fixture",
+      request_timeout_ms: 30000,
+    });
+    globalThis.fetch = async (url, options = {}) => {
+      const body = JSON.parse(String(options.body || "{}"));
+      requests.push({ url: String(url), body });
+      const payload = String(url).includes("audio/transcriptions")
+        ? { text: "fixture transcript" }
+        : { choices: [{ message: { content: "fixture image description" } }] };
+      return { ok: true, status: 200, text: async () => JSON.stringify(payload) };
+    };
+    const audioResult = await handleMediaBridgeRequest({
+      action: "transcribe_audio",
+      paths: [audioName],
+      timeout_ms: 30000,
+    });
+    const imageResult = await handleMediaBridgeRequest({
+      action: "describe_image",
+      paths: [imageName],
+      prompt: "Describe fixture",
+      timeout_ms: 30000,
+    });
+    const voiceTranscript = await requestVoiceTranscription(voicePath, {
+      profile: "Speech Fixture",
+      sessionId: currentSessionUid,
+      timeoutMs: 30000,
+    });
+    const rejectedOutside = await handleMediaBridgeRequest({
+      action: "describe_image",
+      paths: ["../outside.png"],
+      prompt: "Describe fixture",
+      timeout_ms: 30000,
+    });
+    const audioRequest = requests.find((entry) => entry.url.endsWith("/audio/transcriptions"));
+    const imageRequest = requests.find((entry) => entry.url.endsWith("/chat/completions"));
+    const imageUrl = imageRequest?.body?.messages?.[0]?.content?.[1]?.image_url?.url || "";
+    if (
+      !audioResult?.ok ||
+      audioResult.results?.[0]?.transcript !== "fixture transcript" ||
+      !imageResult?.ok ||
+      imageResult.results?.[0]?.description !== "fixture image description" ||
+      rejectedOutside?.ok !== false ||
+      audioRequest?.body?.model !== "fixture/stt" ||
+      audioRequest?.body?.input_audio?.format !== "wav" ||
+      imageRequest?.body?.model !== "fixture/vision" ||
+      !String(imageUrl).startsWith("data:image/png;base64,") ||
+      voiceTranscript !== "fixture transcript" ||
+      requests.filter((entry) => entry.url.endsWith("/audio/transcriptions")).length !== 2 ||
+      requests.length !== 3
+    ) {
+      return {
+        ok: false,
+        error: JSON.stringify({ audioResult, imageResult, rejectedOutside, voiceTranscript, requests }),
+      };
+    }
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error?.message || String(error) };
+  } finally {
+    providers = savedProviders;
+    sessionRuntimeSettings = savedRuntimeSettings;
+    if (savedFetch === undefined) delete globalThis.fetch;
+    else globalThis.fetch = savedFetch;
+    fsSync.rmSync(audioPath, { force: true });
+    fsSync.rmSync(imagePath, { force: true });
+    fsSync.rmSync(voicePath, { force: true });
+    fsSync.rmSync(VOICE_CAPTURE_TEMP_DIR, { recursive: true, force: true });
+  }
+}
+
 async function runExecuteTransportSelfTest() {
   const out = process.stdout.write.bind(process.stdout);
   const previousMode = collaborationMode;
@@ -20543,6 +21409,23 @@ async function runExecuteTransportSelfTest() {
     out(`EXECUTE_FAIL: deep_think acknowledgement failed: ${JSON.stringify(deepThinkResult)}\n`);
     return 1;
   }
+  const missingMediaResult = await executeCodeWithPythonTool(
+    "print(transcribe_audio('missing-audio-fixture.wav'))\nprint(describe_image('missing-image-fixture.png'))"
+  );
+  const missingMediaOutput = String(missingMediaResult?.output || "");
+  if (
+    !missingMediaResult?.ok ||
+    !missingMediaOutput.includes("transcribe_audio: path does not exist") ||
+    !missingMediaOutput.includes("describe_image: path does not exist")
+  ) {
+    out(`EXECUTE_FAIL: media tools are unavailable: ${JSON.stringify(missingMediaResult)}\n`);
+    return 1;
+  }
+  const mediaBridgeResult = await runMediaToolBridgeSelfTest();
+  if (!mediaBridgeResult.ok) {
+    out(`EXECUTE_FAIL: media bridge failed: ${mediaBridgeResult.error}\n`);
+    return 1;
+  }
   try {
     fsSync.writeFileSync(readFixturePath, "NEXUS_READ_OK\n", "utf8");
     collaborationMode = "plan";
@@ -20610,8 +21493,39 @@ function runFormatSelfTest() {
   const out = process.stdout.write.bind(process.stdout);
   try {
     const runtimeSettingKeys = getRuntimeSettings().map((setting) => setting.key);
+    const modelRuntimeFixture = normalizeSessionRuntimeSettings({
+      text_to_speech_model: " audio/speak ",
+      speech_to_text_model: "audio/transcribe",
+      vision_model: "vision/analyze",
+    });
+    const savedNexusConfigFixture = nexusConfig;
+    nexusConfig = {};
+    copyRuntimeMediaModelsToConfig(modelRuntimeFixture);
+    const persistedMediaModelsFixture = {
+      text: nexusConfig.text_to_speech_model,
+      speech: nexusConfig.speech_to_text_model,
+      vision: nexusConfig.vision_model,
+    };
+    nexusConfig = savedNexusConfigFixture;
+    const mergedVoiceFixture = mergeTranscribedText("hello world", 5, "spoken words");
+    const savedProvidersFixture = providers;
+    const savedModelPickerContextFixture = modelPickerContext;
+    providers = [
+      { name: "Speech Local", model: "hidden/stt-model" },
+      { name: "Vision Remote", model: "hidden/vision-model" },
+    ];
+    modelPickerContext = { returnBuffer: "settings", settingKey: "vision_model", label: "vision model" };
+    const savedModelPickerFixture = getModelPickerSource();
+    providers = savedProvidersFixture;
+    modelPickerContext = savedModelPickerContextFixture;
     if (
       !COMMANDS.some((command) => command.name === "/settings") ||
+      !COMMANDS.some((command) => command.name === "/models") ||
+      COMMANDS.some((command) => command.name === "/providers") ||
+      !SYSTEM_PROMPT_VISIBLE_TOOL_NAMES.has("transcribe_audio") ||
+      !SYSTEM_PROMPT_VISIBLE_TOOL_NAMES.has("describe_image") ||
+      !FALLBACK_TOOL_DESCRIPTIONS.transcribe_audio?.includes("Speech to text") ||
+      !FALLBACK_TOOL_DESCRIPTIONS.describe_image?.includes("Vision model") ||
       !COMMANDS.some((command) => command.name === "/init") ||
       !COMMANDS.some((command) => command.name === "/agent") ||
       !COMMANDS.some((command) => command.name === "/list-agents") ||
@@ -20619,10 +21533,24 @@ function runFormatSelfTest() {
       !INIT_CONTRIBUTOR_GUIDE_PROMPT.includes("Generate a file named AGENTS.md") ||
       !INIT_CONTRIBUTOR_GUIDE_PROMPT.includes('Title the document "Repository Guidelines"') ||
       !INIT_CONTRIBUTOR_GUIDE_PROMPT.includes("200-400 words") ||
-      runtimeSettingKeys.join(",") !== "thinking,thinking_blocks,external_thinking,thinking_effort,context_window,request_timeout" ||
+      runtimeSettingKeys.join(",") !== "thinking,thinking_blocks,external_thinking,thinking_effort,text_to_speech_model,speech_to_text_model,vision_model,context_window,request_timeout" ||
       typeof getRuntimeSettings().find((setting) => setting.key === "thinking")?.value !== "boolean" ||
       typeof getRuntimeSettings().find((setting) => setting.key === "thinking_blocks")?.value !== "boolean" ||
       typeof getRuntimeSettings().find((setting) => setting.key === "external_thinking")?.value !== "boolean" ||
+      getRuntimeSettings().find((setting) => setting.key === "text_to_speech_model")?.picker !== "model" ||
+      getRuntimeSettings().find((setting) => setting.key === "speech_to_text_model")?.picker !== "model" ||
+      getRuntimeSettings().find((setting) => setting.key === "vision_model")?.picker !== "model" ||
+      modelRuntimeFixture.text_to_speech_model !== "audio/speak" ||
+      modelRuntimeFixture.speech_to_text_model !== "audio/transcribe" ||
+      modelRuntimeFixture.vision_model !== "vision/analyze" ||
+      persistedMediaModelsFixture.text !== "audio/speak" ||
+      persistedMediaModelsFixture.speech !== "audio/transcribe" ||
+      persistedMediaModelsFixture.vision !== "vision/analyze" ||
+      mergedVoiceFixture.input !== "hello spoken words world" ||
+      mergedVoiceFixture.cursorIndex !== 18 ||
+      savedModelPickerFixture.map((entry) => entry.id).join(",") !== "Speech Local,Vision Remote" ||
+      savedModelPickerFixture.some((entry) => "model" in entry || "inputModalities" in entry) ||
+      formatRuntimeModelSetting("") !== "not set" ||
       getRuntimeSettings().find((setting) => setting.key === "context_window")?.options.join(",") !==
         "128000,256000,384000,512000,768000,1000000" ||
       capitalizeSettingLabel("external thinking") !== "External thinking"
@@ -23769,7 +24697,9 @@ process.stdin.on("data", (rawChunk) => {
     closeAgentMentionBuffer();
     return;
   } else if (activeBuffer === "model" && chunk === "\u001b") {
+    suppressModelEscapeKeypressUntil = Date.now() + 1500;
     closeModelBuffer();
+    return;
   } else if (activeBuffer === "sessions" && chunk === "\u001b") {
     closeSessionsBuffer();
   } else if (activeBuffer === "agents" && chunk === "\u001b") {
@@ -23844,6 +24774,7 @@ process.stdin.on("keypress", async (str, key) => {
   const focusSequence = seq || (typeof str === "string" ? str : "");
   if (focusSequence === "\u001b[I" || focusSequence === "\u001b[O") {
     terminalHasFocus = focusSequence === "\u001b[I";
+    syncVoiceCaptureHelperState();
     return;
   }
   const isEscapeKey =
@@ -23858,6 +24789,13 @@ process.stdin.on("keypress", async (str, key) => {
   }
   if (isEscapeKey && Date.now() < suppressRemoteControlEscapeKeypressUntil) {
     suppressRemoteControlEscapeKeypressUntil = 0;
+    return;
+  }
+  if (isEscapeKey && Date.now() < suppressModelEscapeKeypressUntil) {
+    suppressModelEscapeKeypressUntil = 0;
+    return;
+  }
+  if (isEscapeKey && Date.now() < suppressVoiceEscapeKeypressUntil) {
     return;
   }
   const hasMouseNoise =
@@ -24018,7 +24956,18 @@ process.stdin.on("keypress", async (str, key) => {
       const models = getFilteredModels();
       if (models.length > 0) {
         const nextModel = models[modelSelected].id;
-        if (activeAgentName === "main") {
+        const pickerContext = modelPickerContext ? { ...modelPickerContext } : null;
+        if (pickerContext?.settingKey) {
+          try {
+            await setActiveRuntimeModelSetting(pickerContext.settingKey, nextModel);
+            closeModelBuffer({ message: `${pickerContext.label}: ${nextModel}` });
+          } catch (error) {
+            closeModelBuffer({
+              message: `Could not update ${pickerContext.label}: ${error?.message || String(error)}`,
+            });
+          }
+          return;
+        } else if (activeAgentName === "main") {
           selectedModel = nextModel;
           await rewriteSessionWithCurrentMessages().catch(() => {});
         } else {
@@ -24577,6 +25526,19 @@ process.stdin.on("keypress", async (str, key) => {
       key?.name === "return" ||
       key?.name === "enter"
     ) {
+      const setting = getFilteredRuntimeSettings()[settingsSelected];
+      const isEnter =
+        key?.sequence === "\r" || key?.name === "return" || key?.name === "enter";
+      if (isEnter && setting?.picker === "model") {
+        settingsMessage = "";
+        openModelBuffer({
+          returnBuffer: "settings",
+          settingKey: setting.key,
+          label: setting.label,
+          selectedModel: setting.value,
+        });
+        return;
+      }
       await cycleSelectedRuntimeSetting(key?.name === "left" ? -1 : 1);
       updateSettingsSelectionState();
       markDirty();
@@ -24789,6 +25751,7 @@ process.stdin.on("keypress", async (str, key) => {
         const typedArgs = normalizedTyped.slice(typedCommand.length).trim();
         const isKnownTypedCommand =
           typedCommand === "/model" ||
+          typedCommand === "/providers" ||
           typedCommand === "/thinking" ||
           COMMANDS.some((command) => command.name === typedCommand);
         if (isKnownTypedCommand) {
@@ -25043,6 +26006,7 @@ process.stdin.on("keypress", async (str, key) => {
       const commandName = trimmedInput.split(/\s+/)[0].toLowerCase();
       const isKnownCommand =
         commandName === "/model" ||
+        commandName === "/providers" ||
         commandName === "/thinking" ||
         COMMANDS.some((command) => command.name === commandName);
       if (isKnownCommand) {
@@ -25275,6 +26239,7 @@ async function initializeApp() {
   await loadNamedAgentLoops().catch(() => {});
   await refreshNamedAgents().catch(() => {});
   startNamedAgentRefreshLoop();
+  await startVoiceCaptureHelper().catch(() => false);
   renderFrame(true);
 }
 
