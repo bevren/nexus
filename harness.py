@@ -438,13 +438,24 @@ def _execute_nexus_code(code: str) -> dict:
         returned = eval(compiled, scope, scope)
         if inspect.isawaitable(returned):
             asyncio.run(returned)
-        return {"ok": True, "output": output.getvalue()}
+        plan_ui_events = []
+        if hasattr(tools, "drain_plan_ui_events"):
+            maybe_events = tools.drain_plan_ui_events()
+            if isinstance(maybe_events, list):
+                plan_ui_events = [item for item in maybe_events if isinstance(item, dict)]
+        return {"ok": True, "output": output.getvalue(), "plan_ui_events": plan_ui_events}
     except Exception as exc:
+        plan_ui_events = []
+        if "tools" in locals() and hasattr(tools, "drain_plan_ui_events"):
+            maybe_events = tools.drain_plan_ui_events()
+            if isinstance(maybe_events, list):
+                plan_ui_events = [item for item in maybe_events if isinstance(item, dict)]
         return {
             "ok": False,
             "output": output.getvalue(),
             "error": f"{exc.__class__.__name__}: {exc}",
             "traceback": traceback.format_exc(),
+            "plan_ui_events": plan_ui_events,
         }
 
 

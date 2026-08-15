@@ -1286,6 +1286,9 @@ let sessionsScroll = 0;
 let sessionsSearch = "";
 let isSessionsLoading = false;
 let sessionsLoadError = "";
+let sessionsReloadQueued = false;
+let sessionsManagerMessage = "";
+let sessionTransferClipboard = null;
 let lastSessionsRenderedRows = [];
 let lastSessionsRenderedCols = 0;
 let lastSessionsRenderedHeight = 0;
@@ -2436,8 +2439,9 @@ function loadMcpConfig() {
     const servers = raw?.mcpServers && typeof raw.mcpServers === "object" ? raw.mcpServers : {};
     return { mcpServers: servers };
   } catch (error) {
-    mcpBridgeError = `Failed to parse ${MCP_CONFIG_PATH}: ${error?.message || error}`;
-    return { mcpServers: {} };
+    const message = `Failed to parse ${MCP_CONFIG_PATH}: ${error?.message || error}`;
+    mcpBridgeError = message;
+    return { mcpServers: {}, error: message };
   }
 }
 
@@ -2938,6 +2942,12 @@ function getMcpServerTarget(config) {
   return String(config?.url || config?.command || "");
 }
 
+function getMcpConfigFingerprint(config) {
+  return createHash("sha256")
+    .update(JSON.stringify(config && typeof config === "object" ? config : {}))
+    .digest("hex");
+}
+
 async function startMcpServers() {
   const config = loadMcpConfig();
   const entries = Object.entries(config.mcpServers || {});
@@ -2964,6 +2974,7 @@ async function startMcpServers() {
     tools: entry.tools || [],
     error: entry.error || "",
     command: getMcpServerTarget(config.mcpServers?.[entry.name]),
+    configFingerprint: getMcpConfigFingerprint(config.mcpServers?.[entry.name]),
   }));
 }
 
@@ -2993,6 +3004,7 @@ async function startMcpServerByName(name) {
       tools,
       error: "",
       command: getMcpServerTarget(serverConfig),
+      configFingerprint: getMcpConfigFingerprint(serverConfig),
     };
   } catch (error) {
     const detail = error?.message || String(error);
@@ -3004,6 +3016,7 @@ async function startMcpServerByName(name) {
       tools: [],
       error: stderrTail ? `${detail}; ${stderrTail}` : detail,
       command: getMcpServerTarget(serverConfig),
+      configFingerprint: getMcpConfigFingerprint(serverConfig),
     };
   } finally {
     mcpBusyNames.delete(serverName);
@@ -3050,8 +3063,35 @@ async function stopMcpServerByName(name) {
 }
 
 async function reloadMcpServers() {
-  await stopMcpServers();
-  await startMcpServers();
+  const config = loadMcpConfig();
+  if (config.error) throw new Error(config.error);
+  const configuredEntries = Object.entries(config.mcpServers || {});
+  const configuredNames = new Set(configuredEntries.map(([name]) => name));
+  const removedEntries = mcpServers.filter((entry) => !configuredNames.has(entry.name));
+  for (const entry of removedEntries) {
+    mcpBusyNames.add(entry.name);
+    try {
+      await entry.client?.close().catch(() => {});
+    } finally {
+      mcpBusyNames.delete(entry.name);
+    }
+  }
+  mcpServers = mcpServers.filter((entry) => configuredNames.has(entry.name));
+
+  for (const [name, serverConfig] of configuredEntries) {
+    const existing = mcpServers.find((entry) => entry.name === name);
+    const fingerprint = getMcpConfigFingerprint(serverConfig);
+    if (existing?.configFingerprint === fingerprint) {
+      continue;
+    }
+    await startMcpServerByName(name);
+  }
+
+  const configuredOrder = new Map(configuredEntries.map(([name], index) => [name, index]));
+  mcpServers.sort((left, right) =>
+    (configuredOrder.get(left.name) ?? Number.MAX_SAFE_INTEGER) -
+    (configuredOrder.get(right.name) ?? Number.MAX_SAFE_INTEGER)
+  );
   await refreshMcpDescriptions();
   if (!mcpBridgeServer) {
     try {
@@ -3654,10 +3694,16 @@ async function handleMcpBridgeRequest(parsed) {
   const serverName = typeof parsed.server === "string" ? parsed.server : "";
   const toolName = typeof parsed.tool === "string" ? parsed.tool : "";
   const argumentsObj = parsed.arguments && typeof parsed.arguments === "object" ? parsed.arguments : {};
+  const runtimeSessionId = String(parsed.session_id || "").trim();
+  const allowedServerNames = new Set(
+    mcpServers
+      .filter((entry) => isMcpServerAllowedForSession(entry.name, runtimeSessionId))
+      .map((entry) => String(entry.name || "").toLowerCase())
+  );
 
   if (parsed.method === "list") {
     const result = {};
-    for (const entry of mcpServers) {
+    for (const entry of mcpServers.filter((item) => allowedServerNames.has(item.name.toLowerCase()))) {
       result[entry.name] = {
         status: entry.error ? "error" : isMcpServerEntryRunning(entry) ? "running" : "stopped",
         error: entry.error || "",
@@ -3670,7 +3716,7 @@ async function handleMcpBridgeRequest(parsed) {
   if (parsed.method === "search") {
     const action = typeof parsed.action === "string" ? parsed.action.trim().toLowerCase() : "search";
     if (action === "list") {
-      return { ok: true, servers: buildMcpCatalogServerSummary() };
+      return { ok: true, servers: buildMcpCatalogServerSummary({ allowedServerNames }) };
     }
     if (action === "search") {
       const query = typeof parsed.query === "string" ? parsed.query.trim() : "";
@@ -3681,17 +3727,22 @@ async function handleMcpBridgeRequest(parsed) {
       const limit = Number.isFinite(Number(parsed.limit))
         ? Math.max(1, Math.min(20, Math.trunc(Number(parsed.limit))))
         : 5;
-      const matches = searchMcpCatalog(query, { server, limit });
+      const matches = searchMcpCatalog(query, { server, limit, allowedServerNames });
       return {
         ok: true,
         query,
         matches: matches.map(formatMcpCatalogTool),
-        totalCatalogTools: mcpCatalog.length,
+        totalCatalogTools: mcpCatalog.filter((item) =>
+          allowedServerNames.has(item.server.toLowerCase())
+        ).length,
       };
     }
     if (action === "describe") {
       if (!serverName || !toolName) {
         return { ok: false, error: "mcp_search describe requires server and tool" };
+      }
+      if (!isMcpServerAllowedForSession(serverName, runtimeSessionId)) {
+        return { ok: false, error: `MCP server "${serverName}" is disabled for this agent session` };
       }
       const found = findMcpCatalogTool(serverName, toolName);
       return found
@@ -3707,6 +3758,9 @@ async function handleMcpBridgeRequest(parsed) {
 
   if (!serverName) {
     return { ok: false, error: "missing server" };
+  }
+  if (!isMcpServerAllowedForSession(serverName, runtimeSessionId)) {
+    return { ok: false, error: `MCP server "${serverName}" is disabled for this agent session` };
   }
   const serverEntry = mcpServers.find((entry) => entry.name === serverName);
   if (!serverEntry) {
@@ -3791,9 +3845,13 @@ async function refreshMcpDescriptions() {
   mcpCatalogAverageDocumentLength = catalog.length > 0 ? totalLength / catalog.length : 0;
 }
 
-function buildMcpCatalogServerSummary() {
+function buildMcpCatalogServerSummary(options = {}) {
+  const allowedServerNames = options.allowedServerNames instanceof Set
+    ? options.allowedServerNames
+    : null;
   const result = {};
   for (const entry of mcpServers) {
+    if (allowedServerNames && !allowedServerNames.has(entry.name.toLowerCase())) continue;
     result[entry.name] = {
       status: entry.error ? "error" : isMcpServerEntryRunning(entry) ? "running" : "stopped",
       error: entry.error || "",
@@ -3829,11 +3887,17 @@ function searchMcpCatalog(query, options = {}) {
   const queryTokens = [...new Set(tokenizeMcpCatalogText(queryText))];
   const serverFilter = String(options.server || "").trim().toLowerCase();
   const limit = Math.max(1, Math.min(20, Number(options.limit) || 5));
+  const allowedServerNames = options.allowedServerNames instanceof Set
+    ? options.allowedServerNames
+    : null;
   const count = Math.max(1, mcpCatalog.length);
   const averageLength = Math.max(1, mcpCatalogAverageDocumentLength);
 
   return mcpCatalog
-    .filter((item) => !serverFilter || item.server.toLowerCase() === serverFilter)
+    .filter((item) =>
+      (!allowedServerNames || allowedServerNames.has(item.server.toLowerCase())) &&
+      (!serverFilter || item.server.toLowerCase() === serverFilter)
+    )
     .map((item) => {
       const rawName = item.name.toLowerCase();
       const qualified = `${item.server}.${item.name}`.toLowerCase();
@@ -4480,7 +4544,17 @@ function getDefaultSessionRuntimeSettings() {
     thinking_effort: normalizeThinkingEffort(nexusConfig?.thinking_effort),
     context_window: normalizeModelContextWindow(nexusConfig?.model_context_window_override),
     request_timeout_ms: normalizeLlmRequestTimeoutMs(nexusConfig?.llm_request_timeout_ms),
+    mcp_disabled_servers: [],
   };
+}
+
+function normalizeMcpDisabledServers(raw) {
+  if (!Array.isArray(raw)) return [];
+  return [...new Set(
+    raw
+      .map((name) => String(name || "").trim().toLowerCase())
+      .filter(Boolean)
+  )].sort();
 }
 
 function normalizeSessionRuntimeSettings(raw, defaults = getDefaultSessionRuntimeSettings()) {
@@ -4497,12 +4571,55 @@ function normalizeSessionRuntimeSettings(raw, defaults = getDefaultSessionRuntim
     request_timeout_ms: normalizeLlmRequestTimeoutMs(
       source.request_timeout_ms ?? defaults.request_timeout_ms
     ),
+    mcp_disabled_servers: normalizeMcpDisabledServers(
+      source.mcp_disabled_servers ?? defaults.mcp_disabled_servers
+    ),
   };
 }
 
 function getMainSessionRuntimeSettings() {
   sessionRuntimeSettings = normalizeSessionRuntimeSettings(sessionRuntimeSettings);
   return sessionRuntimeSettings;
+}
+
+function getMcpDisabledServerSetForSessionId(sessionId) {
+  const runtimeSessionId = String(sessionId || "").trim();
+  if (!runtimeSessionId) return new Set();
+  if (runtimeSessionId === String(currentSessionUid || "")) {
+    return new Set(getMainSessionRuntimeSettings().mcp_disabled_servers);
+  }
+  const agent = namedAgents.find((entry) =>
+    String(entry?.runtime?.session_id || "") === runtimeSessionId
+  );
+  if (!agent) return new Set();
+  return new Set(normalizeNamedAgentSessionRuntime(agent).settings.mcp_disabled_servers);
+}
+
+function isMcpServerAllowedForSession(serverName, sessionId) {
+  return !getMcpDisabledServerSetForSessionId(sessionId)
+    .has(String(serverName || "").trim().toLowerCase());
+}
+
+function isMcpServerEnabledForActiveAgent(serverName) {
+  return !new Set(getActiveSessionRuntimeSettings().mcp_disabled_servers)
+    .has(String(serverName || "").trim().toLowerCase());
+}
+
+async function setActiveMcpServerEnabled(serverName, enabled) {
+  const normalizedName = String(serverName || "").trim().toLowerCase();
+  if (!normalizedName) throw new Error("MCP server name is required");
+  const updateSettings = (settings) => {
+    const disabled = new Set(normalizeMcpDisabledServers(settings.mcp_disabled_servers));
+    if (enabled) disabled.delete(normalizedName);
+    else disabled.add(normalizedName);
+    settings.mcp_disabled_servers = [...disabled].sort();
+  };
+  if (activeAgentName !== "main") {
+    await updateActiveNamedAgentSessionRuntime((runtime) => updateSettings(runtime.settings));
+    return;
+  }
+  updateSettings(getMainSessionRuntimeSettings());
+  await rewriteSessionWithCurrentMessages();
 }
 
 function normalizeContextLeftMap(raw) {
@@ -8230,13 +8347,25 @@ function buildToolResultPayload(result) {
     }
     const joinedHistory = historyParts.length > 0 ? historyParts.join("\n") : "(no output)";
     const historyText = capToolHistoryText(joinedHistory, getToolOutputTokenLimit());
-    const uiSections = !planUiMarkdown && editEvents.length > 0 && outputText.length > 0 &&
-      !(editEvents.length > 0 && looksLikeEditResultDict)
+    const looksLikeStandalonePlanResult =
+      outputText.startsWith("{") &&
+      outputText.endsWith("}") &&
+      /["'](?:created_count|updated_count|entry_count|entries|plan)["']/.test(outputText);
+    const uiSections = planUiMarkdown
       ? [
+          ...(!looksLikeStandalonePlanResult && outputText.length > 0
+            ? [{ kind: "result", text: output }]
+            : []),
           ...editEvents.map((text) => ({ kind: "edit", text })),
-          { kind: "result", text: output },
+          { kind: "plan", text: planUiMarkdown },
         ]
-      : [];
+      : editEvents.length > 0 && outputText.length > 0 &&
+          !(editEvents.length > 0 && looksLikeEditResultDict)
+        ? [
+            ...editEvents.map((text) => ({ kind: "edit", text })),
+            { kind: "result", text: output },
+          ]
+        : [];
     return {
       displayText,
       historyText,
@@ -10872,10 +11001,12 @@ function updateSessionsSelectionState() {
 
 async function loadSessionFiles() {
   if (isSessionsLoading) {
+    sessionsReloadQueued = true;
     return;
   }
 
   isSessionsLoading = true;
+  const ownerAtLoad = sessionsOwnerAgent;
   sessionsLoadError = "";
   if (activeBuffer === "sessions") {
     markDirty();
@@ -10883,17 +11014,445 @@ async function loadSessionFiles() {
   }
 
   try {
-    sessionFiles = sessionsOwnerAgent === "main"
+    const loadedFiles = ownerAtLoad === "main"
       ? await scanWorkspaceSessionFiles()
-      : await scanNamedAgentSessionFiles(sessionsOwnerAgent);
-    updateSessionsSelectionState();
+      : await scanNamedAgentSessionFiles(ownerAtLoad);
+    if (ownerAtLoad === sessionsOwnerAgent) {
+      sessionFiles = loadedFiles;
+      updateSessionsSelectionState();
+    } else {
+      sessionsReloadQueued = true;
+    }
   } catch (_error) {
     sessionsLoadError = "Could not load sessions";
   } finally {
     isSessionsLoading = false;
     markDirty();
     renderFrame(true);
+    if (sessionsReloadQueued) {
+      sessionsReloadQueued = false;
+      loadSessionFiles().catch(() => {});
+    }
   }
+}
+
+function getSessionOwnerNames() {
+  return ["main", ...namedAgents.map((agent) => String(agent.name || "")).filter(Boolean)];
+}
+
+function cycleSessionsOwner(direction = 1) {
+  const owners = getSessionOwnerNames();
+  if (owners.length === 0) return;
+  const currentIndex = owners.findIndex((name) =>
+    name.toLowerCase() === String(sessionsOwnerAgent || "main").toLowerCase()
+  );
+  const start = currentIndex >= 0 ? currentIndex : 0;
+  sessionsOwnerAgent = owners[(start + direction + owners.length) % owners.length];
+  sessionsSelected = 0;
+  sessionsScroll = 0;
+  sessionsSearch = "";
+  sessionsManagerMessage = "";
+  sessionFiles = [];
+  loadSessionFiles().catch(() => {});
+}
+
+function parseMainSessionTransferSnapshot(raw) {
+  const snapshot = {
+    sourceKind: "main",
+    raw: String(raw || ""),
+    messages: [],
+    sessionTitle: "",
+    sessionModel: "",
+    sessionMode: "build",
+    sessionReasoningByModel: {},
+    sessionRuntimeSettings: normalizeSessionRuntimeSettings(null),
+    sessionContextLeftByModel: {},
+    sessionCacheTelemetryByModel: {},
+  };
+  for (const line of snapshot.raw.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line);
+      if (typeof entry?.sessionTitle === "string" && entry.sessionTitle.trim()) {
+        snapshot.sessionTitle = normalizeSessionTitle(entry.sessionTitle);
+      }
+      if (typeof entry?.sessionModel === "string" && entry.sessionModel.trim()) {
+        snapshot.sessionModel = entry.sessionModel.trim();
+      }
+      if (entry?.sessionMode === "plan" || entry?.sessionMode === "build") {
+        snapshot.sessionMode = entry.sessionMode;
+      }
+      if (entry?.sessionReasoningByModel && typeof entry.sessionReasoningByModel === "object") {
+        snapshot.sessionReasoningByModel = normalizeReasoningConfigMap(entry.sessionReasoningByModel);
+      }
+      if (entry?.sessionRuntimeSettings && typeof entry.sessionRuntimeSettings === "object") {
+        snapshot.sessionRuntimeSettings = normalizeSessionRuntimeSettings(entry.sessionRuntimeSettings);
+      }
+      if (entry?.sessionContextLeftByModel && typeof entry.sessionContextLeftByModel === "object") {
+        snapshot.sessionContextLeftByModel = normalizeContextLeftMap(entry.sessionContextLeftByModel);
+      }
+      if (entry?.sessionCacheTelemetryByModel && typeof entry.sessionCacheTelemetryByModel === "object") {
+        snapshot.sessionCacheTelemetryByModel = normalizeCacheTelemetryMap(entry.sessionCacheTelemetryByModel);
+      }
+      if (entry?.role === "loop" || entry?.role === "system" || typeof entry?.content !== "string") continue;
+      snapshot.messages.push(entry);
+    } catch {
+      // Ignore malformed lines in a transferable session just as /resume does.
+    }
+  }
+  if (!snapshot.sessionTitle) snapshot.sessionTitle = getFirstSessionTitle(snapshot.messages);
+  return snapshot;
+}
+
+function sessionTransferRuntime(snapshot) {
+  if (snapshot.sourceKind === "named") {
+    return normalizeNamedAgentSessionRuntime(snapshot.record);
+  }
+  return {
+    model: snapshot.sessionModel || selectedModel,
+    collaboration_mode: snapshot.sessionMode === "plan" ? "plan" : "build",
+    reasoning_by_model: normalizeReasoningConfigMap(snapshot.sessionReasoningByModel),
+    settings: normalizeSessionRuntimeSettings(snapshot.sessionRuntimeSettings),
+    context_left_by_model: normalizeContextLeftMap(snapshot.sessionContextLeftByModel),
+    cache_telemetry_by_model: normalizeCacheTelemetryMap(snapshot.sessionCacheTelemetryByModel),
+  };
+}
+
+function mainSessionMessageToNamedMessage(entry) {
+  if (!entry || typeof entry.content !== "string") return null;
+  if (entry.role === "tool" || entry.role === "tool_result") {
+    const name = String(entry.name || "code_execution");
+    return {
+      role: "user",
+      content: `[tool ${name} result]\n${entry.content}`,
+      tool_ok: typeof entry.toolOk === "boolean" ? entry.toolOk : true,
+      ...(entry.uiKind === "plan" ? { ui_kind: "plan" } : {}),
+      ...(typeof entry.uiContent === "string" ? { ui_content: entry.uiContent } : {}),
+    };
+  }
+  if (entry.role !== "user" && entry.role !== "assistant") return null;
+  return {
+    role: entry.role,
+    content: entry.content,
+    ...(Array.isArray(entry.reasoning_details) ? { reasoning_details: entry.reasoning_details } : {}),
+    ...(entry.hidden === true ? { hidden: true } : {}),
+    ...(entry.excludeFromRequest === true ? { exclude_from_request: true } : {}),
+  };
+}
+
+function namedSessionMessageToMainMessage(entry) {
+  if (!entry || entry.role === "system" || typeof entry.content !== "string") return null;
+  const toolMatch = entry.role === "user"
+    ? entry.content.match(/^\[tool ([A-Za-z0-9._-]+) result\]\s*/)
+    : null;
+  if (toolMatch) {
+    return {
+      role: "tool",
+      content: entry.content.slice(toolMatch[0].length),
+      name: toolMatch[1],
+      toolOk: typeof entry.tool_ok === "boolean" ? entry.tool_ok : true,
+      ...(entry.ui_kind === "plan" ? { uiKind: "plan" } : {}),
+      ...(typeof entry.ui_content === "string" ? { uiContent: entry.ui_content } : {}),
+    };
+  }
+  if (entry.role !== "user" && entry.role !== "assistant") return null;
+  return {
+    role: entry.role,
+    content: entry.content,
+    ...(Array.isArray(entry.reasoning_details) ? { reasoning_details: entry.reasoning_details } : {}),
+    ...(entry.hidden === true ? { hidden: true } : {}),
+  };
+}
+
+async function readSessionTransferSnapshot(entry, sourceOwner, mode) {
+  const stagingDir = path.join(os.tmpdir(), "nexus-session-transfer");
+  const sourceExtension = entry.kind === "named-agent" ? ".json" : ".jsonl";
+  const stagedPath = path.join(stagingDir, `session-${process.pid}-${createSessionUid()}${sourceExtension}`);
+  await fs.mkdir(stagingDir, { recursive: true });
+  await fs.copyFile(entry.fullPath, stagedPath);
+  if (entry.kind === "named-agent") {
+    const record = await readJsonObject(stagedPath);
+    if (!record) {
+      await fs.rm(stagedPath, { force: true }).catch(() => {});
+      throw new Error("session file could not be read");
+    }
+    return {
+      mode,
+      sourceOwner,
+      sourceEntry: { ...entry },
+      sourceKind: "named",
+      stagedPath,
+      record,
+      sourceRuntimeSessionId: String(record?.runtime?.session_id || ""),
+      sessionTitle: normalizeSessionTitle(record.session_title) || getFirstSessionTitle(record.messages),
+    };
+  }
+  const raw = await fs.readFile(stagedPath, "utf8");
+  return {
+    ...parseMainSessionTransferSnapshot(raw),
+    mode,
+    sourceOwner,
+    sourceEntry: { ...entry },
+    stagedPath,
+    sourceRuntimeSessionId: String(entry.name || "").match(/^session-(.+)\.jsonl$/i)?.[1] || "",
+  };
+}
+
+function isCurrentTransferSource(entry) {
+  if (entry?.kind === "named-agent") return entry.currentNamedSession === true;
+  return path.resolve(String(entry?.fullPath || "")).toLowerCase() ===
+    path.resolve(String(sessionFilePath || "")).toLowerCase();
+}
+
+function getSessionClipboardKeyAction(str, key) {
+  const sequence = String(key?.sequence || "");
+  const isRawControl = ["\u0003", "\u0018", "\u0016"].includes(str);
+  const isAltShortcut = /^\u001b[cxv]$/i.test(sequence);
+  if (!key?.ctrl && !key?.meta && !isRawControl && !isAltShortcut) return "";
+  const namedAction = String(key?.name || "").toLowerCase();
+  if (["c", "x", "v"].includes(namedAction)) return namedAction;
+  if (isAltShortcut) return sequence.slice(-1).toLowerCase();
+  if (str === "\u0003") return "c";
+  if (str === "\u0018") return "x";
+  if (str === "\u0016") return "v";
+  return "";
+}
+
+async function discardSessionTransferStaging(clipboard = sessionTransferClipboard) {
+  const stagedPath = String(clipboard?.stagedPath || "");
+  if (stagedPath) await fs.rm(stagedPath, { force: true }).catch(() => {});
+}
+
+async function copySelectedSessionToTransferClipboard(mode = "copy") {
+  const entry = getFilteredSessionFiles()[sessionsSelected];
+  if (!entry) {
+    sessionsManagerMessage = "No session selected.";
+    return false;
+  }
+  if (
+    mode === "cut" &&
+    entry.kind === "named-agent" &&
+    isCurrentTransferSource(entry) &&
+    getNamedAgentStatus(getNamedAgentByName(entry.agentName)) === "running"
+  ) {
+    sessionsManagerMessage = "Stop this agent before cutting its current session.";
+    return false;
+  }
+  if (entry.kind !== "named-agent" && isCurrentTransferSource(entry)) {
+    await sessionWriteChain.catch(() => {});
+  }
+  const nextClipboard = await readSessionTransferSnapshot(entry, sessionsOwnerAgent, mode);
+  nextClipboard.sourceWasCurrent = isCurrentTransferSource(entry);
+  await discardSessionTransferStaging();
+  sessionTransferClipboard = nextClipboard;
+  sessionsManagerMessage = `${mode === "cut" ? "Cut" : "Copied"} session file “${entry.firstUserMessage || "Untitled session"}”.`;
+  return true;
+}
+
+async function readStagedSessionTransferSnapshot(clipboard) {
+  const stagedPath = String(clipboard?.stagedPath || "");
+  if (!stagedPath) throw new Error("the copied session file is no longer available");
+  if (clipboard.sourceKind === "named") {
+    const record = await readJsonObject(stagedPath);
+    if (!record) throw new Error("the copied agent session file could not be read");
+    return {
+      ...clipboard,
+      record,
+      sessionTitle: normalizeSessionTitle(record.session_title) || getFirstSessionTitle(record.messages),
+    };
+  }
+  const raw = await fs.readFile(stagedPath, "utf8");
+  return {
+    ...clipboard,
+    ...parseMainSessionTransferSnapshot(raw),
+    mode: clipboard.mode,
+    sourceOwner: clipboard.sourceOwner,
+    sourceEntry: clipboard.sourceEntry,
+    stagedPath: clipboard.stagedPath,
+    sourceWasCurrent: clipboard.sourceWasCurrent,
+    sourceRuntimeSessionId: clipboard.sourceRuntimeSessionId,
+    raw,
+  };
+}
+
+function serializeTransferredMainSession(snapshot) {
+  if (snapshot.sourceKind === "main") {
+    return snapshot.raw
+      .split(/\r?\n/)
+      .filter((line) => {
+        if (!line.trim()) return false;
+        try { return JSON.parse(line)?.role !== "loop"; } catch { return true; }
+      })
+      .join("\n") + "\n";
+  }
+  const runtime = sessionTransferRuntime(snapshot);
+  const title = normalizeSessionTitle(snapshot.sessionTitle) || getFirstSessionTitle(snapshot.record.messages);
+  const lines = [];
+  for (const sourceEntry of Array.isArray(snapshot.record?.messages) ? snapshot.record.messages : []) {
+    const entry = namedSessionMessageToMainMessage(sourceEntry);
+    if (!entry) continue;
+    lines.push(JSON.stringify({
+      ...entry,
+      sessionModel: runtime.model,
+      sessionWorkspace: WORKSPACE_ROOT,
+      sessionTitle: title,
+      sessionReasoningByModel: runtime.reasoning_by_model,
+      sessionMode: runtime.collaboration_mode,
+      sessionRuntimeSettings: runtime.settings,
+      sessionContextLeftByModel: runtime.context_left_by_model,
+      sessionCacheTelemetryByModel: runtime.cache_telemetry_by_model,
+      excludeFromRequest: entry.excludeFromRequest === true,
+    }));
+  }
+  return lines.length > 0 ? `${lines.join("\n")}\n` : "";
+}
+
+function buildTransferredNamedSession(snapshot, destinationAgentName) {
+  const runtime = sessionTransferRuntime(snapshot);
+  const record = createNamedAgentRecord(destinationAgentName);
+  const sourceMessages = snapshot.sourceKind === "named"
+    ? Array.from(snapshot.record?.messages || []).filter((entry) => entry?.role !== "system")
+    : snapshot.messages.map(mainSessionMessageToNamedMessage).filter(Boolean);
+  record.messages = sourceMessages;
+  record.session_title = normalizeSessionTitle(snapshot.sessionTitle) || getFirstSessionTitle(sourceMessages);
+  record.created_at = Date.now() / 1000;
+  record.updated_at = record.created_at;
+  applyNamedAgentSessionRuntime(record, runtime);
+  record.kind = "named-agent-session";
+  record.status = "idle";
+  record.pid = null;
+  record.active_loop_id = "";
+  record.session_loops = [];
+  record.session_notices = [];
+  delete record.recordPath;
+  delete record.queuedTasks;
+  return record;
+}
+
+async function resetMainSessionAfterCut() {
+  await ensureSystemPromptReady();
+  chatGeneration += 1;
+  currentSessionUid = createSessionUid();
+  currentSessionTitle = "";
+  sessionFilePath = getSessionFilePath(currentSessionUid);
+  sessionWriteChain = Promise.resolve();
+  sessionPersistenceInitialized = false;
+  removeLoopsForAgent("main");
+  stopKernelProcess();
+  collaborationMode = "build";
+  contextLeftPercentByModel = {};
+  cacheTelemetryByModel = {};
+  resetMessagesToSystemPrompt();
+  if (activeAgentName === "main") resetComposerState();
+  await rewriteSessionWithCurrentMessages();
+}
+
+async function resetNamedAgentSessionAfterCut(clipboard) {
+  const sourceName = normalizeNamedAgentName(clipboard.sourceOwner);
+  const agent = getNamedAgentByName(sourceName);
+  if (!sourceName || !agent) return false;
+  const current = await readJsonObject(agent.recordPath, agent);
+  if (String(current?.session_uid || "") !== String(clipboard.record?.session_uid || "")) {
+    const archivedPath = getNamedAgentHistoryPath(sourceName, clipboard.record?.session_uid);
+    await fs.rm(archivedPath, { force: true });
+    return true;
+  }
+  if (getNamedAgentStatus(current) === "running") {
+    throw new Error(`stop ${sourceName} before moving its current session`);
+  }
+
+  const reset = createNamedAgentRecord(sourceName);
+  reset.id = current.id || reset.id;
+  const carriedRuntime = normalizeNamedAgentSessionRuntime(current);
+  carriedRuntime.collaboration_mode = "build";
+  carriedRuntime.context_left_by_model = {};
+  carriedRuntime.cache_telemetry_by_model = {};
+  applyNamedAgentSessionRuntime(reset, carriedRuntime);
+  await writeJsonAtomic(agent.recordPath, reset);
+  await writeNamedAgentQueue(agent.recordPath, []);
+  removeLoopsForAgent(sourceName, { persist: false });
+  namedAgentUiNotices.delete(sourceName.toLowerCase());
+  await persistNamedAgentLoops();
+  await refreshNamedAgents();
+  if (activeAgentName.toLowerCase() === sourceName.toLowerCase()) {
+    switchToAgentSession(sourceName);
+  }
+  return true;
+}
+
+async function removeCutSessionSource(clipboard) {
+  if (
+    clipboard.sourceWasCurrent &&
+    clipboard.sourceKind === "main" &&
+    currentSessionUid === clipboard.sourceRuntimeSessionId
+  ) {
+    await fs.rm(clipboard.sourceEntry.fullPath, { force: true });
+    await resetMainSessionAfterCut();
+  } else if (clipboard.sourceWasCurrent && clipboard.sourceKind === "named") {
+    const resetCurrent = await resetNamedAgentSessionAfterCut(clipboard);
+    if (!resetCurrent) await fs.rm(clipboard.sourceEntry.fullPath, { force: true });
+  } else {
+    await fs.rm(clipboard.sourceEntry.fullPath, { force: true });
+  }
+  const planPath = getPlanStorePathForRuntimeSession(clipboard.sourceRuntimeSessionId);
+  if (planPath) await fs.rm(planPath, { force: true }).catch(() => {});
+}
+
+function getPlanStorePathForRuntimeSession(runtimeSessionId) {
+  const sessionId = String(runtimeSessionId || "").trim();
+  if (!sessionId) return "";
+  const scopeKey = createHash("sha1")
+    .update(`${WORKSPACE_ROOT}\0${sessionId}`)
+    .digest("hex");
+  return path.join(os.homedir(), ".nexus", "plans", `plan-${scopeKey}.json`);
+}
+
+async function copySessionPlanStore(sourceRuntimeSessionId, destinationRuntimeSessionId) {
+  const sourcePath = getPlanStorePathForRuntimeSession(sourceRuntimeSessionId);
+  const destinationPath = getPlanStorePathForRuntimeSession(destinationRuntimeSessionId);
+  if (!sourcePath || !destinationPath || sourcePath === destinationPath || !fsSync.existsSync(sourcePath)) return;
+  await fs.mkdir(path.dirname(destinationPath), { recursive: true });
+  await fs.copyFile(sourcePath, destinationPath);
+}
+
+async function pasteSessionTransferClipboard() {
+  const clipboard = sessionTransferClipboard;
+  if (!clipboard) {
+    sessionsManagerMessage = "Nothing has been copied or cut.";
+    return false;
+  }
+  if (
+    clipboard.mode === "cut" &&
+    String(clipboard.sourceOwner || "").toLowerCase() === String(sessionsOwnerAgent || "").toLowerCase()
+  ) {
+    sessionsManagerMessage = "Choose another agent before pasting a cut session.";
+    return false;
+  }
+
+  const stagedClipboard = await readStagedSessionTransferSnapshot(clipboard);
+
+  if (sessionsOwnerAgent === "main") {
+    await ensureSessionFileReady();
+    const destinationSessionId = createSessionUid();
+    const destinationPath = getSessionFilePath(destinationSessionId);
+    await fs.writeFile(destinationPath, serializeTransferredMainSession(stagedClipboard), "utf8");
+    await copySessionPlanStore(clipboard.sourceRuntimeSessionId, destinationSessionId);
+  } else {
+    const destinationName = normalizeNamedAgentName(sessionsOwnerAgent);
+    if (!destinationName) throw new Error("destination agent was not found");
+    const record = buildTransferredNamedSession(stagedClipboard, destinationName);
+    await writeJsonAtomic(getNamedAgentHistoryPath(destinationName, record.session_uid), record);
+    await copySessionPlanStore(clipboard.sourceRuntimeSessionId, record.runtime?.session_id);
+  }
+
+  if (clipboard.mode === "cut") {
+    await removeCutSessionSource(clipboard);
+    await discardSessionTransferStaging(clipboard);
+    sessionTransferClipboard = null;
+  }
+  sessionsManagerMessage = `Pasted session file into ${sessionsOwnerAgent} and refreshed sessions.`;
+  await loadSessionFiles();
+  return true;
 }
 
 async function scanNamedAgentSessionFiles(agentName) {
@@ -11108,12 +11667,46 @@ function namedAgentMessagesForDisplay(agent) {
       : null;
     if (toolResultMatch) {
       const toolName = toolResultMatch[1];
+      const toolContent = content.slice(toolResultMatch[0].length);
+      let planUiMarkdown = entry.ui_kind === "plan" && typeof entry.ui_content === "string"
+        ? entry.ui_content
+        : "";
+      let visibleToolContent = toolContent;
+      if (!planUiMarkdown && toolName === "code_execution") {
+        try {
+          const results = JSON.parse(toolContent);
+          const planEvents = Array.isArray(results)
+            ? results.flatMap((result) => Array.isArray(result?.plan_ui_events) ? result.plan_ui_events : [])
+            : [];
+          if (planEvents.length > 0) {
+            planUiMarkdown = formatPlanUiMarkdown(planEvents[planEvents.length - 1]);
+            const outputs = results
+              .map((result) => String(result?.output || "").trim())
+              .filter((text) => text && !(
+                text.startsWith("{") && text.endsWith("}") &&
+                /["'](?:created_count|updated_count|entry_count|entries|plan)["']/.test(text)
+              ));
+            visibleToolContent = outputs.join("\n");
+          }
+        } catch {
+          // Older agent records contain an opaque tool payload; render it unchanged.
+        }
+      }
+      if (planUiMarkdown && visibleToolContent.trim()) {
+        output.push({
+          role: "tool",
+          name: toolName,
+          toolOk: typeof entry.tool_ok === "boolean" ? entry.tool_ok : true,
+          content: visibleToolContent,
+        });
+      }
       output.push({
         role: "tool",
         name: toolName,
         ...(toolName === "set_reminder" ? { toolInput: "scheduled reminder" } : {}),
         toolOk: typeof entry.tool_ok === "boolean" ? entry.tool_ok : true,
-        content: content.slice(toolResultMatch[0].length),
+        content: toolContent,
+        ...(planUiMarkdown ? { uiKind: "plan", uiContent: planUiMarkdown } : {}),
       });
       continue;
     }
@@ -11130,6 +11723,7 @@ function namedAgentMessagesForDisplay(agent) {
   for (const queued of Array.isArray(agent?.queuedTasks) ? agent.queuedTasks : []) {
     output.push({ role: "user", content: String(queued), queued: true });
   }
+  hideSupersededPlanUiEntries(output);
   return output;
 }
 
@@ -13431,6 +14025,7 @@ function openSessionsBuffer() {
   sessionsSelected = 0;
   sessionsScroll = 0;
   sessionsSearch = "";
+  sessionsManagerMessage = "";
   lastSessionsRenderedRows = [];
   lastSessionsRenderedCols = 0;
   lastSessionsRenderedHeight = 0;
@@ -14893,7 +15488,7 @@ function renderMcpBuffer() {
     frameRows[y] = { text: `${left}${clipped}${right}`.slice(0, cols), color };
   };
 
-  setPanelRow(0, `MCP Servers (${mcpServers.length} configured)`);
+  setPanelRow(0, `MCP Servers — ${activeAgentName} (${mcpServers.length} configured)`);
   if (mcpManagerMessage) {
     setPanelRow(1, mcpManagerMessage, PLACEHOLDER_COLOR);
   }
@@ -14908,6 +15503,7 @@ function renderMcpBuffer() {
       const row = 2 + (i - mcpScroll);
       const selected = i === mcpSelected;
       const busy = mcpBusyNames.has(entry.name);
+      const agentEnabled = isMcpServerEnabledForActiveAgent(entry.name);
       const status = busy
         ? "working"
         : entry.error
@@ -14921,9 +15517,12 @@ function renderMcpBuffer() {
         ? "http"
         : "stdio";
       const marker = selected ? "●" : "○";
-      const text = `  ${marker} ${entry.name}  [${transportText}] ${status}${toolText}${errorText}`;
+      const accessText = agentEnabled ? "enabled" : "disabled for agent";
+      const text = `  ${marker} ${entry.name}  [${transportText}] ${accessText} · ${status}${toolText}${errorText}`;
       const color = selected
         ? BLUE_COLOR
+        : !agentEnabled
+          ? PLACEHOLDER_COLOR
         : entry.error
           ? RED_COLOR
           : isMcpServerEntryRunning(entry)
@@ -14933,7 +15532,11 @@ function renderMcpBuffer() {
     }
   }
 
-  setPanelRow(rows - 1, "Enter: start/stop  R: reload config  Esc: return", PLACEHOLDER_COLOR);
+  setPanelRow(
+    rows - 1,
+    "Enter: enable/disable for agent  S: start/stop server  R: reload config  Esc: return",
+    PLACEHOLDER_COLOR
+  );
   for (let y = 0; y < rows; y += 1) {
     const nextRow = frameRows[y];
     const prevRow = lastMcpRenderedRows[y];
@@ -17985,6 +18588,14 @@ function renderSessionsBuffer() {
   } else {
     setPanelRow(0, "Type to search", PLACEHOLDER_COLOR);
   }
+  const clipboardLabel = sessionTransferClipboard
+    ? ` · ${sessionTransferClipboard.mode === "cut" ? "cut" : "copied"}: ${sessionTransferClipboard.sourceEntry?.firstUserMessage || "Untitled session"}`
+    : "";
+  setPanelRow(
+    1,
+    sessionsManagerMessage || `Agent: ${sessionsOwnerAgent}${clipboardLabel}`,
+    PLACEHOLDER_COLOR
+  );
 
   if (isSessionsLoading && sessionFiles.length === 0) {
     setPanelRow(2, "loading sessions...", PLACEHOLDER_COLOR);
@@ -18021,7 +18632,11 @@ function renderSessionsBuffer() {
     }
   }
 
-  setPanelRow(rows - 1, "Esc to return", PLACEHOLDER_COLOR);
+  setPanelRow(
+    rows - 1,
+    "←/→ agent  Alt+C copy  Alt+X cut  Alt+V paste  Enter: resume  Esc: return",
+    PLACEHOLDER_COLOR
+  );
 
   for (let y = 0; y < rows; y += 1) {
     const nextRow = frameRows[y];
@@ -19499,6 +20114,13 @@ function runAppendSelfTest() {
       !isInputNewlineKey(null, shiftEnterKey) ||
       ctrlCKey?.name !== "c" ||
       ctrlCKey?.ctrl !== true ||
+      getSessionClipboardKeyAction("\u0003", { ctrl: true, name: "c" }) !== "c" ||
+      getSessionClipboardKeyAction("\u0018", { ctrl: true, name: "x" }) !== "x" ||
+      getSessionClipboardKeyAction("\u0016", { ctrl: true, name: "v" }) !== "v" ||
+      getSessionClipboardKeyAction("\u0016", {}) !== "v" ||
+      getSessionClipboardKeyAction(undefined, { meta: true, name: "c", sequence: "\u001bc" }) !== "c" ||
+      getSessionClipboardKeyAction(undefined, { meta: true, name: "x", sequence: "\u001bx" }) !== "x" ||
+      getSessionClipboardKeyAction(undefined, { meta: true, name: "v", sequence: "\u001bv" }) !== "v" ||
       isInputNewlineKey("\r", { name: "return", sequence: "\r" })
     ) {
       out("SELFTEST_FAIL: modified key protocol decoding\n");
@@ -20682,9 +21304,31 @@ function runFormatSelfTest() {
     if (
       planPayload.uiKind !== "plan" ||
       planPayload.displayText !== planMarkdown ||
-      !planPayload.historyText.includes("created_count")
+      !planPayload.historyText.includes("created_count") ||
+      planPayload.uiSections.length !== 1 ||
+      planPayload.uiSections[0]?.kind !== "plan"
     ) {
       out("FORMAT_FAIL: plan UI must preserve raw JSON only in tool history\n");
+      return 1;
+    }
+    const planWithOtherOutput = buildToolResultPayload({
+      ok: true,
+      output: "INSPECTION_RESULT\n{'created_count': 2, 'plan': '[ ] task'}",
+      editEvents: ["Edited example.js (+1 -0)\n1 + const ready = true;"],
+      planUiEvents: [{
+        type: "plan",
+        title: "Plan",
+        entries: [{ text: "Implement change", completed: false }],
+      }],
+    });
+    if (
+      planWithOtherOutput.uiKind !== "plan" ||
+      planWithOtherOutput.uiSections.length !== 3 ||
+      planWithOtherOutput.uiSections[0]?.text.indexOf("INSPECTION_RESULT") < 0 ||
+      planWithOtherOutput.uiSections[1]?.kind !== "edit" ||
+      planWithOtherOutput.uiSections[2]?.kind !== "plan"
+    ) {
+      out("FORMAT_FAIL: plan UI overwrote output from the same execute block\n");
       return 1;
     }
     const mixedEditRunLines = getToolResultLinesForDisplay(
@@ -20807,6 +21451,55 @@ function runFormatSelfTest() {
       resumedPlanSession.sessionCacheTelemetryByModel?.["resumed-model"]?.cachePercent !== 91
     ) {
       out("FORMAT_FAIL: resumed session should show only the newest plan UI\n");
+      return 1;
+    }
+
+    const transferableRaw = [
+      JSON.stringify({
+        role: "user",
+        content: "transfer this session",
+        sessionModel: "transfer-model",
+        sessionWorkspace: WORKSPACE_ROOT,
+        sessionTitle: "transfer this session",
+        sessionMode: "plan",
+        sessionRuntimeSettings: {
+          thinking_effort: "high",
+          mcp_disabled_servers: ["private-mcp"],
+        },
+      }),
+      JSON.stringify({
+        role: "tool",
+        name: "code_execution",
+        content: "{'created_count': 1}",
+        uiKind: "plan",
+        uiContent: "## Plan\n\n☐ Transfer task",
+        toolOk: true,
+      }),
+    ].join("\n");
+    const transferableSnapshot = parseMainSessionTransferSnapshot(transferableRaw);
+    const transferredNamed = buildTransferredNamedSession(transferableSnapshot, "transfer-worker");
+    const transferredNamedDisplay = namedAgentMessagesForDisplay(transferredNamed);
+    const transferredBackToMain = parseMainSessionTransferSnapshot(
+      serializeTransferredMainSession({
+        sourceKind: "named",
+        record: transferredNamed,
+        sessionTitle: transferredNamed.session_title,
+      })
+    );
+    if (
+      transferredNamed.kind !== "named-agent-session" ||
+      transferredNamed.session_title !== "transfer this session" ||
+      transferredNamed.session_runtime?.settings?.mcp_disabled_servers?.[0] !== "private-mcp" ||
+      !transferredNamedDisplay.some((entry) =>
+        entry.uiKind === "plan" && entry.uiContent.includes("Transfer task")
+      ) ||
+      transferredBackToMain.sessionModel !== "transfer-model" ||
+      transferredBackToMain.sessionRuntimeSettings?.mcp_disabled_servers?.[0] !== "private-mcp" ||
+      !transferredBackToMain.messages.some((entry) =>
+        entry.uiKind === "plan" && entry.uiContent.includes("Transfer task")
+      )
+    ) {
+      out("FORMAT_FAIL: copied sessions did not preserve runtime settings and plan UI across agents\n");
       return 1;
     }
 
@@ -22334,6 +23027,47 @@ async function runMcpSelfTest() {
         return 1;
       }
 
+      const savedDisabledServers = [...getMainSessionRuntimeSettings().mcp_disabled_servers];
+      getMainSessionRuntimeSettings().mcp_disabled_servers = ["mock"];
+      const disabledList = await handleMcpBridgeRequest({
+        method: "search",
+        action: "list",
+        session_id: currentSessionUid,
+      });
+      const disabledCall = await handleMcpBridgeRequest({
+        method: "call",
+        server: "mock",
+        tool: "ping",
+        arguments: {},
+        session_id: currentSessionUid,
+      });
+      getMainSessionRuntimeSettings().mcp_disabled_servers = savedDisabledServers;
+      if (
+        Object.prototype.hasOwnProperty.call(disabledList.servers || {}, "mock") ||
+        !Object.prototype.hasOwnProperty.call(disabledList.servers || {}, "remoteMock") ||
+        disabledCall.ok !== false ||
+        !String(disabledCall.error || "").includes("disabled for this agent session")
+      ) {
+        out(`MCP_FAIL: per-agent MCP access was not enforced: ${JSON.stringify({ disabledList, disabledCall })}\n`);
+        return 1;
+      }
+
+      const unchangedMockClient = restartedEntry.client;
+      const unchangedRemoteClient = remoteEntry.client;
+      mockConfig.mcpServers.addedMock = { command: mockNode, args: [scriptPath] };
+      fsSync.writeFileSync(configPath, JSON.stringify(mockConfig, null, 2), "utf8");
+      await reloadMcpServers();
+      const addedEntry = mcpServers.find((entry) => entry.name === "addedMock");
+      if (
+        mcpServers.find((entry) => entry.name === "mock")?.client !== unchangedMockClient ||
+        mcpServers.find((entry) => entry.name === "remoteMock")?.client !== unchangedRemoteClient ||
+        !isMcpServerEntryRunning(addedEntry) ||
+        addedEntry?.tools?.[0]?.name !== "ping"
+      ) {
+        out("MCP_FAIL: incremental reload restarted unchanged servers or failed to start the new server\n");
+        return 1;
+      }
+
       // Verify the python-side helper can reach the bridge too.
       const pyScript = [
         "import json, sys",
@@ -22656,7 +23390,35 @@ async function runNamedAgentSelfTest() {
     WORKSPACE_ROOT,
     `.nexus-named-agent-self-test-${process.pid}-${randomBytes(4).toString("hex")}.json`
   );
+  const transferTestPath = path.join(
+    WORKSPACE_ROOT,
+    `.nexus-session-transfer-self-test-${process.pid}-${randomBytes(4).toString("hex")}.jsonl`
+  );
+  let stagedTransfer = null;
   try {
+    const transferSessionUid = createSessionUid();
+    const transferRaw = `${JSON.stringify({
+      role: "user",
+      content: "filesystem session transfer",
+      sessionWorkspace: WORKSPACE_ROOT,
+      sessionTitle: "filesystem session transfer",
+    })}\n`;
+    await fs.writeFile(transferTestPath, transferRaw, "utf8");
+    stagedTransfer = await readSessionTransferSnapshot({
+      kind: "main",
+      name: `session-${transferSessionUid}.jsonl`,
+      fullPath: transferTestPath,
+      firstUserMessage: "filesystem session transfer",
+    }, "main", "copy");
+    const stagedReload = await readStagedSessionTransferSnapshot(stagedTransfer);
+    if (
+      !stagedTransfer.stagedPath ||
+      !fsSync.existsSync(stagedTransfer.stagedPath) ||
+      stagedReload.messages?.[0]?.content !== "filesystem session transfer"
+    ) {
+      throw new Error("session transfer did not stage and reload a physical session file");
+    }
+
     const record = {
       kind: "named-agent",
       id: "named-agent-self-test",
@@ -22736,7 +23498,9 @@ async function runNamedAgentSelfTest() {
     // that final atomic rename time to release the record on Windows/OneDrive
     // before removing the self-test file.
     await new Promise((resolve) => setTimeout(resolve, 250));
+    await discardSessionTransferStaging(stagedTransfer);
     await fs.unlink(testPath).catch(() => {});
+    await fs.unlink(transferTestPath).catch(() => {});
   }
 }
 
@@ -22923,7 +23687,11 @@ process.stdin.on("keypress", async (str, key) => {
   const menuWasVisible = isCommandMenuVisible();
   const noCommandsWasVisible = isNoCommandsState();
 
-  if (key?.ctrl && key.name === "c") {
+  const sessionClipboardAction = getSessionClipboardKeyAction(str, key);
+  const isCtrlC =
+    (key?.ctrl && String(key?.name || "").toLowerCase() === "c") ||
+    str === "\u0003";
+  if (isCtrlC && activeBuffer !== "sessions") {
     cleanupTerminal({ clearScreen: true });
     process.exit(0);
   }
@@ -23083,7 +23851,25 @@ process.stdin.on("keypress", async (str, key) => {
   }
 
   if (activeBuffer === "sessions") {
-    if (key?.ctrl) {
+    if (sessionClipboardAction) {
+      const action = sessionClipboardAction;
+      if (action === "c" || action === "x") {
+        try {
+          await copySelectedSessionToTransferClipboard(action === "x" ? "cut" : "copy");
+        } catch (error) {
+          sessionsManagerMessage = `Could not ${action === "x" ? "cut" : "copy"} session: ${error?.message || String(error)}`;
+        }
+        markDirty();
+        renderFrame(true);
+      } else if (action === "v") {
+        try {
+          await pasteSessionTransferClipboard();
+        } catch (error) {
+          sessionsManagerMessage = `Could not paste session: ${error?.message || String(error)}`;
+        }
+        markDirty();
+        renderFrame(true);
+      }
       return;
     }
 
@@ -23115,6 +23901,13 @@ process.stdin.on("keypress", async (str, key) => {
         }
       }
 
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+
+    if (key?.name === "left" || key?.name === "right") {
+      cycleSessionsOwner(key.name === "left" ? -1 : 1);
       markDirty();
       renderFrame(true);
       return;
@@ -23172,6 +23965,7 @@ process.stdin.on("keypress", async (str, key) => {
       renderFrame(true);
       return;
     }
+
     if (key?.name === "backspace") {
       agentsSearch = agentsSearch.slice(0, -1);
       agentsSelected = 0;
@@ -23439,7 +24233,6 @@ process.stdin.on("keypress", async (str, key) => {
     }
     if (key?.name === "r" || str === "r" || str === "R") {
       if (mcpBusyNames.size > 0) return;
-      for (const entry of mcpServers) mcpBusyNames.add(entry.name);
       mcpManagerMessage = "Reloading MCP configuration...";
       markDirty();
       renderFrame(true);
@@ -23450,8 +24243,6 @@ process.stdin.on("keypress", async (str, key) => {
       } catch (error) {
         mcpBridgeError = error?.message || String(error);
         mcpManagerMessage = `Reload failed: ${mcpBridgeError}`;
-      } finally {
-        mcpBusyNames.clear();
       }
       updateMcpSelectionState();
       markDirty();
@@ -23459,6 +24250,23 @@ process.stdin.on("keypress", async (str, key) => {
       return;
     }
     if (key?.sequence === "\r" || key?.name === "return" || key?.name === "enter") {
+      const entry = mcpServers[mcpSelected];
+      if (!entry || mcpBusyNames.has(entry.name)) return;
+      const wasEnabled = isMcpServerEnabledForActiveAgent(entry.name);
+      mcpManagerMessage = `${wasEnabled ? "Disabling" : "Enabling"} ${entry.name} for ${activeAgentName}...`;
+      markDirty();
+      renderFrame(true);
+      try {
+        await setActiveMcpServerEnabled(entry.name, !wasEnabled);
+        mcpManagerMessage = `${entry.name} ${wasEnabled ? "disabled" : "enabled"} for ${activeAgentName}.`;
+      } catch (error) {
+        mcpManagerMessage = `Could not update ${entry.name}: ${error?.message || String(error)}`;
+      }
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+    if (key?.name === "s" || str === "s" || str === "S") {
       const entry = mcpServers[mcpSelected];
       if (!entry || mcpBusyNames.has(entry.name)) return;
       const wasRunning = isMcpServerEntryRunning(entry);
@@ -24176,10 +24984,17 @@ process.stdout.on("resize", () => {
   renderFrame(true);
 });
 process.on("SIGINT", () => {
+  if (activeBuffer === "sessions") return;
   cleanupTerminal({ clearScreen: true });
   process.exit(0);
 });
 process.on("exit", cleanupTerminal);
+process.on("exit", () => {
+  const stagedPath = String(sessionTransferClipboard?.stagedPath || "");
+  if (stagedPath) {
+    try { fsSync.rmSync(stagedPath, { force: true }); } catch {}
+  }
+});
 
 async function initializeApp() {
   // Launch MCP servers and the bridge in parallel with the rest of startup.

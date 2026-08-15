@@ -164,8 +164,10 @@ def _ensure_plan_store_ready() -> None:
 
 def _get_plan_store_file() -> Path:
     _ensure_plan_store_ready()
-    workspace_key = hashlib.sha1(str(WORKSPACE_ROOT).encode("utf-8")).hexdigest()
-    return PLAN_STORE_DIR / f"plan-{workspace_key}.json"
+    runtime_session_id = harness.get_agent_runtime_session_id().strip()
+    scope = f"{WORKSPACE_ROOT}\0{runtime_session_id}" if runtime_session_id else str(WORKSPACE_ROOT)
+    scope_key = hashlib.sha1(scope.encode("utf-8")).hexdigest()
+    return PLAN_STORE_DIR / f"plan-{scope_key}.json"
 
 
 def _normalize_plan_entry_text(text: str) -> str:
@@ -2707,7 +2709,10 @@ def mcp_list() -> dict:
             "error": "MCP bridge not available. Is the TUI running with MCP enabled, and are servers configured in ~/.nexus/mcp_config.json?",
         }
     url = f"http://127.0.0.1:{info['port']}/"
-    payload = json.dumps({"method": "list"}).encode("utf-8")
+    payload = json.dumps({
+        "method": "list",
+        "session_id": harness.get_agent_runtime_session_id(),
+    }).encode("utf-8")
     try:
         req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -2743,7 +2748,13 @@ def mcp_call(server: str, tool: str, args: dict | None = None) -> dict:
         return {"ok": False, "error": "mcp_call: 'args' must be a dict"}
 
     url = f"http://127.0.0.1:{info['port']}/"
-    payload = json.dumps({"method": "call", "server": server, "tool": tool, "arguments": args}).encode("utf-8")
+    payload = json.dumps({
+        "method": "call",
+        "server": server,
+        "tool": tool,
+        "arguments": args,
+        "session_id": harness.get_agent_runtime_session_id(),
+    }).encode("utf-8")
     try:
         req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=60) as resp:
@@ -2789,6 +2800,7 @@ def mcp_search(
         "tool": str(tool or ""),
         "arguments": args,
         "limit": limit,
+        "session_id": harness.get_agent_runtime_session_id(),
     }).encode("utf-8")
     url = f"http://127.0.0.1:{info['port']}/"
     try:
