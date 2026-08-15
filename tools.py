@@ -45,12 +45,37 @@ def _emit_voice_capture_event(event: str, **payload) -> None:
 
 
 def _run_voice_capture_helper(temp_directory: str, parent_pid: int) -> int:
-    """Monitor hold-to-talk Alt state and capture the default Windows microphone."""
+    """Hold-to-talk Alt dictation using the default Windows microphone.
+
+    While Alt is held, audio is captured through the waveform API and every
+    ~1.2s the partial recording is snapshotted to a WAV file. Each snapshot is
+    emitted as an ``interim_snapshot`` event so the parent TUI can stream live
+    transcripts into the input box. Releasing Alt saves the full WAV and emits
+    ``recording_stopped``; a non-modifier chord while holding Alt cancels.
+    """
     if os.name != "nt":
         _emit_voice_capture_event("unavailable", error="push-to-talk is currently supported on Windows")
         return 1
 
     import ctypes
+    import math
+    import struct
+
+    WAVE_FORMAT_PCM = 1
+    WAVE_MAPPER = 0xFFFFFFFF
+    CALLBACK_EVENT = 0x00050000
+    MMSYSERR_NOERROR = 0
+    WHDR_DONE = 0x00000001
+    SYNCHRONIZE = 0x00100000
+    WAIT_TIMEOUT = 0x00000102
+    SAMPLE_RATE = 16000
+    BUFFER_BYTES = 8192
+    BUFFER_COUNT = 4
+    INTERIM_INTERVAL_S = 0.8
+    MAX_RECORDING_S = 300.0
+    SILENCE_RMS = 260
+    SILENCE_FINALIZE_S = 0.9
+    RMS_WINDOW_BYTES = 16000
 
     target_dir = Path(temp_directory).resolve()
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -65,18 +90,227 @@ def _run_voice_capture_helper(temp_directory: str, parent_pid: int) -> int:
     kernel32.WaitForSingleObject.restype = ctypes.c_uint
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     kernel32.CloseHandle.restype = ctypes.c_int
-    winmm.mciSendStringW.argtypes = [
-        ctypes.c_wchar_p,
-        ctypes.c_wchar_p,
-        ctypes.c_uint,
-        ctypes.c_void_p,
-    ]
-    winmm.mciSendStringW.restype = ctypes.c_uint
-    winmm.mciGetErrorStringW.argtypes = [ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_uint]
-    winmm.mciGetErrorStringW.restype = ctypes.c_int
+    kernel32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p]
+    kernel32.CreateEventW.restype = ctypes.c_void_p
 
-    SYNCHRONIZE = 0x00100000
-    WAIT_TIMEOUT = 0x00000102
+    class WAVEFORMATEX(ctypes.Structure):
+        _fields_ = [
+            ("wFormatTag", ctypes.c_uint16),
+            ("nChannels", ctypes.c_uint16),
+            ("nSamplesPerSec", ctypes.c_uint32),
+            ("nAvgBytesPerSec", ctypes.c_uint32),
+            ("nBlockAlign", ctypes.c_uint16),
+            ("wBitsPerSample", ctypes.c_uint16),
+            ("cbSize", ctypes.c_uint16),
+        ]
+
+    class WAVEHDR(ctypes.Structure):
+        _fields_ = [
+            ("lpData", ctypes.POINTER(ctypes.c_char)),
+            ("dwBufferLength", ctypes.c_uint32),
+            ("dwBytesRecorded", ctypes.c_uint32),
+            ("dwUser", ctypes.c_size_t),
+            ("dwFlags", ctypes.c_uint32),
+            ("dwLoops", ctypes.c_uint32),
+            ("lpNext", ctypes.c_void_p),
+            ("reserved", ctypes.c_size_t),
+        ]
+
+    winmm.waveInOpen.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_uint,
+        ctypes.POINTER(WAVEFORMATEX),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_uint,
+    ]
+    winmm.waveInOpen.restype = ctypes.c_uint
+    winmm.waveInPrepareHeader.argtypes = [ctypes.c_void_p, ctypes.POINTER(WAVEHDR), ctypes.c_uint]
+    winmm.waveInPrepareHeader.restype = ctypes.c_uint
+    winmm.waveInUnprepareHeader.argtypes = [ctypes.c_void_p, ctypes.POINTER(WAVEHDR), ctypes.c_uint]
+    winmm.waveInUnprepareHeader.restype = ctypes.c_uint
+    winmm.waveInAddBuffer.argtypes = [ctypes.c_void_p, ctypes.POINTER(WAVEHDR), ctypes.c_uint]
+    winmm.waveInAddBuffer.restype = ctypes.c_uint
+    winmm.waveInStart.argtypes = [ctypes.c_void_p]
+    winmm.waveInStart.restype = ctypes.c_uint
+    winmm.waveInReset.argtypes = [ctypes.c_void_p]
+    winmm.waveInReset.restype = ctypes.c_uint
+    winmm.waveInClose.argtypes = [ctypes.c_void_p]
+    winmm.waveInClose.restype = ctypes.c_uint
+
+    def build_wav(data: bytes) -> bytes:
+        block_align = 2
+        header = struct.pack(
+            "<4sI4s4sIHHIIHH4sI",
+            b"RIFF",
+            36 + len(data),
+            b"WAVE",
+            b"fmt ",
+            16,
+            WAVE_FORMAT_PCM,
+            1,
+            SAMPLE_RATE,
+            SAMPLE_RATE * block_align,
+            block_align,
+            16,
+            b"data",
+            len(data),
+        )
+        return header + data
+
+    class WaveRecorder:
+        def __init__(self) -> None:
+            self.data = bytearray()
+            self.data_lock = threading.Lock()
+            self.buffers = []
+            self.handle = ctypes.c_void_p(0)
+            self.event_handle = None
+            self.stop_event = threading.Event()
+            self.thread = None
+
+            format_ex = WAVEFORMATEX()
+            format_ex.wFormatTag = WAVE_FORMAT_PCM
+            format_ex.nChannels = 1
+            format_ex.nSamplesPerSec = SAMPLE_RATE
+            format_ex.wBitsPerSample = 16
+            format_ex.nBlockAlign = 2
+            format_ex.nAvgBytesPerSec = SAMPLE_RATE * 2
+            format_ex.cbSize = 0
+            self.event_handle = kernel32.CreateEventW(None, False, False, None)
+            if not self.event_handle:
+                raise RuntimeError("CreateEventW failed")
+            error_code = winmm.waveInOpen(
+                ctypes.byref(self.handle),
+                WAVE_MAPPER,
+                ctypes.byref(format_ex),
+                self.event_handle,
+                0,
+                CALLBACK_EVENT,
+            )
+            if error_code != MMSYSERR_NOERROR:
+                raise RuntimeError(f"waveInOpen failed (0x{error_code:x})")
+            for _ in range(BUFFER_COUNT):
+                raw = ctypes.create_string_buffer(BUFFER_BYTES)
+                header = WAVEHDR()
+                header.lpData = ctypes.cast(raw, ctypes.POINTER(ctypes.c_char))
+                header.dwBufferLength = BUFFER_BYTES
+                error_code = winmm.waveInPrepareHeader(
+                    self.handle, ctypes.byref(header), ctypes.sizeof(WAVEHDR)
+                )
+                if error_code != MMSYSERR_NOERROR:
+                    raise RuntimeError(f"waveInPrepareHeader failed (0x{error_code:x})")
+                error_code = winmm.waveInAddBuffer(
+                    self.handle, ctypes.byref(header), ctypes.sizeof(WAVEHDR)
+                )
+                if error_code != MMSYSERR_NOERROR:
+                    raise RuntimeError(f"waveInAddBuffer failed (0x{error_code:x})")
+                self.buffers.append((raw, header))
+            error_code = winmm.waveInStart(self.handle)
+            if error_code != MMSYSERR_NOERROR:
+                raise RuntimeError(f"waveInStart failed (0x{error_code:x})")
+            self.thread = threading.Thread(target=self._capture_loop, daemon=True)
+            self.thread.start()
+
+        def _capture_loop(self) -> None:
+            while not self.stop_event.is_set():
+                if kernel32.WaitForSingleObject(self.event_handle, 200) == WAIT_TIMEOUT:
+                    continue
+                if self.stop_event.is_set():
+                    break
+                self._drain()
+
+        def _drain(self) -> None:
+            block_align = 2
+            for _, header in self.buffers:
+                try:
+                    if not (header.dwFlags & WHDR_DONE):
+                        continue
+                    recorded = int(header.dwBytesRecorded)
+                    recorded -= recorded % block_align
+                    if recorded > 0:
+                        chunk = ctypes.string_at(header.lpData, recorded)
+                        with self.data_lock:
+                            self.data.extend(chunk)
+                    header.dwFlags = 0
+                    header.dwBytesRecorded = 0
+                    winmm.waveInUnprepareHeader(self.handle, ctypes.byref(header), ctypes.sizeof(WAVEHDR))
+                    winmm.waveInPrepareHeader(self.handle, ctypes.byref(header), ctypes.sizeof(WAVEHDR))
+                    winmm.waveInAddBuffer(self.handle, ctypes.byref(header), ctypes.sizeof(WAVEHDR))
+                except Exception:
+                    # A transient winmm/ctypes error on one buffer must not
+                    # kill the capture thread; the next drain retries.
+                    pass
+
+        def write_snapshot(self, path, start_byte: int = 0) -> int:
+            with self.data_lock:
+                data = bytes(self.data[start_byte:])
+                total = len(self.data)
+            path = Path(path)
+            if data:
+                path.write_bytes(build_wav(data))
+            else:
+                # Emit empty WAV so the parent can validate path + plumbing
+                # even when no audio arrived yet.
+                path.write_bytes(build_wav(b""))
+            return total
+
+        def full_data(self) -> bytes:
+            with self.data_lock:
+                return bytes(self.data)
+
+        def length(self) -> int:
+            with self.data_lock:
+                return len(self.data)
+
+        def rms_last(self, window_bytes: int) -> float:
+            block_align = 2
+            window_bytes -= window_bytes % block_align
+            with self.data_lock:
+                data = bytes(self.data[-window_bytes:]) if self.data else b""
+            if len(data) < block_align:
+                return 0.0
+            count = len(data) // block_align
+            samples = struct.unpack(f"<{count}h", data)
+            return math.sqrt(sum(sample * sample for sample in samples) / count)
+
+        def stop(self, path) -> int:
+            # Never raise: even if winmm teardown misbehaves, the recording
+            # must be written so the parent can transcribe it.
+            self.stop_event.set()
+            if self.thread:
+                self.thread.join(timeout=1.0)
+            try:
+                self._drain()
+            except Exception:
+                pass
+            with self.data_lock:
+                total = len(self.data)
+                data = bytes(self.data)
+            if path is not None:
+                try:
+                    Path(path).write_bytes(build_wav(data))
+                except Exception:
+                    pass
+            try:
+                winmm.waveInReset(self.handle)
+            except Exception:
+                pass
+            for _, header in self.buffers:
+                try:
+                    winmm.waveInUnprepareHeader(self.handle, ctypes.byref(header), ctypes.sizeof(WAVEHDR))
+                except Exception:
+                    pass
+            try:
+                winmm.waveInClose(self.handle)
+            except Exception:
+                pass
+            if self.event_handle:
+                try:
+                    kernel32.CloseHandle(self.event_handle)
+                except Exception:
+                    pass
+            return total
+
     parent_handle = kernel32.OpenProcess(SYNCHRONIZE, False, int(parent_pid))
     control = {"enabled": False, "stop": False}
     control_lock = threading.Lock()
@@ -100,43 +334,18 @@ def _run_voice_capture_helper(temp_directory: str, parent_pid: int) -> int:
 
     threading.Thread(target=read_control, daemon=True).start()
 
-    alias = f"nexusvoice{os.getpid()}"
+    recorder = None
     recording = False
-    recording_path: Path | None = None
+    recording_path = None
     recording_started_at = 0.0
+    last_interim_at = 0.0
+    interim_index = 0
+    last_speech_at = 0.0
+    committed_bytes = 0
+    utterance_active = False
+    silence_committed = False
     alt_was_down = False
     chorded = False
-
-    def mci(command: str) -> None:
-        error_code = int(winmm.mciSendStringW(command, None, 0, None))
-        if error_code:
-            buffer = ctypes.create_unicode_buffer(512)
-            winmm.mciGetErrorStringW(error_code, buffer, len(buffer))
-            raise RuntimeError(buffer.value or f"Windows audio error {error_code}")
-
-    def close_recording(save: bool) -> tuple[str, int]:
-        nonlocal recording, recording_path, recording_started_at
-        path_value = str(recording_path or "")
-        duration_ms = max(0, int((time.monotonic() - recording_started_at) * 1000))
-        try:
-            mci(f"stop {alias}")
-            if save and recording_path is not None:
-                escaped = str(recording_path).replace('"', '')
-                mci(f'save {alias} "{escaped}"')
-        finally:
-            try:
-                mci(f"close {alias}")
-            except Exception:
-                pass
-            recording = False
-            recording_path = None
-            recording_started_at = 0.0
-        if not save and path_value:
-            try:
-                Path(path_value).unlink(missing_ok=True)
-            except Exception:
-                pass
-        return path_value, duration_ms
 
     def has_non_modifier_key_down() -> bool:
         ignored = {
@@ -151,6 +360,52 @@ def _run_voice_capture_helper(temp_directory: str, parent_pid: int) -> int:
             for virtual_key in range(0x08, 0xFF)
         )
 
+    def stop_recording(save: bool):
+        nonlocal recorder, recording, recording_path, recording_started_at, last_interim_at
+        recorder_ref = recorder
+        recorder = None
+        path_value = str(recording_path or "")
+        duration_ms = max(0, int((time.monotonic() - recording_started_at) * 1000))
+        write_ok = False
+        final_total = 0
+        if recorder_ref is not None:
+            try:
+                if save and recording_path is not None:
+                    target = str(recording_path)
+                    try:
+                        final_total = recorder_ref.stop(target)
+                    except Exception:
+                        # winmm teardown failed; recover by writing the PCM we
+                        # already collected so the recording is never lost.
+                        data = recorder_ref.full_data()
+                        Path(target).write_bytes(build_wav(data))
+                        final_total = len(data)
+                    write_ok = Path(target).is_file() and Path(target).stat().st_size > 44
+                else:
+                    recorder_ref.stop(None)
+            except Exception:
+                write_ok = False
+        last_speech_bytes = committed_bytes
+        if last_speech_at > 0 and final_total > 0:
+            last_speech_bytes = min(
+                final_total,
+                max(
+                    committed_bytes,
+                    int((last_speech_at - recording_started_at) * SAMPLE_RATE * 2),
+                ),
+            )
+        last_speech_bytes -= last_speech_bytes % 2
+        recording = False
+        recording_path = None
+        recording_started_at = 0.0
+        last_interim_at = 0.0
+        if not save and path_value:
+            try:
+                Path(path_value).unlink(missing_ok=True)
+            except Exception:
+                pass
+        return path_value, duration_ms, write_ok, final_total, committed_bytes, last_speech_bytes
+
     _emit_voice_capture_event("ready")
     try:
         while True:
@@ -162,10 +417,15 @@ def _run_voice_capture_helper(temp_directory: str, parent_pid: int) -> int:
             if parent_handle and kernel32.WaitForSingleObject(parent_handle, 0) != WAIT_TIMEOUT:
                 break
 
-            alt_down = bool(user32.GetAsyncKeyState(0x12) & 0x8000)
+            try:
+                alt_down = bool(user32.GetAsyncKeyState(0x12) & 0x8000)
+            except Exception as exc:
+                _emit_voice_capture_event("error", error=f"voice capture state: {exc}")
+                time.sleep(0.02)
+                continue
             if not enabled:
                 if recording:
-                    close_recording(False)
+                    stop_recording(False)
                     _emit_voice_capture_event("recording_cancelled")
                 alt_was_down = alt_down
                 chorded = False
@@ -176,63 +436,148 @@ def _run_voice_capture_helper(temp_directory: str, parent_pid: int) -> int:
                 chorded = False
                 recording_path = target_dir / f"recording-{int(time.time() * 1000)}.wav"
                 try:
-                    mci(f"open new type waveaudio alias {alias}")
-                    mci(
-                        f"set {alias} time format milliseconds samplespersec 16000 "
-                        "channels 1 bitspersample 16 bytespersec 32000 alignment 2"
-                    )
-                    mci(f"record {alias}")
+                    recorder = WaveRecorder()
                     recording = True
                     recording_started_at = time.monotonic()
+                    last_interim_at = recording_started_at
+                    last_speech_at = 0.0
+                    committed_bytes = 0
+                    utterance_active = False
+                    silence_committed = False
                     _emit_voice_capture_event("recording_started", path=str(recording_path))
                 except Exception as exc:
-                    try:
-                        mci(f"close {alias}")
-                    except Exception:
-                        pass
+                    recorder = None
                     recording = False
                     recording_path = None
                     _emit_voice_capture_event("error", error=str(exc))
 
-            if alt_down and recording and has_non_modifier_key_down():
+            if alt_down and recording and recorder is not None and has_non_modifier_key_down():
                 chorded = True
-                close_recording(False)
+                stop_recording(False)
                 _emit_voice_capture_event("recording_cancelled")
+                continue
 
-            if alt_down and recording and (time.monotonic() - recording_started_at) * 1000 >= 300000:
-                path_value, duration_ms = close_recording(True)
-                _emit_voice_capture_event(
-                    "recording_stopped",
-                    path=path_value,
-                    duration_ms=duration_ms,
-                    reason="maximum duration reached",
-                )
+            if alt_down and recording and (time.monotonic() - recording_started_at) >= MAX_RECORDING_S:
+                path_value, duration_ms, write_ok, final_total, committed_value, speech_value = stop_recording(True)
+                if write_ok:
+                    _emit_voice_capture_event(
+                        "recording_stopped",
+                        path=path_value,
+                        duration_ms=duration_ms,
+                        reason="maximum duration reached",
+                        total_bytes=final_total,
+                        committed_bytes=committed_value,
+                        speech_bytes=speech_value,
+                    )
+                else:
+                    _emit_voice_capture_event("error", error="recording could not be saved")
                 chorded = True
+
+            now_monotonic = time.monotonic()
+            speaking = False
+            try:
+                speaking = (
+                    recording
+                    and recorder is not None
+                    and recorder.rms_last(RMS_WINDOW_BYTES) >= SILENCE_RMS
+                )
+            except Exception as exc:
+                _emit_voice_capture_event("error", error=f"voice level check: {exc}")
+            if speaking:
+                last_speech_at = now_monotonic
+                if not utterance_active:
+                    utterance_active = True
+                    silence_committed = False
+
+            if (
+                recording
+                and recorder is not None
+                and utterance_active
+                and not silence_committed
+                and (now_monotonic - last_speech_at) >= SILENCE_FINALIZE_S
+            ):
+                # The user stopped talking: finalize this utterance so the UI
+                # commits the displayed text and stops changing it. New speech
+                # after this point starts a fresh utterance with a byte offset
+                # so only the NEW audio gets uploaded/transcribed.
+                try:
+                    silence_committed = True
+                    utterance_active = False
+                    committed_bytes = recorder.length()
+                    _emit_voice_capture_event("utterance_committed")
+                except Exception as exc:
+                    _emit_voice_capture_event("error", error=f"utterance commit: {exc}")
+
+            audio_growth_ready = False
+            try:
+                audio_growth_ready = recorder is not None and recorder.length() > committed_bytes
+            except Exception as exc:
+                _emit_voice_capture_event("error", error=f"audio length check: {exc}")
+
+            if (
+                alt_down
+                and recording
+                and recorder is not None
+                and utterance_active
+                and (speaking or (now_monotonic - last_speech_at) < 0.15)
+                and (now_monotonic - last_interim_at) >= INTERIM_INTERVAL_S
+                and audio_growth_ready
+            ):
+                last_interim_at = now_monotonic
+                interim_index += 1
+                snapshot_path = target_dir / f"interim-{int(time.time() * 1000)}-{interim_index}.wav"
+                try:
+                    total_bytes = recorder.write_snapshot(snapshot_path, committed_bytes)
+                    if (
+                        total_bytes > committed_bytes
+                        and snapshot_path.is_file()
+                        and snapshot_path.stat().st_size > 44
+                    ):
+                        duration_ms = max(0, int((now_monotonic - recording_started_at) * 1000))
+                        _emit_voice_capture_event(
+                            "interim_snapshot",
+                            path=str(snapshot_path),
+                            duration_ms=duration_ms,
+                        )
+                    else:
+                        snapshot_path.unlink(missing_ok=True)
+                except Exception:
+                    try:
+                        snapshot_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
             if not alt_down and alt_was_down:
                 if recording and not chorded:
-                    try:
-                        path_value, duration_ms = close_recording(True)
+                    path_value, duration_ms, write_ok, final_total, committed_value, speech_value = stop_recording(True)
+                    if write_ok:
                         _emit_voice_capture_event(
                             "recording_stopped",
                             path=path_value,
                             duration_ms=duration_ms,
+                            total_bytes=final_total,
+                            committed_bytes=committed_value,
+                            speech_bytes=speech_value,
                         )
-                    except Exception as exc:
-                        _emit_voice_capture_event("error", error=str(exc))
+                    else:
+                        _emit_voice_capture_event("error", error="recording could not be saved")
                 chorded = False
 
             alt_was_down = alt_down
             time.sleep(0.012)
     finally:
-        if recording:
+        if recording and recorder is not None:
             try:
-                close_recording(False)
+                stop_recording(False)
             except Exception:
                 pass
         if parent_handle:
             kernel32.CloseHandle(parent_handle)
     return 0
+
+
+
+
 
 
 def set_shell_stream_writer(writer) -> None:

@@ -179,6 +179,7 @@ const MEDIA_TOOL_MAX_FILES = 20;
 const MEDIA_TOOL_MAX_AUDIO_BYTES = 50 * 1024 * 1024;
 const MEDIA_TOOL_MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const VOICE_CAPTURE_STATUS_CLEAR_MS = 5000;
+const VOICE_CAPTURE_TAIL_MIN_BYTES = 1600; // ~50ms of 16kHz mono 16-bit PCM
 const VOICE_CAPTURE_MAX_RECORDING_MS = 5 * 60 * 1000;
 const AUDIO_FILE_EXTENSIONS = new Set([".wav", ".mp3", ".flac", ".m4a", ".ogg", ".webm", ".aac"]);
 const IMAGE_FILE_MIME_TYPES = new Map([
@@ -1295,6 +1296,16 @@ let voiceCaptureStatusText = "";
 let voiceCaptureStatusTimer = null;
 let voiceCaptureRecordingPath = "";
 let voiceCaptureContext = null;
+let voiceCaptureInterimInsertion = null;
+let voiceCaptureInterimGeneration = 0;
+let voiceCaptureInterimInFlight = false;
+let voiceCaptureInterimController = null;
+let voiceCaptureInterimResult = null;
+let voiceCaptureCommittedText = "";
+let voiceCaptureUtteranceCommitPending = false;
+let voiceCaptureRelaunchTimer = null;
+let voiceCaptureRelaunchCount = 0;
+let voiceCaptureLastAliveAt = 0;
 let suppressVoiceEscapeKeypressUntil = 0;
 const VOICE_CAPTURE_TEMP_DIR = path.join(os.tmpdir(), `nexus-voice-${process.pid}`);
 let modelSearch = "";
@@ -2039,6 +2050,50 @@ function isSafeVoiceCapturePath(filePath) {
   return candidate === root || candidate.startsWith(`${root}${path.sep}`);
 }
 
+function handleVoiceCaptureCrashCleanup() {
+  if (voiceCaptureInterimController) {
+    try { voiceCaptureInterimController.abort(); } catch {}
+    voiceCaptureInterimController = null;
+  }
+  voiceCaptureInterimInFlight = false;
+  if (voiceCaptureInterimInsertion) {
+    const anchor = {
+      input: voiceCaptureInterimInsertion.input,
+      position: voiceCaptureInterimInsertion.position,
+    };
+    const previewShown =
+      voiceCaptureInterimResult &&
+      input === voiceCaptureInterimResult.input &&
+      inputCursorIndex === voiceCaptureInterimResult.cursorIndex;
+    if (previewShown) {
+      input = anchor.input;
+      inputCursorIndex = anchor.position;
+      markDirty();
+      renderFrame(false);
+    }
+    voiceCaptureInterimInsertion = null;
+  }
+  voiceCaptureInterimResult = null;
+  voiceCaptureCommittedText = "";
+  voiceCaptureUtteranceCommitPending = false;
+  voiceCaptureInterimGeneration += 1;
+  voiceCaptureRecordingPath = "";
+  voiceCaptureContext = null;
+}
+
+function scheduleVoiceCaptureRelaunch() {
+  if (cleanedUp || voiceCaptureProcess) return;
+  if (Date.now() - voiceCaptureLastAliveAt >= 30000) voiceCaptureRelaunchCount = 0;
+  if (voiceCaptureRelaunchCount >= 3) return;
+  voiceCaptureRelaunchCount += 1;
+  if (voiceCaptureRelaunchTimer) clearTimeout(voiceCaptureRelaunchTimer);
+  voiceCaptureRelaunchTimer = setTimeout(() => {
+    voiceCaptureRelaunchTimer = null;
+    if (cleanedUp || voiceCaptureProcess) return;
+    startVoiceCaptureHelper().catch(() => {});
+  }, 1500);
+}
+
 function setVoiceCaptureStatus(state, text = "", clearAfterMs = 0) {
   if (voiceCaptureStatusTimer) {
     clearTimeout(voiceCaptureStatusTimer);
@@ -2102,6 +2157,11 @@ function stopVoiceCaptureHelper() {
     clearTimeout(voiceCaptureStatusTimer);
     voiceCaptureStatusTimer = null;
   }
+  if (voiceCaptureRelaunchTimer) {
+    clearTimeout(voiceCaptureRelaunchTimer);
+    voiceCaptureRelaunchTimer = null;
+  }
+  voiceCaptureRelaunchCount = 0;
   const child = voiceCaptureProcess;
   voiceCaptureProcess = null;
   voiceCaptureEnabledState = null;
@@ -2142,11 +2202,148 @@ function insertTranscribedText(text) {
   return true;
 }
 
-async function requestVoiceTranscription(filePath, context = {}) {
-  if (!isSafeVoiceCapturePath(filePath)) throw new Error("recording path was rejected");
-  const stat = await fs.stat(filePath);
+function insertTranscribedTextAtPosition(text, position) {
+  const merged = mergeTranscribedText(
+    input,
+    Number.isFinite(position) ? position : inputCursorIndex,
+    text
+  );
+  if (!merged.changed) return false;
+  breakSubmittedInputHistoryNavigation();
+  input = merged.input;
+  inputCursorIndex = merged.cursorIndex;
+  updateCommandMenuState();
+  scrollChatToBottom();
+  markDirty();
+  renderFrame(false);
+  return true;
+}
+
+function composeUtterancePreview(anchorInput, anchorPosition, committedText, partialText) {
+  let composed = String(anchorInput || "");
+  let cursor = Math.max(0, Number(anchorPosition) || 0);
+  if (committedText) {
+    const merged = mergeTranscribedText(composed, cursor, committedText);
+    composed = merged.input;
+    cursor = merged.cursorIndex;
+  }
+  if (partialText) {
+    const merged = mergeTranscribedText(composed, cursor, partialText);
+    composed = merged.input;
+    cursor = merged.cursorIndex;
+  }
+  return { input: composed, cursorIndex: cursor };
+}
+
+function mergeCommittedText(existingCommitted, newText) {
+  const current = String(existingCommitted || "");
+  const addition = String(newText || "").replace(/\s+/g, " ").trim();
+  if (!current) return addition;
+  if (!addition) return current;
+  return mergeTranscribedText(current, current.length, addition).input;
+}
+
+function applyUtterancePreview(anchorInput, anchorPosition, partialText) {
+  const composed = composeUtterancePreview(
+    anchorInput,
+    anchorPosition,
+    voiceCaptureCommittedText || "",
+    partialText
+  );
+  if (input === composed.input && inputCursorIndex === composed.cursorIndex) return;
+  breakSubmittedInputHistoryNavigation();
+  input = composed.input;
+  inputCursorIndex = composed.cursorIndex;
+  updateCommandMenuState();
+  scrollChatToBottom();
+  markDirty();
+  renderFrame(false);
+}
+
+function maybeCommitUtterance(anchorInput, anchorPosition) {
+  if (!voiceCaptureUtteranceCommitPending) return;
+  if (voiceCaptureInterimInFlight) return;
+  const resultIntact =
+    !voiceCaptureInterimResult ||
+    (voiceCaptureInterimResult.input === input &&
+      voiceCaptureInterimResult.cursorIndex === inputCursorIndex);
+  if (!resultIntact) {
+    // User edited after the preview landed; keep their text and stop churning.
+    voiceCaptureUtteranceCommitPending = false;
+    voiceCaptureInterimResult = {
+      input: String(input || ""),
+      cursorIndex: inputCursorIndex,
+      text: "",
+    };
+    return;
+  }
+  const partial = voiceCaptureInterimResult?.text || "";
+  voiceCaptureCommittedText = mergeCommittedText(voiceCaptureCommittedText, partial);
+  const composed = composeUtterancePreview(
+    anchorInput,
+    anchorPosition,
+    voiceCaptureCommittedText,
+    ""
+  );
+  input = composed.input;
+  inputCursorIndex = composed.cursorIndex;
+  voiceCaptureInterimResult = {
+    input: composed.input,
+    cursorIndex: composed.cursorIndex,
+    text: "",
+  };
+  voiceCaptureUtteranceCommitPending = false;
+  markDirty();
+  renderFrame(false);
+}
+
+function buildWavPcmBuffer(pcmData) {
+  const sampleRate = 16000;
+  const blockAlign = 2;
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0, "ascii");
+  header.writeUInt32LE(36 + pcmData.length, 4);
+  header.write("WAVE", 8, "ascii");
+  header.write("fmt ", 12, "ascii");
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(1, 22); // mono
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * blockAlign, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36, "ascii");
+  header.writeUInt32LE(pcmData.length, 40);
+  return Buffer.concat([header, pcmData]);
+}
+
+async function statVoiceRecordingFile(filePath) {
+  // The helper writes the WAV in a separate process; on Windows the file may
+  // be briefly invisible (AV scan, cache flush) right after the event arrives.
+  let stat = null;
+  let lastCode = "";
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      stat = await fs.stat(filePath);
+      if (stat.isFile() && stat.size > 44) break;
+    } catch (error) {
+      lastCode = String(error?.code || "");
+      if (lastCode !== "ENOENT" && lastCode !== "EBUSY" && lastCode !== "EACCES" && lastCode !== "EPERM") {
+        throw error;
+      }
+    }
+    stat = null;
+    if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 120));
+  }
+  if (!stat) throw Object.assign(new Error("recording could not be saved"), { code: lastCode || "ENOENT" });
   if (!stat.isFile() || stat.size <= 44) throw new Error("recording was empty");
   if (stat.size > MEDIA_TOOL_MAX_AUDIO_BYTES) throw new Error("recording is too large");
+  return stat;
+}
+
+async function requestVoiceTranscription(filePath, context = {}) {
+  if (!isSafeVoiceCapturePath(filePath)) throw new Error("recording path was rejected");
+  await statVoiceRecordingFile(filePath);
   const { provider, profileName, model } = resolveMediaProviderProfile(
     { profile: context.profile, session_id: context.sessionId },
     "speech_to_text_model",
@@ -2167,6 +2364,130 @@ async function requestVoiceTranscription(filePath, context = {}) {
   return transcript;
 }
 
+async function streamVoiceTranscription(filePath, context = {}, handlers = {}) {
+  const { onDelta, onDone } = handlers;
+  if (!isSafeVoiceCapturePath(filePath)) throw new Error("recording path was rejected");
+  await statVoiceRecordingFile(filePath);
+  const { provider, profileName, model } = resolveMediaProviderProfile(
+    { profile: context.profile, session_id: context.sessionId },
+    "speech_to_text_model",
+    "Speech to text"
+  );
+  const data = await fs.readFile(filePath);
+  const controller = new AbortController();
+  const timeoutMs = normalizeLlmRequestTimeoutMs(context.timeoutMs);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(buildProviderApiUrl(provider, "audio/transcriptions"), {
+      method: "POST",
+      headers: { ...getProviderRequestHeaders(provider), Accept: "text/event-stream" },
+      body: JSON.stringify({
+        input_audio: { data: data.toString("base64"), format: "wav" },
+        model,
+        stream: true,
+      }),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => "");
+      let body = {};
+      try { body = errorText ? JSON.parse(errorText) : {}; } catch { body = { text: errorText }; }
+      throw new Error(
+        String(body?.error?.message || body?.error || body?.message || errorText || `HTTP ${response.status}`)
+      );
+    }
+    const contentType = String(response.headers?.get?.("content-type") || "");
+    if (!contentType.includes("text/event-stream")) {
+      // Provider ignored stream:true and returned the plain JSON transcript.
+      const raw = await response.text();
+      let body = {};
+      try { body = raw ? JSON.parse(raw) : {}; } catch { body = { text: raw }; }
+      const doneText = String(body?.text || "").trim();
+      if (!doneText) throw new Error(`${profileName} returned an empty transcript`);
+      if (typeof onDone === "function") onDone(doneText);
+      return;
+    }
+    const decoder = new TextDecoder("utf-8");
+    const reader = response.body.getReader();
+    let buffer = "";
+    let eventType = "";
+    let dataLines = [];
+    let full = "";
+    let doneEmitted = false;
+    const emitDone = (text) => {
+      if (doneEmitted) return;
+      doneEmitted = true;
+      const finalText = String(text || full || "").trim();
+      if (finalText && typeof onDone === "function") onDone(finalText);
+    };
+    const emitDelta = (chunk) => {
+      if (typeof onDelta !== "function") return;
+      full += String(chunk || "");
+      onDelta(full);
+    };
+    const flushBlock = () => {
+      const payload = dataLines.join("\n");
+      const blockEvent = eventType;
+      dataLines = [];
+      eventType = "";
+      if (!payload) return;
+      if (payload === "[DONE]") {
+        emitDone(full);
+        return;
+      }
+      let parsed = null;
+      try { parsed = JSON.parse(payload); } catch { return; }
+      const dataText = String(parsed?.text || "");
+      const delta = String(parsed?.delta || "");
+      const choicesDelta = String(parsed?.choices?.[0]?.delta?.content || "");
+      if (parsed?.type === "transcript.text.done" || blockEvent === "transcript.text.done") {
+        emitDone(dataText);
+        return;
+      }
+      if (parsed?.type === "transcript.text.delta" || blockEvent === "transcript.text.delta" || delta) {
+        emitDelta(delta || dataText);
+        return;
+      }
+      if (choicesDelta) {
+        emitDelta(choicesDelta);
+        return;
+      }
+      if (dataText) {
+        emitDone(dataText);
+      }
+    };
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let newlineIndex = buffer.indexOf("\n");
+      while (newlineIndex >= 0) {
+        let line = buffer.slice(0, newlineIndex);
+        buffer = buffer.slice(newlineIndex + 1);
+        if (line.endsWith("\r")) line = line.slice(0, -1);
+        if (line === "") {
+          flushBlock();
+        } else if (line.startsWith("event:")) {
+          eventType = line.slice(6).trim();
+        } else if (line.startsWith("data:")) {
+          dataLines.push(line.slice(5).replace(/^ /, ""));
+        }
+        newlineIndex = buffer.indexOf("\n");
+      }
+    }
+    flushBlock();
+    if (!doneEmitted && full.trim()) emitDone();
+    if (!doneEmitted) throw new Error(`${profileName} returned an empty transcript`);
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(`Media model request timed out after ${Math.round(timeoutMs / 1000)}s`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function handleVoiceCaptureEvent(event) {
   const eventName = String(event?.event || "");
   if (eventName === "ready") {
@@ -2184,6 +2505,15 @@ async function handleVoiceCaptureEvent(event) {
       timeoutMs: settings.request_timeout_ms,
     };
     suppressVoiceEscapeKeypressUntil = Date.now() + VOICE_CAPTURE_MAX_RECORDING_MS + 1500;
+    voiceCaptureInterimInsertion = { input: String(input || ""), position: inputCursorIndex };
+    voiceCaptureInterimController = null;
+    voiceCaptureCommittedText = "";
+    voiceCaptureUtteranceCommitPending = false;
+    // Generation keeps increasing across recordings so a stale in-flight
+    // interim from a previous utterance can never collide with a new one.
+    voiceCaptureInterimGeneration += 1;
+    voiceCaptureInterimInFlight = false;
+    voiceCaptureInterimResult = null;
     setVoiceCaptureStatus("recording", "Recording");
     return;
   }
@@ -2191,6 +2521,34 @@ async function handleVoiceCaptureEvent(event) {
     const cancelledPath = voiceCaptureRecordingPath;
     voiceCaptureRecordingPath = "";
     voiceCaptureContext = null;
+    if (voiceCaptureInterimController) {
+      try { voiceCaptureInterimController.abort(); } catch {}
+      voiceCaptureInterimController = null;
+    }
+    voiceCaptureInterimInFlight = false;
+    if (voiceCaptureInterimInsertion) {
+      const anchor = {
+        input: voiceCaptureInterimInsertion.input,
+        position: voiceCaptureInterimInsertion.position,
+      };
+      const previewShown =
+        voiceCaptureInterimResult &&
+        input === voiceCaptureInterimResult.input &&
+        inputCursorIndex === voiceCaptureInterimResult.cursorIndex;
+      if (previewShown) {
+        input = anchor.input;
+        inputCursorIndex = anchor.position;
+        markDirty();
+        renderFrame(false);
+      }
+      // A snapshot transcription still in flight will be rejected by the
+      // generation guard, so no stale preview can appear after cancel.
+      voiceCaptureInterimInsertion = null;
+    }
+    voiceCaptureInterimResult = null;
+    voiceCaptureCommittedText = "";
+    voiceCaptureUtteranceCommitPending = false;
+    voiceCaptureInterimGeneration += 1;
     suppressVoiceEscapeKeypressUntil = Date.now() + 800;
     if (cancelledPath && isSafeVoiceCapturePath(cancelledPath)) {
       await fs.rm(cancelledPath, { force: true }).catch(() => {});
@@ -2198,36 +2556,294 @@ async function handleVoiceCaptureEvent(event) {
     setVoiceCaptureStatus("idle");
     return;
   }
+  if (eventName === "interim_snapshot") {
+    const snapshotPath = String(event.path || "");
+    const context = voiceCaptureContext || {};
+    if (!isSafeVoiceCapturePath(snapshotPath)) return;
+    if (!voiceCaptureInterimInsertion) return;
+    if (voiceCaptureInterimInFlight) {
+      // A transcription is already running and will finish with the full
+      // transcript up to its snapshot. Aborting it would restart with an even
+      // larger file and the user would never see updates. Let it settle; the
+      // next snapshot after it completes picks up the newest audio. New
+      // snapshots are only emitted while the user is actually speaking.
+      await fs.rm(snapshotPath, { force: true }).catch(() => {});
+      return;
+    }
+    // No request in flight: start a fresh one for this snapshot.
+    if (voiceCaptureInterimController) {
+      try { voiceCaptureInterimController.abort(); } catch {}
+      voiceCaptureInterimController = null;
+    }
+    voiceCaptureInterimGeneration += 1;
+    const generation = voiceCaptureInterimGeneration;
+    const anchorInput = voiceCaptureInterimInsertion.input;
+    const anchorPosition = voiceCaptureInterimInsertion.position;
+    const controller = new AbortController();
+    voiceCaptureInterimController = controller;
+    voiceCaptureInterimInFlight = true;
+    voiceCaptureInterimResult = null;
+    const applyPreview = (text) => {
+      if (generation !== voiceCaptureInterimGeneration || controller.signal.aborted) return;
+      const intact =
+        !voiceCaptureInterimResult ||
+        (input === voiceCaptureInterimResult.input &&
+          inputCursorIndex === voiceCaptureInterimResult.cursorIndex);
+      if (!intact) return; // User edited while streaming; do not clobber.
+      voiceCaptureInterimResult = null;
+      applyUtterancePreview(anchorInput, anchorPosition, text);
+      voiceCaptureInterimResult = {
+        input: String(input || ""),
+        cursorIndex: inputCursorIndex,
+        text: String(text || ""),
+      };
+    };
+    streamVoiceTranscription(snapshotPath, context, {
+      onDelta: (text) => {
+        applyPreview(text);
+      },
+      onDone: (text) => {
+        applyPreview(text);
+        maybeCommitUtterance(anchorInput, anchorPosition);
+      },
+    })
+      .catch(() => {})
+      .finally(async () => {
+        if (voiceCaptureInterimController === controller) {
+          voiceCaptureInterimController = null;
+          voiceCaptureInterimInFlight = false;
+        }
+        maybeCommitUtterance(anchorInput, anchorPosition);
+        await fs.rm(snapshotPath, { force: true }).catch(() => {});
+      });
+    return;
+  }
+  if (eventName === "utterance_committed") {
+    if (!voiceCaptureInterimInsertion) return;
+    voiceCaptureUtteranceCommitPending = true;
+    maybeCommitUtterance(
+      voiceCaptureInterimInsertion.input,
+      voiceCaptureInterimInsertion.position
+    );
+    return;
+  }
   if (eventName === "recording_stopped") {
     const recordingPath = String(event.path || voiceCaptureRecordingPath || "");
     const context = voiceCaptureContext || {};
     voiceCaptureRecordingPath = "";
     voiceCaptureContext = null;
+    const anchor = voiceCaptureInterimInsertion
+      ? { input: voiceCaptureInterimInsertion.input, position: voiceCaptureInterimInsertion.position }
+      : null;
+    const committedBytes = Math.max(0, Number(event.committed_bytes) || 0);
+    const totalBytes = Math.max(0, Number(event.total_bytes) || 0);
+    const speechBytes = Math.max(
+      committedBytes,
+      Math.min(totalBytes, Number(event.speech_bytes) || committedBytes)
+    );
+    // Releasing Alt must never lose words. Normally the streamed interim
+    // transcript is authoritative and we don't re-transcribe. But when talking
+    // quickly, interim snapshots lag the live audio; if un-committed speech
+    // remains after the last commit, only that tail region [committed_bytes,
+    // speech_bytes] is transcribed below and substituted for the provisional
+    // preview, so every word still lands.
+    // Prevent the aborted in-flight request from committing its partial text:
+    // its audio region is covered by the tail consolidation instead.
+    voiceCaptureUtteranceCommitPending = false;
+    voiceCaptureInterimInsertion = null;
+    if (voiceCaptureInterimController) {
+      try { voiceCaptureInterimController.abort(); } catch {}
+      voiceCaptureInterimController = null;
+    }
+    voiceCaptureInterimInFlight = false;
+    const previewAlreadyShown =
+      (voiceCaptureInterimResult &&
+        input === voiceCaptureInterimResult.input &&
+        inputCursorIndex === voiceCaptureInterimResult.cursorIndex) ||
+      (voiceCaptureCommittedText &&
+        input === composeUtterancePreview(
+          anchor ? anchor.input : input,
+          anchor ? anchor.position : inputCursorIndex,
+          voiceCaptureCommittedText,
+          ""
+        ).input);
+    const replacementBase = anchor
+      ? composeUtterancePreview(anchor.input, anchor.position, voiceCaptureCommittedText, "").input
+      : "";
+    voiceCaptureInterimResult = null;
+    voiceCaptureCommittedText = "";
+    voiceCaptureUtteranceCommitPending = false;
+    voiceCaptureInterimGeneration += 1;
     suppressVoiceEscapeKeypressUntil = Date.now() + 1500;
+    const cleanupRecording = () =>
+      fs.rm(recordingPath, { force: true }).catch(() => {});
     if (!isSafeVoiceCapturePath(recordingPath)) {
       setVoiceCaptureStatus("error", "Recording path rejected", VOICE_CAPTURE_STATUS_CLEAR_MS);
       return;
     }
-    setVoiceCaptureStatus("transcribing", "Transcribing...");
-    try {
-      const transcript = await requestVoiceTranscription(recordingPath, context);
+    const tailBytes = Math.max(0, speechBytes - committedBytes);
+    if (previewAlreadyShown && tailBytes <= VOICE_CAPTURE_TAIL_MIN_BYTES) {
       voiceCaptureState = "idle";
       voiceCaptureStatusText = "";
-      insertTranscribedText(transcript);
+      markDirty();
+      renderFrame(false);
+      await cleanupRecording();
+      return;
+    }
+    if (previewAlreadyShown) {
+      // Fast speech: the streamed preview lags behind the final recording.
+      // Transcribe only the un-committed speech tail
+      // [committed_bytes, speech_bytes] and substitute it for the provisional
+      // preview text so no words are lost.
+      setVoiceCaptureStatus("transcribing", "Transcribing...");
+      let lastApplied = { input: String(input || ""), cursorIndex: inputCursorIndex };
+      let lastTailText = "";
+      const applyTailText = (text) => {
+        if (
+          input !== lastApplied.input ||
+          inputCursorIndex !== lastApplied.cursorIndex
+        ) {
+          return; // user edited during consolidation; do not clobber
+        }
+        const normalized = String(text || "").replace(/\s+/g, " ").trim();
+        if (!normalized) return; // keep the provisional preview as-is
+        if (normalized === lastTailText) return; // delta+done deliver the same full text
+        lastTailText = normalized;
+        const next = replacementBase
+          ? `${replacementBase} ${normalized}`
+          : normalized;
+        input = next;
+        inputCursorIndex = input.length;
+        lastApplied = { input: String(next), cursorIndex: input.length };
+        updateCommandMenuState();
+        scrollChatToBottom();
+        markDirty();
+        renderFrame(false);
+      };
+      let tailStarted = false;
+      try {
+        const audio = await fs.readFile(recordingPath);
+        const dataBytes = Math.max(0, audio.length - 44);
+        const tailStart = 44 + Math.min(committedBytes, dataBytes);
+        const tailEnd = 44 + Math.min(speechBytes, dataBytes);
+        if (tailEnd > tailStart + VOICE_CAPTURE_TAIL_MIN_BYTES) {
+          const tailPath = path.join(
+            VOICE_CAPTURE_TEMP_DIR,
+            `tail-${Date.now()}-${voiceCaptureInterimGeneration}.wav`
+          );
+          await fs.writeFile(tailPath, buildWavPcmBuffer(audio.subarray(tailStart, tailEnd)));
+          tailStarted = true;
+          try {
+            await streamVoiceTranscription(tailPath, context, {
+              onDelta: (text) => applyTailText(text),
+              onDone: (text) => {
+                applyTailText(text);
+                voiceCaptureState = "idle";
+                voiceCaptureStatusText = "";
+                markDirty();
+                renderFrame(false);
+              },
+            });
+          } finally {
+            await fs.rm(tailPath, { force: true }).catch(() => {});
+          }
+        }
+      } catch {
+        // Tail consolidation failed; keep the streamed preview as-is and
+        // make sure the footer is not left stuck in "Transcribing".
+        voiceCaptureState = "idle";
+        voiceCaptureStatusText = "";
+        markDirty();
+        renderFrame(false);
+      }
+      if (!tailStarted) {
+        voiceCaptureState = "idle";
+        voiceCaptureStatusText = "";
+        markDirty();
+        renderFrame(false);
+      }
+      await cleanupRecording();
+      return;
+    }
+    // No interim ever landed (very short utterance or interim failures): run a
+    // single fallback transcription so the dictation is not lost. This stream
+    // REPLACES the provisional text on every delta (onDelta carries the full
+    // accumulated transcript), so onDone with the same full text is idempotent
+    // — there is never an append here, which previously doubled the text.
+    setVoiceCaptureStatus("transcribing", "Transcribing...");
+    let lastFallback = { input: String(input || ""), cursorIndex: inputCursorIndex };
+    const applyFinal = (text) => {
+      if (
+        input !== lastFallback.input ||
+        inputCursorIndex !== lastFallback.cursorIndex
+      ) {
+        return; // user edited during transcription; do not clobber
+      }
+      if (anchor) {
+        input = anchor.input;
+        inputCursorIndex = anchor.position;
+      }
+      insertTranscribedTextAtPosition(text, anchor ? anchor.position : inputCursorIndex);
+      lastFallback = { input: String(input || ""), cursorIndex: inputCursorIndex };
+    };
+    try {
+      await streamVoiceTranscription(recordingPath, context, {
+        onDelta: (text) => {
+          applyFinal(text);
+        },
+        onDone: (text) => {
+          applyFinal(text);
+          voiceCaptureState = "idle";
+          voiceCaptureStatusText = "";
+          markDirty();
+          renderFrame(false);
+        },
+      });
     } catch (error) {
+      const message =
+        error?.code === "ENOENT"
+          ? "recording could not be saved"
+          : (error?.message || String(error));
       setVoiceCaptureStatus(
         "error",
-        `Voice: ${error?.message || String(error)}`,
+        `Voice: ${message}`,
         VOICE_CAPTURE_STATUS_CLEAR_MS
       );
     } finally {
-      await fs.rm(recordingPath, { force: true }).catch(() => {});
+      await cleanupRecording();
     }
     return;
   }
   if (eventName === "error" || eventName === "unavailable") {
     voiceCaptureRecordingPath = "";
     voiceCaptureContext = null;
+    if (voiceCaptureInterimController) {
+      try { voiceCaptureInterimController.abort(); } catch {}
+      voiceCaptureInterimController = null;
+    }
+    voiceCaptureInterimInFlight = false;
+    if (voiceCaptureInterimInsertion) {
+      const anchor = {
+        input: voiceCaptureInterimInsertion.input,
+        position: voiceCaptureInterimInsertion.position,
+      };
+      const previewShown =
+        voiceCaptureInterimResult &&
+        input === voiceCaptureInterimResult.input &&
+        inputCursorIndex === voiceCaptureInterimResult.cursorIndex;
+      if (previewShown) {
+        input = anchor.input;
+        inputCursorIndex = anchor.position;
+        markDirty();
+        renderFrame(false);
+      }
+      voiceCaptureInterimInsertion = null;
+    }
+    voiceCaptureInterimResult = null;
+    voiceCaptureCommittedText = "";
+    voiceCaptureUtteranceCommitPending = false;
+    voiceCaptureInterimGeneration += 1;
+    voiceCaptureInterimInFlight = false;
     setVoiceCaptureStatus(
       "error",
       `Voice: ${event?.error || "recording failed"}`,
@@ -2276,7 +2892,10 @@ async function startVoiceCaptureHelper() {
         voiceCaptureStdoutBuffer = voiceCaptureStdoutBuffer.slice(newline + 1);
         try {
           const event = JSON.parse(line);
-          if (event?.event === "ready") becameReady = true;
+          if (event?.event === "ready") {
+            becameReady = true;
+            voiceCaptureLastAliveAt = Date.now();
+          }
           handleVoiceCaptureEvent(event).catch(() => {});
         } catch {
           // Ignore non-protocol helper output.
@@ -2291,13 +2910,18 @@ async function startVoiceCaptureHelper() {
         voiceCaptureProcess = null;
         voiceCaptureEnabledState = null;
       }
-      if (!becameReady && !cleanedUp) launch(index + 1);
-      else if (becameReady && !cleanedUp) {
+      if (!becameReady && !cleanedUp) {
+        launch(index + 1);
+      } else if (becameReady && !cleanedUp) {
+        // Unexpected helper exit: restore any half-finished voice state, show a
+        // brief notice, and relaunch so dictation keeps working.
+        handleVoiceCaptureCrashCleanup();
         setVoiceCaptureStatus(
           "error",
           "Voice recorder stopped",
           VOICE_CAPTURE_STATUS_CLEAR_MS
         );
+        scheduleVoiceCaptureRelaunch();
       }
     });
     syncVoiceCaptureHelperState();
