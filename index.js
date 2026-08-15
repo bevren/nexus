@@ -123,6 +123,10 @@ const CODE_BLOCK_BG_COLOR = "\u001b[48;5;236m";
 const SESSION_EVEN_BG_COLOR = "\u001b[48;2;24;24;24m";
 const SESSION_SELECTED_FG_COLOR = "\u001b[38;2;184;134;11m";
 const SESSION_MARKER_FG_COLOR = "\u001b[1m\u001b[38;2;218;165;32m";
+const AGENT_SELECTED_BG_COLOR = "\u001b[48;2;20;34;46m";
+const FOOTER_PLAN_COLOR = "\u001b[38;2;197;134;192m";
+const FOOTER_MODEL_COLOR = "\u001b[38;2;220;220;170m";
+const FOOTER_PATH_COLOR = "\u001b[38;2;181;206;168m";
 const CODE_BLOCK_FG_COLOR = "\u001b[38;5;252m";
 const CODE_BLOCK_KEYWORD_COLOR = "\u001b[38;5;81m";
 const CODE_BLOCK_STRING_COLOR = "\u001b[38;5;151m";
@@ -1370,6 +1374,7 @@ let bracketedPasteBuffer = "";
 let suppressKeypressUntil = 0;
 let suppressSolveEscapeKeypressUntil = 0;
 let suppressAgentMentionEscapeKeypressUntil = 0;
+let suppressRemoteControlEscapeKeypressUntil = 0;
 let suppressMouseNoiseUntil = 0;
 let ignoreNextProvidersEscape = false;
 let bracketedPasteModeEnabled = false;
@@ -10912,25 +10917,44 @@ function formatWorkspacePathForFooter(workspacePath) {
 function getMainFooterText() {
   const activeModel = getActiveSessionModel();
   const modelLabel = activeModel && activeModel.trim().length > 0 ? activeModel.trim() : "no model";
-  const contextLeft = Math.round(getActiveContextLeftPercent(activeModel));
-  const safeContextLeft = Math.max(0, Math.min(100, contextLeft));
-  const thinkingState = getActiveReasoningEnabled() ? "thinking on" : "thinking off";
-  const modeState = getActiveCollaborationMode() === "plan" ? "PLAN" : "BUILD";
-  let text = `${modeState} | Agent: ${activeAgentName} | Current model: ${modelLabel} | ${safeContextLeft}% context left | ${thinkingState}`;
-  const cacheTelemetry = getActiveCacheTelemetry(activeModel);
-  if (Number.isFinite(cacheTelemetry?.cachePercent)) {
-    text += ` | cache ${cacheTelemetry.cachePercent}%`;
+  const effort = normalizeThinkingEffort(getActiveSessionRuntimeSettings().thinking_effort);
+  const agentLabel = activeAgentName.toLowerCase() === "main" ? "Main" : activeAgentName;
+  return [
+    ...(getActiveCollaborationMode() === "plan" ? ["PLAN"] : []),
+    `${modelLabel} ${effort}`,
+    formatWorkspacePathForFooter(WORKSPACE_ROOT),
+    agentLabel,
+  ].join(" · ");
+}
+
+function getMainFooterStyledText(maxWidth = Number.POSITIVE_INFINITY) {
+  const activeModel = getActiveSessionModel();
+  const modelLabel = activeModel && activeModel.trim().length > 0 ? activeModel.trim() : "no model";
+  const effort = normalizeThinkingEffort(getActiveSessionRuntimeSettings().thinking_effort);
+  const agentLabel = activeAgentName.toLowerCase() === "main" ? "Main" : activeAgentName;
+  const segments = [
+    ...(getActiveCollaborationMode() === "plan"
+      ? [{ text: "PLAN", color: FOOTER_PLAN_COLOR }]
+      : []),
+    { text: `${modelLabel} ${effort}`, color: FOOTER_MODEL_COLOR },
+    { text: formatWorkspacePathForFooter(WORKSPACE_ROOT), color: FOOTER_PATH_COLOR },
+    { text: agentLabel, color: PLACEHOLDER_COLOR },
+  ];
+  let remaining = Math.max(0, Number(maxWidth));
+  let styled = "";
+  for (let index = 0; index < segments.length && remaining > 0; index += 1) {
+    if (index > 0) {
+      const separatorText = " · ".slice(0, remaining);
+      styled += `${PLACEHOLDER_COLOR}${separatorText}${RESET_COLOR}`;
+      remaining -= separatorText.length;
+      if (separatorText.length < 3 || remaining <= 0) break;
+    }
+    const visible = segments[index].text.slice(0, remaining);
+    styled += `${segments[index].color}${visible}${RESET_COLOR}`;
+    remaining -= visible.length;
+    if (visible.length < segments[index].text.length) break;
   }
-  const activeLoopCount = getLoopTaskCountForAgent();
-  if (activeLoopCount > 0) {
-    text += ` | ${activeLoopCount} loop${activeLoopCount === 1 ? "" : "s"} active`;
-  }
-  text += ` | ${formatWorkspacePathForFooter(WORKSPACE_ROOT)}`;
-  const mouseManuallyOff = APP_MOUSE_TRACKING_ENABLED && !mouseTrackingEnabled && !mouseSelectionMode;
-  if (mouseManuallyOff) {
-    text += " | drag to select/copy · Alt+S sessions · Alt+A agents · Alt+M mouse · PgUp/PgDn scroll";
-  }
-  return text;
+  return styled;
 }
 
 function getSessionsVisibleCount() {
@@ -11451,6 +11475,74 @@ async function pasteSessionTransferClipboard() {
     sessionTransferClipboard = null;
   }
   sessionsManagerMessage = `Pasted session file into ${sessionsOwnerAgent} and refreshed sessions.`;
+  await loadSessionFiles();
+  return true;
+}
+
+async function deletePlanStoreForRuntimeSession(runtimeSessionId) {
+  const planPath = getPlanStorePathForRuntimeSession(runtimeSessionId);
+  if (planPath) await fs.rm(planPath, { force: true }).catch(() => {});
+}
+
+async function deleteSelectedSessionFromBuffer() {
+  const selected = getFilteredSessionFiles()[sessionsSelected];
+  if (!selected) {
+    sessionsManagerMessage = "No session selected.";
+    return false;
+  }
+
+  if (selected.kind !== "named-agent") {
+    const sourceSessionId = String(selected.name || "").match(/^session-(.+)\.jsonl$/i)?.[1] || "";
+    const deletingCurrent = isCurrentTransferSource(selected);
+    if (deletingCurrent && isAssistantThinking()) {
+      sessionsManagerMessage = "Stop the main agent before deleting its current session.";
+      return false;
+    }
+    await fs.rm(selected.fullPath, { force: true });
+    await deletePlanStoreForRuntimeSession(sourceSessionId);
+    if (deletingCurrent) await resetMainSessionAfterCut();
+  } else {
+    const agent = getNamedAgentByName(selected.agentName);
+    const record = await readJsonObject(selected.fullPath);
+    if (!record) throw new Error("session file could not be read");
+    const runtimeSessionId = String(record?.runtime?.session_id || "");
+    if (selected.currentNamedSession) {
+      if (!agent) throw new Error("agent was not found");
+      if (getNamedAgentStatus(agent) === "running") {
+        sessionsManagerMessage = `Stop ${agent.name} before deleting its current session.`;
+        return false;
+      }
+      const reset = createNamedAgentRecord(agent.name);
+      reset.id = record.id || reset.id;
+      const carriedRuntime = normalizeNamedAgentSessionRuntime(record);
+      carriedRuntime.collaboration_mode = "build";
+      carriedRuntime.context_left_by_model = {};
+      carriedRuntime.cache_telemetry_by_model = {};
+      applyNamedAgentSessionRuntime(reset, carriedRuntime);
+      await writeJsonAtomic(agent.recordPath, reset);
+      await writeNamedAgentQueue(agent.recordPath, []);
+      removeLoopsForAgent(agent.name, { persist: false });
+      namedAgentUiNotices.delete(agent.name.toLowerCase());
+      await persistNamedAgentLoops();
+      await refreshNamedAgents();
+      if (activeAgentName.toLowerCase() === agent.name.toLowerCase()) {
+        switchToAgentSession(agent.name);
+      }
+    } else {
+      await fs.rm(selected.fullPath, { force: true });
+    }
+    await deletePlanStoreForRuntimeSession(runtimeSessionId);
+  }
+
+  if (
+    sessionTransferClipboard &&
+    path.resolve(String(sessionTransferClipboard.sourceEntry?.fullPath || "")).toLowerCase() ===
+      path.resolve(String(selected.fullPath || "")).toLowerCase()
+  ) {
+    await discardSessionTransferStaging();
+    sessionTransferClipboard = null;
+  }
+  sessionsManagerMessage = `Deleted “${selected.firstUserMessage || "Untitled session"}”.`;
   await loadSessionFiles();
   return true;
 }
@@ -12490,6 +12582,68 @@ async function stopNamedAgent(agent = getNamedAgentByName(), options = {}) {
   latest.messages.push({ role: "assistant", content: String(options.message || "■ Stopped by user.") });
   await writeJsonAtomic(agent.recordPath, latest);
   await refreshNamedAgents();
+  return true;
+}
+
+async function deleteSelectedNamedAgentFromBuffer() {
+  const selected = getAgentsListEntries()[agentsSelected];
+  if (!selected) {
+    agentsMessage = "No agent selected.";
+    return false;
+  }
+  if (String(selected.name || "").toLowerCase() === "main") {
+    agentsMessage = "The main agent cannot be deleted.";
+    return false;
+  }
+
+  const agent = getNamedAgentByName(selected.name);
+  if (!agent) {
+    agentsMessage = "Agent was not found.";
+    return false;
+  }
+  const agentKey = String(agent.name || "").toLowerCase();
+  const involvedInHandoff = Array.from(activeAgentHandoffs.values()).some((handoff) =>
+    String(handoff?.sourceAgent || "").toLowerCase() === agentKey ||
+    String(handoff?.agentName || "").toLowerCase() === agentKey
+  );
+  if (
+    getNamedAgentStatus(agent) === "running" ||
+    namedAgentDispatching.has(agent.recordPath) ||
+    involvedInHandoff
+  ) {
+    agentsMessage = `Stop ${agent.name} before deleting it.`;
+    return false;
+  }
+
+  const runtimeSessionIds = new Set();
+  const current = await readJsonObject(agent.recordPath, agent);
+  if (current?.runtime?.session_id) runtimeSessionIds.add(String(current.runtime.session_id));
+  const historyDir = getNamedAgentHistoryDir(agent.name);
+  for (const fileName of await fs.readdir(historyDir).catch(() => [])) {
+    if (!fileName.endsWith(".json")) continue;
+    const archived = await readJsonObject(path.join(historyDir, fileName));
+    if (archived?.runtime?.session_id) runtimeSessionIds.add(String(archived.runtime.session_id));
+  }
+
+  if (activeAgentName.toLowerCase() === agentKey) switchToAgentSession("main");
+  removeLoopsForAgent(agent.name, { persist: false });
+  namedAgentUiNotices.delete(agentKey);
+  await fs.rm(agent.recordPath, { force: true });
+  await fs.rm(getNamedAgentQueuePath(agent.recordPath), { force: true });
+  await fs.rm(historyDir, { recursive: true, force: true });
+  for (const runtimeSessionId of runtimeSessionIds) {
+    await deletePlanStoreForRuntimeSession(runtimeSessionId);
+  }
+  if (String(sessionTransferClipboard?.sourceOwner || "").toLowerCase() === agentKey) {
+    await discardSessionTransferStaging();
+    sessionTransferClipboard = null;
+  }
+  await persistNamedAgentLoops();
+  await refreshNamedAgents();
+  agentsSelected = Math.min(agentsSelected, Math.max(0, getAgentsListEntries().length - 1));
+  updateAgentsSelectionState();
+  agentsMessage = `Deleted agent ${agent.name}.`;
+  scheduleRemoteControlBroadcast({ force: true });
   return true;
 }
 
@@ -14082,6 +14236,15 @@ function updateAgentsSelectionState() {
   agentsScroll = Math.max(0, Math.min(agentsScroll, Math.max(0, entries.length - visibleCount)));
 }
 
+function selectActiveAgentInAgentsBuffer() {
+  const entries = getAgentsListEntries();
+  const activeIndex = entries.findIndex(
+    (agent) => String(agent.name || "").toLowerCase() === activeAgentName.toLowerCase()
+  );
+  agentsSelected = activeIndex >= 0 ? activeIndex : 0;
+  updateAgentsSelectionState();
+}
+
 function openAgentsBuffer() {
   const reuseAltScreen = altScreenActive;
   commandBufferQuery = "";
@@ -14089,9 +14252,9 @@ function openAgentsBuffer() {
   inputCursorIndex = 0;
   activeBuffer = "agents";
   enterAltScreenIfNeeded();
-  agentsSelected = 0;
-  agentsScroll = 0;
   agentsSearch = "";
+  agentsScroll = 0;
+  selectActiveAgentInAgentsBuffer();
   agentsMessage = "";
   lastAgentsRenderedRows = [];
   lastAgentsRenderedCols = 0;
@@ -14099,7 +14262,14 @@ function openAgentsBuffer() {
   forceFullClearOnNextRender = !reuseAltScreen;
   markDirty();
   renderFrame(true);
-  refreshNamedAgents().catch(() => {});
+  refreshNamedAgents()
+    .then(() => {
+      if (activeBuffer !== "agents") return;
+      selectActiveAgentInAgentsBuffer();
+      markDirty();
+      renderFrame(true);
+    })
+    .catch(() => {});
 }
 
 function closeAgentsBuffer(options = {}) {
@@ -18503,17 +18673,28 @@ function renderModelBuffer() {
   if (rows > 0) {
     const footerLine =
       `${" ".repeat(footerX)}${footer}`.slice(0, cols).padEnd(cols, " ");
-    frameRows[rows - 1] = { text: footerLine, color: null };
+    frameRows[rows - 1] = {
+      text: footerLine,
+      color: null,
+      styledText: `${" ".repeat(footerX)}${getMainFooterStyledText(cols - footerX)}`,
+    };
   }
 
   for (let y = 0; y < rows; y += 1) {
     const nextRow = frameRows[y];
     const prevRow = lastModelRenderedRows[y];
-    if (prevRow && prevRow.text === nextRow.text && prevRow.color === nextRow.color) {
+    if (
+      prevRow &&
+      prevRow.text === nextRow.text &&
+      prevRow.color === nextRow.color &&
+      prevRow.styledText === nextRow.styledText
+    ) {
       continue;
     }
 
-    if (nextRow.color === BLUE_COLOR) {
+    if (nextRow.styledText) {
+      writeStyledLine(y, nextRow.text, nextRow.styledText, cols);
+    } else if (nextRow.color === BLUE_COLOR) {
       writeColoredLine(y, nextRow.text, cols, BLUE_COLOR);
     } else if (nextRow.color === PLACEHOLDER_COLOR) {
       writeColoredLine(y, nextRow.text, cols, PLACEHOLDER_COLOR);
@@ -18634,7 +18815,7 @@ function renderSessionsBuffer() {
 
   setPanelRow(
     rows - 1,
-    "←/→ agent  Alt+C copy  Alt+X cut  Alt+V paste  Enter: resume  Esc: return",
+    "←/→ agent  Alt+C copy  Alt+X cut  Alt+V paste  Del delete  Enter: resume  Esc: return",
     PLACEHOLDER_COLOR
   );
 
@@ -18714,18 +18895,21 @@ function renderAgentsBuffer() {
     const marker = selected ? "›" : current ? "●" : "○";
     const status = String(agent.status || "idle").padEnd(8, " ");
     const plain = `${marker} ${status} ${agent.name}`.slice(0, panelWidth).padEnd(panelWidth, " ");
-    const background = index % 2 === 1 ? SESSION_EVEN_BG_COLOR : "";
+    const background = selected
+      ? AGENT_SELECTED_BG_COLOR
+      : index % 2 === 1 ? SESSION_EVEN_BG_COLOR : "";
     const statusColor = agent.status === "running"
       ? SESSION_MARKER_FG_COLOR
       : agent.status === "stopped" ? RED_COLOR : PLACEHOLDER_COLOR;
-    const foreground = selected || current ? SESSION_SELECTED_FG_COLOR : "";
-    const styled = `${background}${selected ? SESSION_MARKER_FG_COLOR : current ? SESSION_MARKER_FG_COLOR : PLACEHOLDER_COLOR}${marker}${RESET_COLOR}` +
+    const foreground = selected ? WHITE_COLOR : current ? VSCODE_BLUE_COLOR : "";
+    const styled = `${background}${selected || current ? VSCODE_BLUE_COLOR : PLACEHOLDER_COLOR}${marker}${RESET_COLOR}` +
       `${background} ${statusColor}${status}${RESET_COLOR}` +
       `${background}${foreground} ${String(agent.name).slice(0, Math.max(0, panelWidth - 12))}${RESET_COLOR}`;
-    setRow(2 + index - agentsScroll, plain, `${styled}${" ".repeat(Math.max(0, panelWidth - stripAnsiSgr(styled).length))}`);
+    const rowPadding = " ".repeat(Math.max(0, panelWidth - stripAnsiSgr(styled).length));
+    setRow(2 + index - agentsScroll, plain, `${styled}${background}${rowPadding}${RESET_COLOR}`);
   }
   if (agentsMessage) setRow(Math.max(2, rows - 2), agentsMessage, `${PLACEHOLDER_COLOR}${agentsMessage}${RESET_COLOR}`);
-  setRow(rows - 1, "Enter: switch session  Esc: return", `${PLACEHOLDER_COLOR}${"Enter: switch session  Esc: return"}${RESET_COLOR}`);
+  setRow(rows - 1, "Del: delete agent  Enter: switch session  Esc: return", `${PLACEHOLDER_COLOR}${"Del: delete agent  Enter: switch session  Esc: return"}${RESET_COLOR}`);
 
   for (let y = 0; y < rows; y += 1) {
     const next = frameRows[y];
@@ -19279,6 +19463,7 @@ function renderFrame(forceChatRefresh = false) {
     rowMap.set(footerTop, {
       type: "footer",
       text: getMainFooterText(),
+      styledText: getMainFooterStyledText(cols),
     });
   }
 
@@ -19298,7 +19483,7 @@ function renderFrame(forceChatRefresh = false) {
     } else if (row.type === "muted") {
       writeColoredLine(y, row.text, cols, PLACEHOLDER_COLOR);
     } else if (row.type === "footer") {
-      writeColoredLine(y, row.text, cols, PLACEHOLDER_COLOR);
+      writeStyledLine(y, row.text, row.styledText || row.text, cols);
     } else if (row.type === "status") {
       if (row.text) {
         writeColoredLine(y, row.text, cols, PLACEHOLDER_COLOR);
@@ -20484,6 +20669,9 @@ function runFormatSelfTest() {
     const savedNamedAgentsForRuntime = namedAgents;
     const savedActiveAgentForRuntime = activeAgentName;
     const savedActiveNamedMessagesForRuntime = activeNamedAgentMessages;
+    const savedAgentsSearchForRuntime = agentsSearch;
+    const savedAgentsSelectedForRuntime = agentsSelected;
+    const savedAgentsScrollForRuntime = agentsScroll;
     const mainModeBeforeNamedRuntime = collaborationMode;
     const mainModelBeforeNamedRuntime = selectedModel;
     let namedRuntimeIsolationOk = false;
@@ -20518,12 +20706,17 @@ function runFormatSelfTest() {
       namedAgents = [workerRuntimeFixture];
       activeAgentName = "runtime-worker";
       activeNamedAgentMessages = namedAgentMessagesForDisplay(workerRuntimeFixture);
+      agentsSearch = "";
+      agentsSelected = 0;
+      agentsScroll = 0;
+      selectActiveAgentInAgentsBuffer();
       const workerSettings = getRuntimeSettings();
       const workerPrompt = buildNamedAgentSystemPrompt(
         workerRuntimeFixture,
         normalizeNamedAgentSessionRuntime(workerRuntimeFixture)
       );
       const workerFooter = getMainFooterText();
+      const workerStyledFooter = getMainFooterStyledText();
       namedRuntimeIsolationOk =
         getActiveSessionModel() === "worker-model" &&
         getActiveCollaborationMode() === "plan" &&
@@ -20533,9 +20726,11 @@ function runFormatSelfTest() {
         workerSettings.find((setting) => setting.key === "thinking_effort")?.value === "xhigh" &&
         workerSettings.find((setting) => setting.key === "context_window")?.value === 256000 &&
         workerSettings.find((setting) => setting.key === "request_timeout")?.value === 120000 &&
-        workerFooter.includes("PLAN | Agent: runtime-worker") &&
-        workerFooter.includes("37% context left") &&
-        workerFooter.includes("cache 82%") &&
+        workerFooter === `PLAN · worker-model xhigh · ${formatWorkspacePathForFooter(WORKSPACE_ROOT)} · runtime-worker` &&
+        workerStyledFooter.includes(`${FOOTER_PLAN_COLOR}PLAN${RESET_COLOR}`) &&
+        workerStyledFooter.includes(`${FOOTER_MODEL_COLOR}worker-model xhigh${RESET_COLOR}`) &&
+        workerStyledFooter.includes(`${FOOTER_PATH_COLOR}${formatWorkspacePathForFooter(WORKSPACE_ROOT)}${RESET_COLOR}`) &&
+        agentsSelected === 1 &&
         workerPrompt.includes("PLAN MODE (MANDATORY)") &&
         !workerPrompt.includes("write_file") &&
         collaborationMode === mainModeBeforeNamedRuntime &&
@@ -20544,6 +20739,9 @@ function runFormatSelfTest() {
       namedAgents = savedNamedAgentsForRuntime;
       activeAgentName = savedActiveAgentForRuntime;
       activeNamedAgentMessages = savedActiveNamedMessagesForRuntime;
+      agentsSearch = savedAgentsSearchForRuntime;
+      agentsSelected = savedAgentsSelectedForRuntime;
+      agentsScroll = savedAgentsScrollForRuntime;
     }
     if (!namedRuntimeIsolationOk) {
       out("FORMAT_FAIL: named agent runtime state leaked into the main session\n");
@@ -23581,7 +23779,9 @@ process.stdin.on("data", (rawChunk) => {
   } else if (activeBuffer === "settings" && chunk === "\u001b") {
     closeSettingsBuffer();
   } else if (activeBuffer === "remote_control" && chunk === "\u001b") {
+    suppressRemoteControlEscapeKeypressUntil = Date.now() + 1500;
     closeRemoteControlBuffer();
+    return;
   } else if (activeBuffer === "mcp" && chunk === "\u001b") {
     closeMcpBuffer();
   } else if (activeBuffer === "loops" && chunk === "\u001b") {
@@ -23654,6 +23854,10 @@ process.stdin.on("keypress", async (str, key) => {
   }
   if (isEscapeKey && Date.now() < suppressAgentMentionEscapeKeypressUntil) {
     suppressAgentMentionEscapeKeypressUntil = 0;
+    return;
+  }
+  if (isEscapeKey && Date.now() < suppressRemoteControlEscapeKeypressUntil) {
+    suppressRemoteControlEscapeKeypressUntil = 0;
     return;
   }
   const hasMouseNoise =
@@ -23913,6 +24117,17 @@ process.stdin.on("keypress", async (str, key) => {
       return;
     }
 
+    if (key?.name === "delete" || key?.sequence === "\u001b[3~") {
+      try {
+        await deleteSelectedSessionFromBuffer();
+      } catch (error) {
+        sessionsManagerMessage = `Could not delete session: ${error?.message || String(error)}`;
+      }
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+
     if (key?.name === "backspace") {
       if (sessionsSearch.length > 0) {
         sessionsSearch = sessionsSearch.slice(0, -1);
@@ -23960,6 +24175,17 @@ process.stdin.on("keypress", async (str, key) => {
           ? Math.max(0, agentsSelected - 1)
           : Math.min(entries.length - 1, agentsSelected + 1);
         updateAgentsSelectionState();
+      }
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+
+    if (key?.name === "delete" || key?.sequence === "\u001b[3~") {
+      try {
+        await deleteSelectedNamedAgentFromBuffer();
+      } catch (error) {
+        agentsMessage = `Could not delete agent: ${error?.message || String(error)}`;
       }
       markDirty();
       renderFrame(true);
