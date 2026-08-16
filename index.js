@@ -318,6 +318,7 @@ const REMOTE_CONTROL_HTML = String.raw`<!doctype html>
     .message.assistant del { color:#888; }
     .task-marker { display:inline-block; width:20px; color:var(--dim); }
     .message.tool { color:#bdbdbd; padding:10px 12px; border-left:2px solid var(--blue); background:var(--panel); }
+    .message.tool .tool-header { color:#e8e8e8; font-weight:600; margin-bottom:6px; }
     .message.reasoning { color:var(--dim); font-style:italic; }
     .message.reasoning .role { display:none; }
     .message.reasoning::before { content:'◦ '; color:#666; }
@@ -921,6 +922,15 @@ const REMOTE_CONTROL_HTML = String.raw`<!doctype html>
             }
           });
           return;
+        }
+        if (message.role === 'tool' && (message.header || message.code)) {
+          if (message.header) {
+            var header = document.createElement('div'); header.className = 'tool-header'; header.textContent = message.header; item.appendChild(header);
+          }
+          if (message.code) {
+            var toolCode = document.createElement('pre'); toolCode.className = 'code';
+            appendHighlightedPython(toolCode, message.code); item.appendChild(toolCode);
+          }
         }
         var body = document.createElement('span'); body.textContent = message.content; item.appendChild(body);
       }
@@ -3003,6 +3013,36 @@ async function runPythonCommand(args, options = {}) {
   return execFileAsync("py", ["-3", ...args], mergedOptions);
 }
 
+function killChildProcessTree(child) {
+  if (!child || !Number.isFinite(Number(child.pid)) || child.exitCode !== null) {
+    return;
+  }
+  if (process.platform === "win32") {
+    try {
+      spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+        windowsHide: true,
+        timeout: 5000,
+        stdio: "ignore",
+      });
+      return;
+    } catch {
+      // fall through to direct child termination
+    }
+  } else {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+      return;
+    } catch {
+      // fall through to direct child termination
+    }
+  }
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    // process already exited
+  }
+}
+
 function spawnPythonCommandStreaming(args, options = {}) {
   const mergedOptions = {
     cwd: process.cwd(),
@@ -3064,7 +3104,7 @@ function spawnPythonCommandStreaming(args, options = {}) {
       if (stdout.length + stderr.length > maxBuffer) {
         const error = new Error(`Python output exceeded ${maxBuffer} bytes`);
         error.code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
-        try { child.kill("SIGKILL"); } catch {}
+        killChildProcessTree(child);
         finish(error);
       }
     };
@@ -3086,7 +3126,7 @@ function spawnPythonCommandStreaming(args, options = {}) {
         const error = new Error(`Python execution timed out after ${Math.round(timeoutMs / 1000)}s`);
         error.code = "ETIMEDOUT";
         error.killed = true;
-        try { child.kill("SIGKILL"); } catch {}
+        killChildProcessTree(child);
         finish(error);
       }, timeoutMs);
       timer.unref?.();
@@ -3254,6 +3294,7 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "- If a relevant MCP server is configured, use mcp_search(query='capability needed') and then mcp_search(action='call', server='...', tool='...', args={...}) before trying web or direct HTTP.",
     "- Fall back to web_search, fetch_url, or direct APIs only when no relevant MCP server is configured or the relevant MCP call fails. Briefly preserve the MCP failure in the tool result/context so the fallback is explainable.",
     "- Deferred MCP schemas are not a reason to skip MCP discovery; mcp_search is the required discovery and call boundary.",
+    "- When a context7 MCP server is configured, prefer it over web_search/fetch_url for code-related lookups: library/framework APIs, syntax, version-specific docs, migration guides, and code examples. Call context7 resolve-library-id first (libraryName + query, both required), then context7 query-docs with the resolved libraryId and the specific question (maxResults optional). Fall back to web_search only when context7 is not configured or its call fails.",
     "",
     "COLLABORATION MODE (MUST FOLLOW):",
     ...(planModeActive
@@ -3619,11 +3660,7 @@ class McpStdioClientReal {
       this.child = null;
       await new Promise((resolve) => {
         const timer = setTimeout(() => {
-          try {
-            child.kill();
-          } catch {
-            // ignore
-          }
+          killChildProcessTree(child);
           resolve();
         }, 1500);
         child.once("exit", () => {
@@ -16491,11 +16528,34 @@ function buildRemoteControlStatus() {
   };
 }
 
+function getRemoteToolHeader(message) {
+  const name = typeof message?.name === "string" && message.name ? message.name : "code_execution";
+  const editSummary = extractEditSummaryFromToolOutput(
+    typeof message?.content === "string" ? message.content : ""
+  );
+  if (editSummary) return editSummary;
+  return message?.live === true ? `Running ${name}` : `Ran ${name}`;
+}
+
+function getRemoteToolCode(message) {
+  if (message?.name !== "code_execution") return "";
+  if (typeof message?.toolCallId !== "string" || !message.toolCallId) return "";
+  return typeof message.toolInput === "string" ? message.toolInput : "";
+}
+
 function getRemoteControlVisibleMessages() {
   const visible = getActiveChatEntries().filter((message) => {
     if (!message || message.hidden === true || message.role === "system") return false;
     if (isCompactionSummaryEntry(message)) return false;
     if (message.ephemeral === true && !String(message.content || "").trim()) return false;
+    if (
+      message.role === "assistant" &&
+      !String(message.content || "").trim() &&
+      Array.isArray(message.toolCalls) &&
+      message.toolCalls.length > 0
+    ) {
+      return false;
+    }
     return ["user", "assistant", "tool", "error"].includes(message.role);
   });
   const remoteMessages = [];
@@ -16531,6 +16591,11 @@ function getRemoteControlVisibleMessages() {
         : raw;
     }
     const entry = { role: message.role, content };
+    if (message.role === "tool") {
+      entry.header = getRemoteToolHeader(message);
+      const code = getRemoteToolCode(message);
+      if (code.trim()) entry.code = code;
+    }
     if (message.role === "assistant") {
       const annotated = annotateAssistantCodeBlocks(content);
       const blocks = [];
@@ -23433,6 +23498,7 @@ function runFormatSelfTest() {
       !deferredPrompt.includes("first call mcp_search(action='list')") ||
       !deferredPrompt.includes("before trying web or direct HTTP") ||
       !deferredPrompt.includes("Deferred MCP schemas are not a reason to skip MCP discovery") ||
+      !deferredPrompt.includes("When a context7 MCP server is configured, prefer it over web_search/fetch_url") ||
       !deferredPrompt.includes("manage_skill(name") ||
       !deferredPrompt.includes("harness_overview()") ||
       !deferredPrompt.includes("harness_memory(key") ||
