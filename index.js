@@ -53,11 +53,30 @@ Commit & Pull Request Guidelines
 const EXECUTION_RESULT_BOUNDARY_PROMPT_LINES = [
   "",
   "EXECUTION RESULT BOUNDARY (MANDATORY):",
-  "- Writing an execute block only requests execution. It is never evidence that the block ran or succeeded.",
-  "- End the assistant response immediately after the closing execute fence. Never predict, narrate, or claim the block's result in that same response.",
+  "- Calling code_execution only requests execution. It is never evidence that the code ran or succeeded.",
   "- Wait for the subsequent code_execution tool result before describing any output or claiming that a read, edit, command, MCP call, subagent action, or other operation worked.",
   "- Judge success from the actual result, including nested fields such as ok, exit_code, error, stderr, timed_out, and tool-specific failure payloads. A successful wrapper does not make an inner {ok: false} operation successful.",
-  "- If no code_execution result appears, treat the block as not executed and its outcome as unknown. Do not invent output; retry with a valid complete execute block when appropriate.",
+  "- If no code_execution result appears, treat the code as not executed and its outcome as unknown. Do not invent output; retry with a valid code_execution call when appropriate.",
+];
+
+const CODE_EXECUTION_TOOL_SCHEMA = [
+  {
+    type: "function",
+    function: {
+      name: "code_execution",
+      description: "Run Python code with the Nexus helper functions available in scope. Pass the Python source as the code argument. Helper functions (file read/write/edit, shell, search, plans, subagents, MCP, and more) are listed in the system prompt and are called directly inside the code.",
+      parameters: {
+        type: "object",
+        properties: {
+          code: {
+            type: "string",
+            description: "Python source to execute. Call helper functions directly, e.g. get_file_content(path='x'), write_file(path='x', content='...'), run_shell(command='...').",
+          },
+        },
+        required: ["code"],
+      },
+    },
+  },
 ];
 const NEXUS_START_DATE = (() => {
   const now = new Date();
@@ -127,6 +146,9 @@ const AGENT_SELECTED_BG_COLOR = "\u001b[48;2;20;34;46m";
 const FOOTER_PLAN_COLOR = "\u001b[38;2;197;134;192m";
 const FOOTER_MODEL_COLOR = "\u001b[38;2;220;220;170m";
 const FOOTER_PATH_COLOR = "\u001b[38;2;181;206;168m";
+const FOOTER_CONTEXT_OK_COLOR = "\u001b[38;2;181;206;168m";
+const FOOTER_CONTEXT_WARN_COLOR = "\u001b[38;2;220;220;170m";
+const FOOTER_CONTEXT_HIGH_COLOR = "\u001b[38;2;255;120;120m";
 const CODE_BLOCK_FG_COLOR = "\u001b[38;5;252m";
 const CODE_BLOCK_KEYWORD_COLOR = "\u001b[38;5;81m";
 const CODE_BLOCK_STRING_COLOR = "\u001b[38;5;151m";
@@ -208,6 +230,7 @@ const COMPACTION_DEFAULT_CUSTOM_INSTRUCTION =
 const MAX_REASONING_DISPLAY_CHARS = 4000;
 const MAX_INPUT_HISTORY_ITEMS = 500;
 const DEFAULT_LLM_REQUEST_TIMEOUT_MS = 120000;
+const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
 const DEFAULT_MODEL_CONTEXT_WINDOW = 1000000;
 const DEFAULT_THINKING_EFFORT = "high";
 const THINKING_EFFORT_OPTIONS = ["low", "high", "xhigh", "max"];
@@ -774,6 +797,28 @@ const REMOTE_CONTROL_HTML = String.raw`<!doctype html>
           var line = lines[index];
           if (!line.trim()) { index += 1; continue; }
 
+          var xmlFence = line.match(/^\s{0,3}<execute[ \t]*>/i);
+          if (xmlFence) {
+            var codeLines = [];
+            var inlineCode = line.slice(line.indexOf('>') + 1);
+            var inlineClose = /<\/execute>/i.exec(inlineCode);
+            if (inlineClose) {
+              codeLines.push(inlineCode.slice(0, inlineClose.index));
+              index += 1;
+            } else {
+              if (inlineCode.trim()) codeLines.push(inlineCode);
+              index += 1;
+              while (index < lines.length) {
+                var closing = lines[index].trim();
+                if (/^<\/execute>\s*$/i.test(closing)) { index += 1; break; }
+                codeLines.push(lines[index]); index += 1;
+              }
+            }
+            var pre = document.createElement('pre'); pre.className = 'code';
+            appendHighlightedPython(pre, codeLines.join('\n'));
+            parent.appendChild(pre); continue;
+          }
+
           var fence = line.match(/^\s{0,3}((?:\x60){3,}|~{3,})\s*([^\s]*)\s*$/);
           if (fence) {
             var fenceChar = fence[1][0];
@@ -1159,7 +1204,7 @@ const FALLBACK_TOOL_DESCRIPTIONS = {
   notify_agent:
     "notify_agent(name: str, task: str) -> dict: Start a task in an idle named Nexus agent and return immediately after admission. This is fire-and-forget: do not wait or poll unless the user later asks. Returns {ok, agent, status, pid|error}.",
   tool_search:
-    "tool_search(query: str, limit: int = 5) -> dict: Search deferred built-in helper names and descriptions. Returns only the most relevant helper signatures; call the discovered helper in a later execute block.",
+    "tool_search(query: str, limit: int = 5) -> dict: Search deferred built-in helper names and descriptions. Returns only the most relevant helper signatures; call the discovered helper in a later code_execution call.",
   harness_overview:
     "harness_overview() -> dict: Continual harness overview: memories, skills, subagent templates, prompt notes, refinements.",
   harness_memory:
@@ -3165,26 +3210,14 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
       "- Before finishing, call create_plan or update_plan with ordered, concrete tasks. Do not implement until the user exits with /plan or /plan off.",
       "",
       "TOOL USAGE FORMAT (MANDATORY):",
-      "- If inspection or plan updates are needed, output exactly one fenced ````execute code block and no surrounding prose.",
-      "- Use four backticks by default. If the Python contains four consecutive backticks, use an outer fence longer than any backtick run inside the code.",
-      "- Call the provided helpers directly. Imports, raw file access, arbitrary functions, and unlisted helpers are blocked.",
-      "- Keep each execute block compact; if truncated, retry with a smaller complete block.",
+      "- When inspection or plan updates are needed, call the code_execution function with a code argument holding the Python to run, and no surrounding prose.",
+      "- Call the provided helpers directly inside the code. Imports, raw file access, arbitrary functions, and unlisted helpers are blocked.",
+      "- Keep each code_execution call compact; if truncated, retry with a smaller complete code block.",
       ...EXECUTION_RESULT_BOUNDARY_PROMPT_LINES,
       "",
-      "EXAMPLE:",
-      "````execute",
-      "print(get_file_list('.'))",
-      "print(get_file_content('package.json', start_line=1, end_line=120))",
-      "````",
+      "EXAMPLE: call code_execution with code = print(get_file_list('.')) then print(get_file_content('package.json', start_line=1, end_line=120)).",
       "",
-      "PLAN EXAMPLE:",
-      "````execute",
-      "print(create_plan([",
-      "    'Inspect the relevant architecture and constraints',",
-      "    'Implement the scoped changes',",
-      "    'Add focused regression tests and verify the result',",
-      "]))",
-      "````",
+      "PLAN EXAMPLE: call code_execution with code = print(create_plan(['Inspect the relevant architecture and constraints', 'Implement the scoped changes', 'Add focused regression tests and verify the result'])).",
       "",
       "Allowed Python helper functions:",
       ...(lines.length > 0 ? lines : ["- (none)"]),
@@ -3205,7 +3238,7 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
       ? [
           "",
           "EXTERNAL THINKING (MUST FOLLOW):",
-          "- Native model thinking is disabled. Before complex reasoning, call deep_think(\"your deliberate thought\") in an execute block, then continue from its acknowledgement.",
+          "- Native model thinking is disabled. Before complex reasoning, call deep_think(\"your deliberate thought\") in a code_execution call, then continue from its acknowledgement.",
           "- Use deep_think for reasoning only; do not place file edits, shell commands, secrets, or user-facing answers inside it.",
         ]
       : []),
@@ -3239,25 +3272,19 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "SUBAGENT ORCHESTRATION (MUST FOLLOW):",
     "- delegate_agent(name, task) hands work to a persistent named Nexus agent and waits for its final result. Use it when your next step depends on that named agent's answer.",
     "- notify_agent(name, task) starts a persistent named Nexus agent and returns immediately after admission. Use it for fire-and-forget work; do not poll or wait unless the user later asks.",
-    "- rlm_spawn children are persistent full Nexus agent processes with no tool-turn ceiling. They inherit the active provider/model, this system prompt, execute-block loop, workspace, and tool chain; they may inspect, create, edit, execute, and verify within the delegated scope.",
-    "- rlm_spawn is non-blocking: it returns an admitted handle immediately. End the spawn block, then continue useful independent parent work on subsequent turns. call wait_subagents only later, when the next step truly depends on child completion, because wait_subagents intentionally blocks.",
+    "- rlm_spawn children are persistent full Nexus agent processes with no tool-turn ceiling. They inherit the active provider/model, this system prompt, code_execution loop, workspace, and tool chain; they may inspect, create, edit, execute, and verify within the delegated scope.",
+    "- rlm_spawn is non-blocking: it returns an admitted handle immediately. End the spawn code_execution call, then continue useful independent parent work on subsequent turns. call wait_subagents only later, when the next step truly depends on child completion, because wait_subagents intentionally blocks.",
     "- Delegate independent, non-overlapping tasks and include task-specific context in each prompt. Because all children share the workspace, never assign overlapping file ownership concurrently.",
-    "- A spawn execute block must only launch workers, print/return their admission handles, and end immediately. Never call join/await/wait_subagents, sleep, poll files, or run a status loop in that same block. Workers continue in the background after the block ends.",
-    "- Collect results in a later execute block with list_subagents() for a non-blocking snapshot, or wait_subagents([id1, id2, ...], timeout=...) only when the parent has no independent work left and genuinely needs the results.",
+    "- A spawn code_execution call must only launch workers, print/return their admission handles, and end immediately. Never call join/await/wait_subagents, sleep, poll files, or run a status loop in that same call. Workers continue in the background after the call ends.",
+    "- Collect results in a later code_execution call with list_subagents() for a non-blocking snapshot, or wait_subagents([id1, id2, ...], timeout=...) only when the parent has no independent work left and genuinely needs the results.",
     "- Do not treat a running status, elapsed polling time, or not-yet-created workspace files as failure. Inspect each terminal status, result, and error before drawing conclusions.",
     "- After collection, synthesize results and run parent-side integration verification. Never claim child workspace isolation prevented completion; children share the same working directory.",
     "",
     "TOOL USAGE FORMAT (MANDATORY):",
-    "- If tool use is needed, output exactly one fenced ````execute code block.",
-    "- Execute fences may use three or more backticks; use four by default.",
-    "- The outer fence must be longer than every consecutive backtick run inside the Python code.",
-    "- Only execute-labeled fences are executed by the app.",
-    "- Never use ```python blocks for executable tool calls (those are treated as plain text/demo).",
-    "- Do not output JSON like {\"tool\": \"...\", \"arguments\": {...}}.",
-    "- Do not output tool_call payloads, XML, YAML, or pseudo function-call objects.",
-    "- Call helper functions directly in Python code.",
-    "- For tool-use replies, include no prose before or after the execute block.",
-    "- Keep execute blocks compact. If an execute block is reported as truncated, retry with a smaller complete block.",
+    "- For tool use, call the code_execution function with a code argument containing Python that calls the helper functions below. Do not add prose around the call.",
+    "- Call helper functions directly inside the code. Do not import modules, open raw files, or use unlisted functions.",
+    "- Do not output raw JSON or pseudo function-call objects; use the code_execution function instead.",
+    "- Keep each code_execution call compact; if truncated, retry with a smaller complete code block.",
     ...EXECUTION_RESULT_BOUNDARY_PROMPT_LINES,
     "",
     "FILE EDIT STRATEGY (MANDATORY):",
@@ -3267,31 +3294,11 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "- Before replacing, read context only if needed (missing or stale).",
     "- If the relevant code is already present in recent conversation/tool output, do not call read tools again.",
     "",
-    "VALID TOOL-USE RESPONSE EXAMPLE 1:",
-    "````execute",
-    "cwd = get_current_working_directory()",
-    "print(cwd)",
-    "print(get_file_list(\".\"))",
-    "````",
+    "VALID TOOL-USE RESPONSE EXAMPLE 1: call code_execution with code = cwd = get_current_working_directory(); print(cwd); print(get_file_list('.')).",
     "",
-    "VALID SEARCH RESPONSE EXAMPLE:",
-    "````execute",
-    "matches = find_in_file(",
-    "    path=\"index.js\",",
-    "    query=\"buildSystemPromptFromDescriptions\",",
-    "    use_regex=False,",
-    "    max_results=5,",
-    ")",
-    "print(matches)",
-    "````",
+    "VALID SEARCH RESPONSE EXAMPLE: call code_execution with code = matches = find_in_file(path='index.js', query='buildSystemPromptFromDescriptions', use_regex=False, max_results=5); print(matches).",
     "",
-    "VALID FILE-EDIT RESPONSE EXAMPLE:",
-    "````execute",
-    "snippet = get_file_content(\"index.js\", start_line=120, end_line=170)",
-    "old = \"const RETRY_COUNT = 2\"",
-    "new = \"const RETRY_COUNT = 3\"",
-    "print(replace_in_file(\"index.js\", old, new, count=1))",
-    "````",
+    "VALID FILE-EDIT RESPONSE EXAMPLE: call code_execution with code = snippet = get_file_content('index.js', start_line=120, end_line=170); old = 'const RETRY_COUNT = 2'; new = 'const RETRY_COUNT = 3'; print(replace_in_file('index.js', old, new, count=1)).",
     "",
     "INVALID RESPONSE EXAMPLE (NEVER DO THIS):",
     "{\"tool\": \"get_file_list\", \"arguments\": {\"path\": \".\"}}",
@@ -3316,15 +3323,22 @@ async function loadToolDescriptionsFromPython() {
   try {
     const { stdout } = await runPythonCommand([TOOLS_SCRIPT_PATH, "--describe-json"], {
       timeout: 3000,
-      maxBuffer: 256 * 1024,
+      maxBuffer: 512 * 1024,
     });
     const parsed = JSON.parse(String(stdout || "{}"));
     if (!parsed || typeof parsed !== "object") {
       return { ...FALLBACK_TOOL_DESCRIPTIONS };
     }
 
+    // New shape: { descriptions: {name: str}, schemas: [...] }. The legacy flat
+    // map ({name: str}) is still tolerated for backward compatibility.
+    const descriptionSource =
+      parsed.descriptions && typeof parsed.descriptions === "object"
+        ? parsed.descriptions
+        : parsed;
+
     const cleaned = {};
-    for (const [name, description] of Object.entries(parsed)) {
+    for (const [name, description] of Object.entries(descriptionSource)) {
       if (typeof name === "string" && typeof description === "string") {
         cleaned[name] = description;
       }
@@ -5289,6 +5303,20 @@ async function rewriteSessionWithCurrentMessages() {
       if (typeof entry?.uiContent === "string") {
         payload.uiContent = entry.uiContent;
       }
+      if (Array.isArray(entry?.toolCalls) && entry.toolCalls.length > 0) {
+        payload.toolCalls = entry.toolCalls
+          .filter((call) => call && typeof call === "object" && String(call?.function?.name || "").trim())
+          .map((call) => ({
+            id: String(call.id || ""),
+            type: String(call.type || "function"),
+            function: {
+              name: String(call.function.name),
+              arguments: typeof call.function.arguments === "string"
+                ? call.function.arguments
+                : JSON.stringify(call.function.arguments ?? {}),
+            },
+          }));
+      }
       if (entry?.hidden === true) {
         payload.hidden = true;
       }
@@ -5713,6 +5741,12 @@ function normalizeRuntimeModelId(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function normalizeLlmMaxOutputTokens(value) {
+  const raw = Number(value);
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_MAX_OUTPUT_TOKENS;
+  return Math.max(256, Math.min(65536, Math.floor(raw)));
+}
+
 function getDefaultSessionRuntimeSettings() {
   return {
     thinking_blocks: nexusConfig?.show_thinking_blocks !== false,
@@ -5723,6 +5757,7 @@ function getDefaultSessionRuntimeSettings() {
     vision_model: normalizeRuntimeModelId(nexusConfig?.vision_model),
     context_window: normalizeModelContextWindow(nexusConfig?.model_context_window_override),
     request_timeout_ms: normalizeLlmRequestTimeoutMs(nexusConfig?.llm_request_timeout_ms),
+    max_output_tokens: normalizeLlmMaxOutputTokens(nexusConfig?.max_output_tokens),
     mcp_disabled_servers: [],
   };
 }
@@ -5762,6 +5797,9 @@ function normalizeSessionRuntimeSettings(raw, defaults = getDefaultSessionRuntim
     context_window: normalizeModelContextWindow(source.context_window ?? defaults.context_window),
     request_timeout_ms: normalizeLlmRequestTimeoutMs(
       source.request_timeout_ms ?? defaults.request_timeout_ms
+    ),
+    max_output_tokens: normalizeLlmMaxOutputTokens(
+      source.max_output_tokens ?? defaults.max_output_tokens
     ),
     mcp_disabled_servers: normalizeMcpDisabledServers(
       source.mcp_disabled_servers ?? defaults.mcp_disabled_servers
@@ -5939,6 +5977,7 @@ async function ensureNexusConfigFileReady() {
     provider: DEFAULT_PROVIDERS[0].name,
     model_context_window_override: DEFAULT_MODEL_CONTEXT_WINDOW,
     llm_request_timeout_ms: DEFAULT_LLM_REQUEST_TIMEOUT_MS,
+    max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
     thinking_effort: DEFAULT_THINKING_EFFORT,
     show_thinking_blocks: true,
     external_thinking: false,
@@ -6249,6 +6288,20 @@ function appendHistoryEntry(role, content, extra = null) {
     }
     if (extra.hidden === true) {
       payload.hidden = true;
+    }
+    if (Array.isArray(extra.toolCalls) && extra.toolCalls.length > 0) {
+      payload.toolCalls = extra.toolCalls
+        .filter((call) => call && typeof call === "object" && String(call?.function?.name || "").trim())
+        .map((call) => ({
+          id: String(call.id || ""),
+          type: String(call.type || "function"),
+          function: {
+            name: String(call.function.name),
+            arguments: typeof call.function.arguments === "string"
+              ? call.function.arguments
+              : JSON.stringify(call.function.arguments ?? {}),
+          },
+        }));
     }
     payload.excludeFromRequest = extra.excludeFromRequest === true;
     if (typeof extra.toolOk === "boolean") {
@@ -8479,6 +8532,7 @@ async function maybeCompactBeforeTurn() {
 function buildOpenRouterMessagesFromHistory(modelId = selectedModel) {
   ensureSystemMessageAtTop(modelId);
   const includeReasoningDetails = getReasoningEnabledForModel(modelId);
+  const pendingToolCallIds = new Set();
   const buildUserMultimodalContent = (text) => {
     const source = String(text ?? "");
     if (!source.includes("[Image #")) {
@@ -8558,8 +8612,17 @@ function buildOpenRouterMessagesFromHistory(modelId = selectedModel) {
       });
       const compactedDiscovery = hasLaterRequestEntry ? compactToolDiscoveryContent(entry) : "";
       const toolContent = compactedDiscovery || (content.trim().length > 0 ? content : "(no output)");
-      // Programmatic tool-calling flow uses plain text/code, not API-native tool_call objects.
-      // Feed tool outcomes back as user context so the model reliably produces a final answer.
+      const toolCallId =
+        typeof entry?.toolCallId === "string" && entry.toolCallId.trim().length > 0
+          ? entry.toolCallId.trim()
+          : "";
+      if (toolCallId && pendingToolCallIds.has(toolCallId)) {
+        // Native tool-calling flow: emit the actual tool result message.
+        requestMessages.push({ role: "tool", tool_call_id: toolCallId, content: toolContent });
+        pendingToolCallIds.delete(toolCallId);
+        continue;
+      }
+      // Legacy/fenced-execute history: feed the outcome back as user context.
       requestMessages.push({
         role: "user",
         content: `[tool ${toolName} result]\n${toolContent}`,
@@ -8577,6 +8640,24 @@ function buildOpenRouterMessagesFromHistory(modelId = selectedModel) {
       const details = normalizeReasoningDetails(entry?.reasoningDetails);
       if (includeReasoningDetails && details) {
         messagePayload.reasoning_details = details;
+      }
+      const entryToolCalls = Array.isArray(entry?.toolCalls) ? entry.toolCalls : [];
+      if (entryToolCalls.length > 0) {
+        messagePayload.tool_calls = entryToolCalls
+          .filter((call) => call && typeof call === "object" && String(call?.function?.name || "").trim())
+          .map((call) => ({
+            id: String(call.id || createSessionUid()),
+            type: String(call.type || "function"),
+            function: {
+              name: String(call.function.name),
+              arguments: typeof call.function.arguments === "string"
+                ? call.function.arguments
+                : JSON.stringify(call.function.arguments ?? {}),
+            },
+          }));
+        for (const call of messagePayload.tool_calls) {
+          pendingToolCallIds.add(call.id);
+        }
       }
       requestMessages.push(messagePayload);
       continue;
@@ -8661,6 +8742,21 @@ function extractAssistantPayloadFromCompletion(completion, options = {}) {
   }
 
   let text = extractAssistantText(message?.content);
+  const toolCalls = Array.isArray(message?.tool_calls)
+    ? message.tool_calls
+        .filter((call) => call && typeof call === "object")
+        .map((call) => ({
+          id: String(call.id || ""),
+          type: String(call.type || "function"),
+          function: {
+            name: String(call?.function?.name || ""),
+            arguments: typeof call?.function?.arguments === "string"
+              ? call.function.arguments
+              : JSON.stringify(call?.function?.arguments ?? {}),
+          },
+        }))
+        .filter((call) => call.function.name.length > 0)
+    : [];
   const thinkParsed = extractThinkBlocksFromText(text);
   if (thinkParsed.reasoningText) {
     const thinkDetails = [{ type: "reasoning.text", text: thinkParsed.reasoningText, format: "unknown" }];
@@ -8673,14 +8769,14 @@ function extractAssistantPayloadFromCompletion(completion, options = {}) {
   if (!text.trim() && typeof choice?.text === "string" && choice.text.trim().length > 0) {
     text = choice.text.trim();
   }
-  if (allowReasoningTextFallback && !text.trim()) {
+  if (!text.trim() && !toolCalls.length && allowReasoningTextFallback) {
     const reasoningPreview = extractReasoningDisplayText(reasoningDetails);
     if (reasoningPreview.trim().length > 0) {
       text = reasoningPreview;
     }
   }
 
-  return { text, reasoningDetails };
+  return { text, reasoningDetails, toolCalls };
 }
 
 function appendAssistantMessage(text, options = {}) {
@@ -8781,8 +8877,9 @@ function triggerAnswerReveal(entry) {
   if (!entry || entry.ephemeral === true || APPEND_CHAT_TO_SCROLLBACK) {
     return;
   }
+  const hasNativeToolCalls = Array.isArray(entry.toolCalls) && entry.toolCalls.length > 0;
   const isExecuteBlock =
-    entry.role === "assistant" && containsExecuteFence(entry.content);
+    entry.role === "assistant" && (containsExecuteFence(entry.content) || hasNativeToolCalls);
   if (isAssistantThinking() && !isExecuteBlock) {
     // Hold the initial black reveal frame until the Thinking status actually
     // collapses. Starting the clock here can consume the whole fade while a
@@ -8866,6 +8963,20 @@ function finalizePendingAssistantMessage(index, text, generation, options = {}) 
   if (reasoningDetails) {
     nextEntry.reasoningDetails = reasoningDetails;
   }
+  if (role === "assistant" && Array.isArray(options?.toolCalls) && options.toolCalls.length > 0) {
+    nextEntry.toolCalls = options.toolCalls
+      .filter((call) => call && typeof call === "object" && String(call?.function?.name || "").trim())
+      .map((call) => ({
+        id: String(call.id || ""),
+        type: String(call.type || "function"),
+        function: {
+          name: String(call.function.name),
+          arguments: typeof call.function.arguments === "string"
+            ? call.function.arguments
+            : JSON.stringify(call.function.arguments ?? {}),
+        },
+      }));
+  }
   if (index >= 0 && index < messages.length && messages[index]?.role === "assistant") {
     messages[index] = nextEntry;
   } else {
@@ -8877,7 +8988,12 @@ function finalizePendingAssistantMessage(index, text, generation, options = {}) 
   }
 
   if (persistHistory) {
-    appendHistoryEntry(role, content, reasoningDetails ? { reasoningDetails } : null);
+    const historyExtra = {};
+    if (reasoningDetails) historyExtra.reasoningDetails = reasoningDetails;
+    if (Array.isArray(nextEntry.toolCalls) && nextEntry.toolCalls.length > 0) {
+      historyExtra.toolCalls = nextEntry.toolCalls;
+    }
+    appendHistoryEntry(role, content, Object.keys(historyExtra).length > 0 ? historyExtra : null);
   }
   syncImagePasteCounter();
   scrollChatToBottom();
@@ -8981,13 +9097,22 @@ function extractAllPythonCodeBlocks(text) {
 
 function matchExecutableFenceOpening(line) {
   const match = String(line ?? "").match(/^ {0,3}(`{3,}|~{3,})execute[ \t]*$/i);
-  if (!match) {
-    return null;
+  if (match) {
+    return { character: match[1][0], length: match[1].length };
   }
-  return { character: match[1][0], length: match[1].length };
+  // XML-style alternative: <execute> code ... </execute>.
+  // Matches `<execute>`, `<execute >`, and inline `<execute>print(1)</execute>`.
+  const xml = String(line ?? "").match(/^ {0,3}<execute[ \t]*>/i);
+  if (xml) {
+    return { xmlTag: true };
+  }
+  return null;
 }
 
 function isMatchingFenceClosing(line, fence) {
+  if (fence.xmlTag) {
+    return /^ {0,3}<\/execute>\s*$/i.test(String(line ?? ""));
+  }
   const match = String(line ?? "").match(/^ {0,3}(`{3,}|~{3,})[ \t]*$/);
   return Boolean(
     match &&
@@ -9017,7 +9142,35 @@ function extractAllPythonCodeBlockEntries(text) {
     }
 
     let closingIndex = -1;
-    if (fence.length === 3) {
+    let xmlInlineBody = "";
+    if (fence.xmlTag) {
+      // XML-style block: <execute> ... </execute>. The opener line may already
+      // contain code (<execute>print(1)</execute>), and the closing tag can sit
+      // at the end of a code line too (<execute>print('a')\nprint('b')</execute>).
+      const openerLineStr = String(lines[openingIndex]);
+      const openerTailIdx = openerLineStr.indexOf(">");
+      const openerTail =
+        openerTailIdx >= 0 ? openerLineStr.slice(openerTailIdx + 1) : "";
+      const openerCloseIdx = openerTail.search(/<\/execute>/i);
+      if (openerCloseIdx >= 0) {
+        closingIndex = openingIndex;
+        const prefix = openerTail.slice(0, openerCloseIdx);
+        if (prefix.trim()) xmlInlineBody = prefix;
+      } else {
+        if (openerTail.trim()) xmlInlineBody = openerTail;
+        for (let i = openingIndex + 1; i < lines.length; i += 1) {
+          const closeIdx = String(lines[i]).search(/<\/execute>/i);
+          if (closeIdx >= 0) {
+            closingIndex = i;
+            if (closeIdx > 0) {
+              const prefix = String(lines[i]).slice(0, closeIdx);
+              xmlInlineBody += (xmlInlineBody ? "\n" : "") + prefix;
+            }
+            break;
+          }
+        }
+      }
+    } else if (fence.length === 3) {
       // Legacy triple fences are ambiguous when their Python payload contains
       // Markdown fences. Use the final matching fence as the outer closer;
       // this also recovers a valid execute block when the model incorrectly
@@ -9052,7 +9205,11 @@ function extractAllPythonCodeBlockEntries(text) {
     }
 
     const bodyEnd = closingIndex >= 0 ? closingIndex : lines.length;
-    const body = lines.slice(openingIndex + 1, bodyEnd).join("\n").trim();
+    const bodyParts = [];
+    if (xmlInlineBody) bodyParts.push(xmlInlineBody);
+    const restLines = lines.slice(openingIndex + 1, bodyEnd);
+    if (restLines.length > 0) bodyParts.push(restLines.join("\n"));
+    const body = bodyParts.join("\n").trim();
     if (body) {
       blocks.push({
         code: body,
@@ -9150,6 +9307,237 @@ function buildExecutableCodeForToolCall(toolName, toolArgs) {
   ].join("\n");
 
   return { code: generatedCode, executionName: toolName };
+}
+
+function formatNativeToolInvocation(name, rawArgs) {
+  const trimmed = String(rawArgs || "").trim();
+  if (!trimmed || trimmed === "{}") return name + "()";
+  return name + "(" + trimmed + ")";
+}
+
+async function executeNativeToolCall(toolCall, generation) {
+  if (generation !== chatGeneration) {
+    return { execResult: null };
+  }
+
+  const name = String(toolCall?.function?.name || "").trim();
+  const callId = String(toolCall?.id || "").trim();
+  const rawArgs = String(toolCall?.function?.arguments || "").trim();
+  let args = {};
+  try {
+    const parsed = rawArgs.length > 0 ? JSON.parse(rawArgs) : {};
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      args = parsed;
+    }
+  } catch {
+    args = {};
+  }
+
+  const failureResult = (message) => ({
+    ok: false,
+    output: "",
+    error: message,
+    traceback: "",
+    editEvents: [],
+    editSummaries: [],
+    historyActions: [],
+    planUiEvents: [],
+    backgroundJobEvents: [],
+  });
+  const recordFailure = (message) => {
+    appendToolMessages(
+      name || "unknown_tool",
+      rawArgs,
+      "",
+      message,
+      message,
+      callId,
+      false,
+      generation
+    );
+    return { execResult: failureResult(message) };
+  };
+
+  const built = buildExecutableCodeForToolCall(name, args);
+  if (built && built.error) {
+    return recordFailure(built.error);
+  }
+  const code = built && typeof built.code === "string" ? built.code : "";
+  if (!code.trim()) {
+    return recordFailure("No executable code produced for tool call.");
+  }
+  const hookToolInput = name === "code_execution" ? { code } : { arguments: args };
+  const displayInput = name === "code_execution" ? code : formatNativeToolInvocation(name, rawArgs);
+
+  let pendingCodeEntry = null;
+  if (name === "code_execution" && code.trim()) {
+    pendingCodeEntry = {
+      role: "tool",
+      name: "code_execution",
+      toolInput: code,
+      toolCode: "",
+      content: "",
+      uiContent: "",
+      ephemeral: true,
+      live: true,
+      toolCallId: callId,
+    };
+    messages.push(pendingCodeEntry);
+    scrollChatToBottom();
+    markDirty();
+    renderFrame(true);
+  }
+
+  let liveToolOutput = "";
+  let liveRenderTimer = null;
+  const renderLiveToolOutput = () => {
+    liveRenderTimer = null;
+    if (!liveToolOutput || !pendingCodeEntry || generation !== chatGeneration) return;
+    let visibleOutput = String(liveToolOutput)
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n");
+    let liveOutputTruncated = false;
+    const liveLines = visibleOutput.split("\n");
+    if (liveLines.length > EXECUTE_LIVE_MAX_LINES) {
+      visibleOutput = liveLines.slice(-EXECUTE_LIVE_MAX_LINES).join("\n");
+      liveOutputTruncated = true;
+    }
+    if (visibleOutput.length > EXECUTE_LIVE_MAX_OUTPUT_CHARS) {
+      visibleOutput = visibleOutput.slice(-EXECUTE_LIVE_MAX_OUTPUT_CHARS);
+      liveOutputTruncated = true;
+    }
+    if (liveOutputTruncated) {
+      visibleOutput = `... [live output truncated; showing latest ${EXECUTE_LIVE_MAX_LINES} lines / ${EXECUTE_LIVE_MAX_OUTPUT_CHARS} chars] ...\n${visibleOutput}`;
+    }
+    pendingCodeEntry.content = visibleOutput;
+    pendingCodeEntry.uiContent = visibleOutput;
+    // The live entry object is updated in place. The transcript cache
+    // keys on its object identity, so explicitly invalidate it or the
+    // first streamed frame will remain frozen for the rest of the run.
+    cachedChatLines = null;
+    // The render scheduler normally repaints chat only when its layout
+    // or entry count changes. Streaming mutates one entry in place, so
+    // request an explicit in-place repaint for every throttled frame.
+    forceChatRefreshFlag = true;
+    scrollChatToBottom();
+    markDirty();
+    renderFrame(false);
+  };
+  const handleLiveToolOutput = (_chunk, cumulative) => {
+    liveToolOutput = String(cumulative || "");
+    if (!liveRenderTimer) {
+      liveRenderTimer = setTimeout(renderLiveToolOutput, EXECUTE_LIVE_REFRESH_MS);
+    }
+  };
+
+  activeToolRun = {
+    label: name || "code execution",
+    startedAt: Date.now(),
+    done: false,
+    ok: false,
+  };
+
+  try {
+    let execResult = null;
+    const preToolRun = await runHooks({
+      eventName: "PreToolUse",
+      matcherValue: name,
+      input: {
+        tool_name: name,
+        tool_input: hookToolInput,
+      },
+      timeoutMs: 30000,
+    });
+    if (preToolRun.blocked) {
+      execResult = failureResult(
+        "Tool blocked by hook" + (preToolRun.blockReason ? ": " + preToolRun.blockReason : ".")
+      );
+    } else {
+      if (preToolRun.additionalContext) {
+        pendingHookContext = preToolRun.additionalContext;
+      }
+      execResult = await executeCodeWithPythonTool(code, {
+        onOutput: handleLiveToolOutput,
+      });
+    }
+
+    if (stopRequested) {
+      activeToolRun = { ...activeToolRun, done: true, ok: false, cancelled: true };
+    } else if (activeToolRun) {
+      activeToolRun.done = true;
+      activeToolRun.ok = getToolUiOk(execResult);
+    }
+
+    const postEventName = Boolean(execResult?.ok) ? "PostToolUse" : "PostToolUseFailure";
+    const postToolRun = await runHooks({
+      eventName: postEventName,
+      matcherValue: name,
+      input: {
+        tool_name: name,
+        tool_input: hookToolInput,
+        tool_output: execResult
+          ? { done: true, ok: Boolean(execResult.ok), error: execResult.error || "" }
+          : { done: false },
+      },
+      timeoutMs: 30000,
+    });
+    if (postToolRun.blocked) {
+      execResult = failureResult(
+        "Tool result blocked by hook" + (postToolRun.blockReason ? ": " + postToolRun.blockReason : ".")
+      );
+    }
+    if (postToolRun.additionalContext) {
+      pendingHookContext = postToolRun.additionalContext;
+    }
+
+    if (pendingCodeEntry) {
+      const pendingIndex = messages.indexOf(pendingCodeEntry);
+      if (pendingIndex >= 0) messages.splice(pendingIndex, 1);
+      pendingCodeEntry = null;
+    }
+
+    const toolResultPayload = buildToolResultPayload(execResult);
+    const historyActionResult = applyHistoryActionsFromTool(execResult?.historyActions, generation);
+    if (historyActionResult.changed) {
+      await rewriteSessionWithCurrentMessages().catch(() => {});
+      markDirty();
+      renderFrame(false);
+    }
+    if (historyActionResult.processedActions > 0) {
+      const actionSummary =
+        historyActionResult.errorCount > 0
+          ? "history exclude applied: " + historyActionResult.appliedCount + " (errors: " + historyActionResult.errorCount + ")"
+          : "history exclude applied: " + historyActionResult.appliedCount;
+      toolResultPayload.displayText = (toolResultPayload.displayText + "\n" + actionSummary).trim();
+      toolResultPayload.historyText = (toolResultPayload.historyText + "\n" + actionSummary).trim();
+    }
+    appendToolMessages(
+      name,
+      displayInput,
+      "",
+      toolResultPayload.displayText,
+      toolResultPayload.historyText,
+      callId,
+      toolResultPayload.toolOk,
+      generation,
+      toolResultPayload.uiKind,
+      toolResultPayload.uiSections
+    );
+    return { execResult };
+  } catch (error) {
+    if (pendingCodeEntry) {
+      const pendingIndex = messages.indexOf(pendingCodeEntry);
+      if (pendingIndex >= 0) messages.splice(pendingIndex, 1);
+      pendingCodeEntry = null;
+    }
+    return recordFailure(getOpenRouterErrorMessage(error) || "Native tool call failed.");
+  } finally {
+    if (liveRenderTimer) {
+      clearTimeout(liveRenderTimer);
+      liveRenderTimer = null;
+    }
+    activeToolRun = null;
+  }
 }
 
 async function executeCodeWithPythonTool(code, options = {}) {
@@ -10045,6 +10433,12 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
         messages: msgs,
       };
       applyThinkingRequestSettings(payload, resolvedModel, includeReasoning);
+      payload.tools = CODE_EXECUTION_TOOL_SCHEMA;
+      payload.tool_choice = "auto";
+      const requestedMaxTokens = Number(getMainSessionRuntimeSettings().max_output_tokens || 0);
+      if (Number.isFinite(requestedMaxTokens) && requestedMaxTokens > 0) {
+        payload.max_tokens = requestedMaxTokens;
+      }
 
       const requestController = new AbortController();
       activeLlmAbortController = requestController;
@@ -10120,7 +10514,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
       const attemptPayload = extractAssistantPayloadFromCompletion(attemptCompletion, {
         allowReasoningTextFallback: false,
       });
-      if (attemptPayload.text.trim().length > 0) {
+      if (attemptPayload.text.trim().length > 0 || (attemptPayload.toolCalls || []).length > 0) {
         return {
           completion: attemptCompletion,
           payload: attemptPayload,
@@ -10150,9 +10544,11 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
     let assistantPayload = extractAssistantPayloadFromCompletion(completion, {
       allowReasoningTextFallback: reasoningEnabledNow,
     });
-    // Empty assistant message (reasoning-only or transient provider response):
-    // re-run with reasoning off, a few times, so the turn does not silently stall.
-    if (assistantPayload.text.trim().length === 0) {
+    // Empty assistant message (reasoning-only or transient provider response
+    // with no tool calls): re-run with reasoning off a few times so the turn
+    // does not silently stall. A tool-call-only reply is a valid turn and is
+    // handled below, not retried here.
+    if (assistantPayload.text.trim().length === 0 && (assistantPayload.toolCalls || []).length === 0) {
       try {
         const retried = await retryAssistantPayloadForEmpty(requestMessages, resolvedModel, {
           maxAttempts: 3,
@@ -10178,6 +10574,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
       }
     }
 
+    const nativeToolCalls = assistantPayload.toolCalls || [];
     const assistantContent = normalizeAssistantToolUseResponse(assistantPayload.text);
     const assistantReasoningDetails = reasoningEnabledNow ? assistantPayload.reasoningDetails : null;
     const emptyContentMessage = getReasoningEnabledForModel(resolvedModel)
@@ -10189,11 +10586,13 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
     }
     finalizePendingAssistantMessage(
       pendingIndex,
-      assistantContent.trim().length > 0
+      assistantContent.trim().length > 0 || nativeToolCalls.length > 0
         ? assistantContent
         : emptyContentMessage,
       generation,
-      { reasoningDetails: assistantReasoningDetails }
+      nativeToolCalls.length > 0
+        ? { reasoningDetails: assistantReasoningDetails, toolCalls: nativeToolCalls }
+        : { reasoningDetails: assistantReasoningDetails }
     );
     pendingResolved = true;
 
@@ -10201,14 +10600,34 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
       return;
     }
 
+    // Native tool-calling loop: execute every assistant tool_calls request
+    // first (mirroring the classic API tool loop). Fenced execute blocks in
+    // the same reply are handled by the existing fallback loop below.
+    for (const toolCall of nativeToolCalls) {
+      if (stopRequested) {
+        emitStopNotice();
+        break;
+      }
+      const toolResult = await executeNativeToolCall(toolCall, generation);
+      if (generation !== chatGeneration) {
+        return;
+      }
+      markBackgroundShellJobsDelivered(toolResult?.execResult?.backgroundJobEvents);
+      if (hasQueuedPromptForToolBoundary(generation)) {
+        break;
+      }
+    }
+    // Continue the follow-up request loop below from the fresh request so
+    // the model sees the native tool results (or the fenced blocks above).
     let latestAssistantContent = assistantContent;
+    let needFollowUpRequest = nativeToolCalls.length > 0;
     for (;;) {
       if (stopRequested) {
         emitStopNotice();
         break;
       }
-      const pythonBlocks = extractAllPythonCodeBlockEntries(latestAssistantContent);
-      if (pythonBlocks.length === 0) {
+      const pythonBlocks = [];
+      if (!needFollowUpRequest) {
         break;
       }
 
@@ -10447,8 +10866,43 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
       let followUpPayload = extractAssistantPayloadFromCompletion(followUpCompletion, {
         allowReasoningTextFallback: followUpReasoningEnabled,
       });
+      const followUpNativeToolCalls = Array.isArray(followUpPayload?.toolCalls)
+        ? followUpPayload.toolCalls
+        : [];
       let followUpContent = followUpPayload.text;
       let followUpReasoningDetails = followUpReasoningEnabled ? followUpPayload.reasoningDetails : null;
+
+      // Native tool-calling follow-up: record the assistant tool-call turn,
+      // execute every requested tool, then loop so the model sees the results.
+      if (followUpNativeToolCalls.length > 0) {
+        finalizePendingAssistantMessage(
+          -1,
+          followUpContent.trim().length > 0 ? followUpContent : "",
+          generation,
+          { reasoningDetails: followUpReasoningDetails, toolCalls: followUpNativeToolCalls }
+        );
+        if (generation !== chatGeneration) {
+          return;
+        }
+        for (const toolCall of followUpNativeToolCalls) {
+          if (stopRequested) {
+            emitStopNotice();
+            break;
+          }
+          const toolResult = await executeNativeToolCall(toolCall, generation);
+          if (generation !== chatGeneration) {
+            return;
+          }
+          markBackgroundShellJobsDelivered(toolResult?.execResult?.backgroundJobEvents);
+          if (hasQueuedPromptForToolBoundary(generation)) {
+            break;
+          }
+        }
+        latestAssistantContent = "";
+        needFollowUpRequest = true;
+        continue;
+      }
+
       if (followUpContent.trim().length === 0) {
         // Empty follow-up after a tool run: retry (reasoning off, bounded) so
         // a transient empty response does not silently stop the agent loop.
@@ -10490,6 +10944,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
 
       appendAssistantMessage(followUpContent, { reasoningDetails: followUpReasoningDetails, reveal: true });
       latestAssistantContent = followUpContent;
+      needFollowUpRequest = false;
     }
   } catch (error) {
     if (stopRequested) {
@@ -12133,7 +12588,11 @@ function getMainFooterText() {
   const effort = normalizeThinkingEffort(getActiveSessionRuntimeSettings().thinking_effort);
   const agentLabel = activeAgentName.toLowerCase() === "main" ? "Main" : activeAgentName;
   const voiceSegment = getVoiceCaptureFooterSegment();
+  // Leftmost segment: current context-window usage (context 38%).
+  const contextUsed = Math.min(100, Math.max(0, getActiveContextLeftPercent(activeModel)));
+  const contextSegment = `context ${Math.round(contextUsed)}%`;
   return [
+    contextSegment,
     ...(voiceSegment ? [voiceSegment.text] : []),
     ...(getActiveCollaborationMode() === "plan" ? ["PLAN"] : []),
     `${modelLabel} ${effort}`,
@@ -12148,7 +12607,20 @@ function getMainFooterStyledText(maxWidth = Number.POSITIVE_INFINITY) {
   const effort = normalizeThinkingEffort(getActiveSessionRuntimeSettings().thinking_effort);
   const agentLabel = activeAgentName.toLowerCase() === "main" ? "Main" : activeAgentName;
   const voiceSegment = getVoiceCaptureFooterSegment();
+  // Leftmost segment: current context-window usage (context 38%).
+  const contextUsed = Math.min(100, Math.max(0, getActiveContextLeftPercent(activeModel)));
+  // contextUsed is the PERCENT REMAINING (100 = empty, 0 = full):
+  //   >= 50  plenty of room (green)
+  //   20-49  getting tight (yellow)
+  //    < 20  almost exhausted (red)
+  const contextColor =
+    contextUsed >= 50
+      ? FOOTER_CONTEXT_OK_COLOR
+      : contextUsed >= 20
+        ? FOOTER_CONTEXT_WARN_COLOR
+        : FOOTER_CONTEXT_HIGH_COLOR;
   const segments = [
+    { text: `context ${Math.round(contextUsed)}%`, color: contextColor },
     ...(voiceSegment ? [voiceSegment] : []),
     ...(getActiveCollaborationMode() === "plan"
       ? [{ text: "PLAN", color: FOOTER_PLAN_COLOR }]
@@ -14123,6 +14595,7 @@ function parseSessionHistory(raw, options = {}) {
         ...(reasoningDetails ? { reasoningDetails } : {}),
         ...(parsed?.hidden === true ? { hidden: true } : {}),
         ...(parsed?.excludeFromRequest === true ? { excludeFromRequest: true } : {}),
+        ...(Array.isArray(parsed?.toolCalls) && parsed.toolCalls.length > 0 ? { toolCalls: parsed.toolCalls } : {}),
       };
 
       const previousEntry = loadedMessages.length > 0 ? loadedMessages[loadedMessages.length - 1] : null;
@@ -15703,6 +16176,13 @@ function getRuntimeSettings() {
       value: requestTimeout,
       options: uniqueSettingOptions([30000, 60000, 120000, 300000, 600000], requestTimeout),
       format: formatRequestTimeout,
+    },
+    {
+      key: "max_output_tokens",
+      label: "max output tokens",
+      value: runtimeSettings.max_output_tokens,
+      options: uniqueSettingOptions([1024, 2048, 4096, 8192, 16384], runtimeSettings.max_output_tokens),
+      format: (value) => String(value),
     },
   ];
 }
@@ -17522,6 +18002,11 @@ function annotateAssistantCodeBlocks(message) {
     const line = sourceLines[lineIndex];
     const trimmed = line.trim();
     if (!activeFence) {
+      const xmlOpening = trimmed.match(/^<execute[ \t]*>/i);
+      if (xmlOpening) {
+        activeFence = { xmlTag: true, closeIndex: -1 };
+        continue;
+      }
       const opening = trimmed.match(/^(`{3,}|~{3,})(python|py|execute)\s*$/i);
       if (opening) {
         activeFence = {
@@ -17539,6 +18024,11 @@ function annotateAssistantCodeBlocks(message) {
             break;
           }
         }
+        continue;
+      }
+    } else if (activeFence.xmlTag) {
+      if (trimmed.match(/^<\/execute>\s*$/i)) {
+        activeFence = null;
         continue;
       }
     } else if (
@@ -18113,15 +18603,24 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
     const executedCode = typeof entry?.toolCode === "string" && entry.toolCode.length > 0
       ? entry.toolCode
       : "";
+    const isNativeCodeExecution =
+      toolName === "code_execution" &&
+      typeof entry?.toolCallId === "string" &&
+      entry.toolCallId.length > 0;
     let resultSource = message;
     let toolHeader = entry?.live === true
       ? `\u2022 Running ${toolName}`
       : `\u2022 Ran ${toolName}`;
+    let nativeEditSummary = "";
     if (toolName === "code_execution") {
       const editSummary = extractEditSummaryFromToolOutput(message);
       if (editSummary) {
-        toolHeader = `\u2022 ${editSummary}`;
         resultSource = stripFirstMatchingLine(message, editSummary);
+        if (isNativeCodeExecution) {
+          nativeEditSummary = editSummary;
+        } else {
+        toolHeader = `\u2022 ${editSummary}`;
+        }
       }
     }
     const resultLines = getToolResultLinesForDisplay(resultSource);
@@ -18129,7 +18628,26 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
     const formattedResults = (resultLines.length > 0 ? resultLines : [""]).map((line, i) =>
       resultIsDiff ? line : i === 0 ? `\u2514 ${line}` : `  ${line}`
     );
+    if (nativeEditSummary) {
+      formattedResults.unshift("• " + nativeEditSummary);
+    }
     const hasDistinctCode = executedCode.length > 0 && executedCode !== assistantInput;
+    if (isNativeCodeExecution) {
+      // Native code_execution: show the code argument as a highlighted
+      // Python block with 2-column left padding, then header + output.
+      // An edit summary replaces the Ran code_execution header.
+      const codeLines = assistantInput.replace(/\r/g, "\n").split("\n").map((line) => "  " + line);
+      const headerLines = nativeEditSummary ? [] : [toolHeader];
+      const visibleResults = entry?.live === true && !resultSource.trim() ? [] : formattedResults;
+      logicalLines = [...codeLines, "", "", ...headerLines, ...visibleResults];
+      logicalLineMeta = [
+        ...codeLines.map((line) => ({ text: line, python: true, fence: false })),
+        { text: "", python: false, fence: false },
+        { text: "", python: false, fence: false },
+        ...headerLines.map((line) => ({ text: line, python: false, fence: false })),
+        ...visibleResults.map((line) => ({ text: line, python: false, fence: false })),
+      ];
+    } else {
     logicalLines = [toolHeader];
     if (toolName !== "code_execution") {
       const inputLines = assistantInput.replace(/\r/g, "\n").split("\n");
@@ -18147,6 +18665,7 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
     }
     logicalLines.push(...formattedResults);
     logicalLineMeta = logicalLines.map((line) => ({ text: line, python: false, fence: false }));
+    }
     if (typeof entry?.toolOk === "boolean") {
       structuredToolOk = entry.toolOk;
     }
@@ -18236,6 +18755,8 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
 
       if (isErrorMessage) {
         line = `${RED_COLOR}${visibleText}${RESET_COLOR}`;
+      } else if (isToolCall && lineMeta.python) {
+        line = highlightPythonCodeLine(visibleText.padEnd(contentWidth, " "), lineMeta.fence);
       } else if (isToolCall) {
         // Only color +/- lines as diff hunks when the whole output actually
         // looks like a unified diff; otherwise "- some text" from a tool
@@ -18267,10 +18788,9 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
           preserveDiffStyle = true;
         } else {
           const color = i === 0 && w === 0 ? toolColor : PLACEHOLDER_COLOR;
-          const editedHeaderStyled =
-            i === 0 && w === 0 ? styleEditedToolHeaderLine(visibleText, toolColor) : null;
+          const editedHeaderStyled = styleEditedToolHeaderLine(visibleText, toolColor);
           const executionHeaderStyled =
-            i === 0 && w === 0 ? styleToolExecutionHeaderLine(visibleText, toolColor) : null;
+            styleToolExecutionHeaderLine(visibleText, toolColor);
           if (editedHeaderStyled) {
             line = editedHeaderStyled;
           } else if (executionHeaderStyled) {
@@ -22158,7 +22678,7 @@ function runFormatSelfTest() {
       !INIT_CONTRIBUTOR_GUIDE_PROMPT.includes("Generate a file named AGENTS.md") ||
       !INIT_CONTRIBUTOR_GUIDE_PROMPT.includes('Title the document "Repository Guidelines"') ||
       !INIT_CONTRIBUTOR_GUIDE_PROMPT.includes("200-400 words") ||
-      runtimeSettingKeys.join(",") !== "thinking,thinking_blocks,external_thinking,thinking_effort,text_to_speech_model,speech_to_text_model,vision_model,context_window,request_timeout" ||
+      runtimeSettingKeys.join(",") !== "thinking,thinking_blocks,external_thinking,thinking_effort,text_to_speech_model,speech_to_text_model,vision_model,context_window,request_timeout,max_output_tokens" ||
       typeof getRuntimeSettings().find((setting) => setting.key === "thinking")?.value !== "boolean" ||
       typeof getRuntimeSettings().find((setting) => setting.key === "thinking_blocks")?.value !== "boolean" ||
       typeof getRuntimeSettings().find((setting) => setting.key === "external_thinking")?.value !== "boolean" ||
@@ -22279,7 +22799,8 @@ function runFormatSelfTest() {
         workerSettings.find((setting) => setting.key === "thinking_effort")?.value === "xhigh" &&
         workerSettings.find((setting) => setting.key === "context_window")?.value === 256000 &&
         workerSettings.find((setting) => setting.key === "request_timeout")?.value === 120000 &&
-        workerFooter === `PLAN · worker-model xhigh · ${formatWorkspacePathForFooter(WORKSPACE_ROOT)} · runtime-worker` &&
+        workerFooter === `context 37% · PLAN · worker-model xhigh · ${formatWorkspacePathForFooter(WORKSPACE_ROOT)} · runtime-worker` &&
+        workerStyledFooter.includes(`${FOOTER_CONTEXT_WARN_COLOR}context 37%${RESET_COLOR}`) &&
         workerStyledFooter.includes(`${FOOTER_PLAN_COLOR}PLAN${RESET_COLOR}`) &&
         workerStyledFooter.includes(`${FOOTER_MODEL_COLOR}worker-model xhigh${RESET_COLOR}`) &&
         workerStyledFooter.includes(`${FOOTER_PATH_COLOR}${formatWorkspacePathForFooter(WORKSPACE_ROOT)}${RESET_COLOR}`) &&
@@ -22933,14 +23454,14 @@ function runFormatSelfTest() {
       !deferredPrompt.includes("persistent full Nexus agent processes") ||
       !deferredPrompt.includes("rlm_spawn is non-blocking") ||
       !deferredPrompt.includes("no tool-turn ceiling") ||
-      !deferredPrompt.includes("A spawn execute block must only launch workers") ||
+      !deferredPrompt.includes("A spawn code_execution call must only launch workers") ||
       !deferredPrompt.includes("Never call join/await/wait_subagents, sleep, poll files") ||
-      !deferredPrompt.includes("Workers continue in the background after the block ends") ||
+      !deferredPrompt.includes("Workers continue in the background after the call ends") ||
       !deferredPrompt.includes("EXECUTION RESULT BOUNDARY (MANDATORY)") ||
       !deferredPrompt.includes("only requests execution") ||
       !deferredPrompt.includes("Wait for the subsequent code_execution tool result") ||
       !deferredPrompt.includes("A successful wrapper does not make an inner {ok: false} operation successful") ||
-      !deferredPrompt.includes("treat the block as not executed and its outcome as unknown") ||
+      !deferredPrompt.includes("treat the code as not executed and its outcome as unknown") ||
       !workspaceGuidePrompt.includes("WORKSPACE GUIDE (MUST FOLLOW)") ||
       !workspaceGuidePrompt.includes("loaded from AGENTS.md when this session started") ||
       !workspaceGuidePrompt.includes("Run `npm test` before submitting changes.") ||
@@ -24361,6 +24882,27 @@ async function runKernelSelfTest() {
     const truncExecCode = extractAllPythonCodeBlocks(truncExecReply)[0] || "";
     if (!truncExecCode.includes("x = 6 * 7")) {
       out(`KERNEL_FAIL: unterminated execute fence should yield partial code: ${JSON.stringify(truncExecCode)}\n`);
+      return 1;
+    }
+
+    // XML execute blocks: multi-line and inline forms both extract, and a
+    // payload containing backticks stays intact (no nested-fence ambiguity).
+    const xmlReply = "<execute>" + NL + "print('SOLVE_OK_XML')" + NL + "</execute>";
+    const xmlCode = extractAllPythonCodeBlocks(xmlReply)[0] || "";
+    if (!xmlCode.includes("SOLVE_OK_XML") || xmlCode.includes("<execute>") || xmlCode.includes("</execute>")) {
+      out(`KERNEL_FAIL: xml execute block extraction wrong: ${JSON.stringify(xmlCode)}\n`);
+      return 1;
+    }
+    const xmlInlineReply = `<execute>print('INLINE_OK')</execute>`;
+    const xmlInlineCode = extractAllPythonCodeBlocks(xmlInlineReply)[0] || "";
+    if (!xmlInlineCode.includes("INLINE_OK")) {
+      out(`KERNEL_FAIL: inline xml execute block extraction wrong: ${JSON.stringify(xmlInlineCode)}\n`);
+      return 1;
+    }
+    const xmlBacktickReply = "<execute>" + NL + "print('backtick ' + '" + BT + "')" + NL + "</execute>";
+    const xmlBacktickCode = extractAllPythonCodeBlocks(xmlBacktickReply)[0] || "";
+    if (!xmlBacktickCode.includes(BT)) {
+      out(`KERNEL_FAIL: xml execute block with backticks inside should extract cleanly: ${JSON.stringify(xmlBacktickCode)}\n`);
       return 1;
     }
 

@@ -20,9 +20,12 @@ import textwrap
 import bisect
 import hashlib
 import errno
+import inspect
+import types as _types
 import uuid
 from datetime import datetime, timezone
 from typing import Iterable
+import typing as _typing
 import harness
 import skills_deps
 
@@ -3588,7 +3591,7 @@ FUNCTION_DESCRIPTIONS = {
     "deep_think": "deep_think(thought: str) -> dict: Record a private deliberate reasoning step, then continue solving with the returned acknowledgement. Available when External thinking is enabled and native thinking is disabled.",
     "delegate_agent": "delegate_agent(name: str, task: str, timeout: int|float = 240, poll_interval: int|float = 0.25) -> dict: Send a task to an idle named Nexus agent and wait for its final result. The target inherits its own persistent session, tools, MCP, skills, runtime settings, and shared workspace. Returns {ok, agent, status, result|error}.",
     "notify_agent": "notify_agent(name: str, task: str) -> dict: Start a task in an idle named Nexus agent and return immediately after admission. This is fire-and-forget: do not wait or poll unless the user later asks. Returns {ok, agent, status, pid|error}.",
-    "tool_search": "tool_search(query: str, limit: int = 5) -> dict: Search deferred built-in helper names and descriptions. Returns the most relevant exact helper signatures; call a discovered helper in a later execute block.",
+    "tool_search": "tool_search(query: str, limit: int = 5) -> dict: Search deferred built-in helper names and descriptions. Returns the most relevant exact helper signatures; call a discovered helper in a later code_execution call.",
     "create_plan": "create_plan(entries: str|list[str]) -> dict: Create a new workspace to-do plan and return the full plan.",
     "update_plan": "update_plan(completed: int|str|list[int|str]|None = None, new_entries: str|list[str]|None = None) -> dict: Mark plan entries completed and/or add new plan entries, then return updated entries and current plan.",
     "get_current_plan": "get_current_plan() -> dict: Get current workspace plan with [ ]/[✓] style formatted output.",
@@ -3619,9 +3622,9 @@ FUNCTION_DESCRIPTIONS = {
     "get_skill": "get_skill(name: str) -> dict: Get a skill by name. Returns {name, description, path, body, error}. Load the body only when using the skill.",
     "manage_skill": "manage_skill(name: str, description: str = '', body: str = '', delete: bool = False) -> dict: Create, update, or delete a personal skill under ~/.nexus/skills. Workspace and bundled skills are read-only.",
     "web_search": "web_search(query: str, max_results: int = 5) -> dict: Search the web via DuckDuckGo (Lite HTML with Instant Answer fallback). Returns {query, results: [{title, snippet, url}], error}.",
-    "rlm_spawn": "rlm_spawn(prompt: str, system: str = '', timeout: int = 300, max_tokens: int = 2048, template: str = '') -> dict: Non-blocking spawn of a persistent concurrent Nexus child process using the active provider/model, parent system prompt, unlimited tool turns, shared workspace, and tools. timeout is a hard wall-clock limit for each provider request and execute block. Returns an admitted handle immediately; end the current execute block after spawning so the child continues in the background.",
+    "rlm_spawn": "rlm_spawn(prompt: str, system: str = '', timeout: int = 300, max_tokens: int = 2048, template: str = '') -> dict: Non-blocking spawn of a persistent concurrent Nexus child process using the active provider/model, parent system prompt, unlimited tool turns, shared workspace, and tools. timeout is a hard wall-clock limit for each provider request and code_execution call. Returns an admitted handle immediately; end the current code_execution call after spawning so the child continues in the background.",
     "list_subagents": "list_subagents() -> list[dict]: Non-blocking workspace-wide list of named agents plus session-spawned child agents. status is normalized to idle, running, or stopped; task_status preserves the raw last-task state such as done or error. Returns kind, id, name, status, task_status, prompt, result, error, turn, and pid.",
-    "wait_subagents": "wait_subagents(handle_ids: list[str] | None = None, timeout: int|float = 300, poll_interval: int|float = 0.5) -> list[dict]: Block until selected named or spawned Nexus agents become idle/stopped or timeout. Accepts agent IDs or names, returns already-finished agents immediately, and rejects unknown IDs immediately. Use only in a later execute block, never in the block that starts an agent.",
+    "wait_subagents": "wait_subagents(handle_ids: list[str] | None = None, timeout: int|float = 300, poll_interval: int|float = 0.5) -> list[dict]: Block until selected named or spawned Nexus agents become idle/stopped or timeout. Accepts agent IDs or names, returns already-finished agents immediately, and rejects unknown IDs immediately. Use only in a later code_execution call, never in the call that starts an agent.",
     "delete_subagent": "delete_subagent(handle_id: str) -> dict: Delete a spawned child sub-agent by handle id.",
     "harness_overview": "harness_overview() -> dict: Continual harness overview: memories, skills, subagent templates, prompt notes, refinements.",
     "harness_memory": "harness_memory(key: str, content: str = '', delete: bool = False) -> dict: Read a persistent memory when content is omitted; create/update it when content is supplied; delete it with delete=True.",
@@ -3642,6 +3645,85 @@ FUNCTION_DESCRIPTIONS = {
 
 def get_functions() -> dict[str, object]:
     return dict(FUNCTIONS)
+
+
+def _annotation_schema_type(annotation) -> str:
+    if annotation is inspect.Parameter.empty or annotation is None:
+        return "string"
+    origin = _typing.get_origin(annotation)
+    args = _typing.get_args(annotation)
+    if origin is _typing.Union or (_types.UnionType is not None and origin is _types.UnionType):
+        non_none = [a for a in args if a is not type(None)]
+        if len(non_none) == 1:
+            return _annotation_schema_type(non_none[0])
+        if non_none and all(a in (int, float) for a in non_none):
+            return "number"
+        return "string"
+    if origin is list:
+        return "array"
+    if origin is dict:
+        return "object"
+    if annotation in (str, bytes):
+        return "string"
+    if annotation is int:
+        return "integer"
+    if annotation is float:
+        return "number"
+    if annotation is bool:
+        return "boolean"
+    if annotation is list:
+        return "array"
+    if annotation is dict:
+        return "object"
+    if annotation is _typing.List:
+        return "array"
+    if annotation is _typing.Dict:
+        return "object"
+    return "string"
+
+
+def _build_function_schema(name: str, func, description: str) -> dict:
+    parameters: dict = {"type": "object", "properties": {}}
+    required: list[str] = []
+    try:
+        hints = _typing.get_type_hints(func)
+    except Exception:
+        hints = {}
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is not None:
+        for param_name, param in signature.parameters.items():
+            if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                continue
+            prop: dict = {}
+            annotation = hints.get(param_name)
+            if annotation is None and param.annotation is not inspect.Parameter.empty:
+                annotation = param.annotation
+            prop["type"] = _annotation_schema_type(annotation)
+            if (
+                param.default is not inspect.Parameter.empty
+                and param.default is not None
+                and isinstance(param.default, (str, int, float, bool))
+            ):
+                prop["default"] = param.default
+            if param.default is inspect.Parameter.empty:
+                required.append(param_name)
+            parameters["properties"][param_name] = prop
+    if required:
+        parameters["required"] = required
+    return {
+        "type": "function",
+        "function": {"name": name, "description": description, "parameters": parameters},
+    }
+
+
+TOOL_SCHEMAS = [
+    _build_function_schema(name, fn, FUNCTION_DESCRIPTIONS[name])
+    for name, fn in FUNCTIONS.items()
+    if name in FUNCTION_DESCRIPTIONS
+]
 
 
 def get_descriptions() -> dict[str, str]:
@@ -3686,7 +3768,7 @@ def main() -> int:
         print(json.dumps(list_skills()))
         return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--describe-json":
-        print(json.dumps(FUNCTION_DESCRIPTIONS))
+        print(json.dumps({"descriptions": FUNCTION_DESCRIPTIONS, "schemas": TOOL_SCHEMAS}))
         return 0
     return 0
 
