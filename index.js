@@ -12,6 +12,18 @@ const { createHash, randomBytes, randomUUID } = require("crypto");
 const { WebSocket, WebSocketServer } = require("ws");
 const qrcodeTerminal = require("qrcode-terminal");
 
+// Defensive guard: Node deprecation warnings (e.g. DEP0190 from child_process
+// with shell:true + args) go to stderr and interleave with the raw-mode TUI,
+// rendering as stray text below the active buffer. The offending spawn sites are
+// fixed directly; this keeps any remaining/future deprecation noise off the
+// screen while still letting non-deprecation warnings reach stderr.
+process.on("warning", (warning) => {
+  if (warning && warning.name === "DeprecationWarning") {
+    return;
+  }
+  process.stderr.write(`${warning && warning.stack ? warning.stack : String(warning)}\n`);
+});
+
 const PACKAGE_ROOT = __dirname;
 const TOOLS_SCRIPT_PATH = path.join(PACKAGE_ROOT, "tools.py");
 const WORKSPACE_GUIDE_FILENAMES = ["AGENTS.md", "AGENT.md"];
@@ -230,7 +242,7 @@ const COMPACTION_DEFAULT_CUSTOM_INSTRUCTION =
 const MAX_REASONING_DISPLAY_CHARS = 4000;
 const MAX_INPUT_HISTORY_ITEMS = 500;
 const DEFAULT_LLM_REQUEST_TIMEOUT_MS = 120000;
-const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
+const DEFAULT_MAX_OUTPUT_TOKENS = 65536;
 const DEFAULT_MODEL_CONTEXT_WINDOW = 1000000;
 const DEFAULT_THINKING_EFFORT = "high";
 const THINKING_EFFORT_OPTIONS = ["low", "high", "xhigh", "max"];
@@ -319,6 +331,8 @@ const REMOTE_CONTROL_HTML = String.raw`<!doctype html>
     .task-marker { display:inline-block; width:20px; color:var(--dim); }
     .message.tool { color:#bdbdbd; padding:10px 12px; border-left:2px solid var(--blue); background:var(--panel); }
     .message.tool .tool-header { color:#e8e8e8; font-weight:600; margin-bottom:6px; }
+    .message.code { padding:0; }
+    .message.code .role { display:none; }
     .message.reasoning { color:var(--dim); font-style:italic; }
     .message.reasoning .role { display:none; }
     .message.reasoning::before { content:'◦ '; color:#666; }
@@ -712,7 +726,7 @@ const REMOTE_CONTROL_HTML = String.raw`<!doctype html>
       function appendHighlightedPython(parent, source) {
         var keywords = /^(?:False|None|True|and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield)$/;
         var builtins = /^(?:abs|all|any|bool|dict|enumerate|float|int|len|list|map|max|min|open|print|range|set|sorted|str|sum|tuple|zip)$/;
-        var pattern = /#[^\n]*|(?:[fFrRbBuU]{0,2})(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|\b\d+(?:[._]\d+)*\b|\b[A-Za-z_]\w*\b/g;
+        var pattern = /#[^\n]*|(?:[fFrRbBuU]{0,2})(?:"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|\b\d+(?:[._]\d+)*\b|\b[A-Za-z_]\w*\b/g;
         var index = 0;
         var match;
         while ((match = pattern.exec(source)) !== null) {
@@ -720,6 +734,7 @@ const REMOTE_CONTROL_HTML = String.raw`<!doctype html>
           var token = match[0];
           var className = '';
           if (token[0] === '#') className = 'tok-comment';
+          else if (/^[fFrRbBuU]{0,2}(?:"""|''')/.test(token)) className = 'tok-comment';
           else if (/^[fFrRbBuU]{0,2}["']/.test(token)) className = 'tok-string';
           else if (/^\d/.test(token)) className = 'tok-number';
           else if (keywords.test(token)) className = 'tok-keyword';
@@ -912,6 +927,11 @@ const REMOTE_CONTROL_HTML = String.raw`<!doctype html>
       }
 
       function appendMessageBody(item, message) {
+        if (message.role === 'code') {
+          var codeBlock = document.createElement('pre'); codeBlock.className = 'code';
+          appendHighlightedPython(codeBlock, message.content || ''); item.appendChild(codeBlock);
+          return;
+        }
         if (message.role === 'assistant' && Array.isArray(message.blocks) && message.blocks.length) {
           message.blocks.forEach(function (block) {
             if (block.type === 'code') {
@@ -923,14 +943,8 @@ const REMOTE_CONTROL_HTML = String.raw`<!doctype html>
           });
           return;
         }
-        if (message.role === 'tool' && (message.header || message.code)) {
-          if (message.header) {
-            var header = document.createElement('div'); header.className = 'tool-header'; header.textContent = message.header; item.appendChild(header);
-          }
-          if (message.code) {
-            var toolCode = document.createElement('pre'); toolCode.className = 'code';
-            appendHighlightedPython(toolCode, message.code); item.appendChild(toolCode);
-          }
+        if (message.role === 'tool' && message.header) {
+          var header = document.createElement('div'); header.className = 'tool-header'; header.textContent = message.header; item.appendChild(header);
         }
         var body = document.createElement('span'); body.textContent = message.content; item.appendChild(body);
       }
@@ -1138,6 +1152,7 @@ const COMMANDS = [
   { name: "/agent", description: "create or task an async agent: /agent <name> [task]" },
   { name: "/list-agents", description: "view agents, statuses, and switch agent sessions" },
   { name: "/new", description: "start a new chat with a new uid" },
+  { name: "/update", description: "check for a newer release and update if available" },
   { name: "/mcp", description: "manage MCP servers: start, stop, and reload configuration" },
   { name: "/remote-control", description: "connect a phone to this session over the local network" },
   { name: "/compact", description: "manually compact context: /compact [optional instruction]" },
@@ -1443,6 +1458,22 @@ let lastMcpRenderedRows = [];
 let lastMcpRenderedCols = 0;
 let lastMcpRenderedHeight = 0;
 const mcpBusyNames = new Set();
+// ---------------------------------------------------------------------------
+// Update-check buffer state (npm release version check on startup).
+// ---------------------------------------------------------------------------
+let updateCheckState = "idle"; // idle | checking | available | installing | done | error
+let updateCurrentVersion = "";
+let updateLatestVersion = "";
+let updateAvailable = false;
+let updatePanelSelected = 0; // 0 = update, 1 = continue
+let updateOutputLog = "";
+let updateSupplyBufferOpen = false;
+const UPDATE_REGISTRY_URL = "https://registry.npmjs.org/@bevren/nexus/latest";
+const UPDATE_FETCH_TIMEOUT_MS = 6000;
+const UPDATE_INSTALL_CMD = process.platform === "win32" ? "npm.cmd" : "npm";
+let lastUpdateRenderedRows = [];
+let lastUpdateRenderedCols = 0;
+let lastUpdateRenderedHeight = 0;
 let commandBufferQuery = "";
 let lastCommandRenderedRows = [];
 let lastCommandRenderedCols = 0;
@@ -1471,6 +1502,7 @@ let suppressKeypressUntil = 0;
 let suppressSolveEscapeKeypressUntil = 0;
 let suppressAgentMentionEscapeKeypressUntil = 0;
 let suppressRemoteControlEscapeKeypressUntil = 0;
+let suppressUpdateEscapeKeypressUntil = 0;
 let suppressModelEscapeKeypressUntil = 0;
 let suppressMouseNoiseUntil = 0;
 let ignoreNextProvidersEscape = false;
@@ -5340,6 +5372,9 @@ async function rewriteSessionWithCurrentMessages() {
       if (typeof entry?.uiContent === "string") {
         payload.uiContent = entry.uiContent;
       }
+      if (typeof entry?.planAction === "string" && entry.planAction.trim()) {
+        payload.planAction = entry.planAction.trim();
+      }
       if (Array.isArray(entry?.toolCalls) && entry.toolCalls.length > 0) {
         payload.toolCalls = entry.toolCalls
           .filter((call) => call && typeof call === "object" && String(call?.function?.name || "").trim())
@@ -5781,7 +5816,7 @@ function normalizeRuntimeModelId(value) {
 function normalizeLlmMaxOutputTokens(value) {
   const raw = Number(value);
   if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_MAX_OUTPUT_TOKENS;
-  return Math.max(256, Math.min(65536, Math.floor(raw)));
+  return Math.max(256, Math.min(393216, Math.floor(raw)));
 }
 
 function getDefaultSessionRuntimeSettings() {
@@ -6003,6 +6038,15 @@ function applyThinkingRequestSettings(payload, modelId = selectedModel, enabled 
   return payload;
 }
 
+function applyMaxOutputTokens(payload, settings = getMainSessionRuntimeSettings()) {
+  if (!payload) return payload;
+  const requestedMaxTokens = Number(settings?.max_output_tokens || 0);
+  if (Number.isFinite(requestedMaxTokens) && requestedMaxTokens > 0) {
+    payload.max_tokens = requestedMaxTokens;
+  }
+  return payload;
+}
+
 function getLlmRequestTimeoutMs() {
   return getMainSessionRuntimeSettings().request_timeout_ms;
 }
@@ -6109,6 +6153,16 @@ async function saveNexusConfig() {
     ),
     vision_model: normalizeRuntimeModelId(
       nexusConfig?.vision_model ?? current?.vision_model
+    ),
+    model_context_window_override: normalizeModelContextWindow(
+      nexusConfig?.model_context_window_override ??
+        sessionRuntimeSettings?.context_window ??
+        current?.model_context_window_override
+    ),
+    max_output_tokens: normalizeLlmMaxOutputTokens(
+      nexusConfig?.max_output_tokens ??
+        sessionRuntimeSettings?.max_output_tokens ??
+        current?.max_output_tokens
     ),
   };
   nexusConfig = next;
@@ -6322,6 +6376,9 @@ function appendHistoryEntry(role, content, extra = null) {
     }
     if (typeof extra.uiContent === "string") {
       payload.uiContent = extra.uiContent;
+    }
+    if (typeof extra.planAction === "string" && extra.planAction.trim()) {
+      payload.planAction = extra.planAction.trim();
     }
     if (extra.hidden === true) {
       payload.hidden = true;
@@ -8349,10 +8406,12 @@ async function runCompaction(customInstruction = "") {
 
   let summaryText = "";
   try {
-    const completion = await client.chat.completions.create({
+    const compactionPayload = {
       model: resolvedModel,
       messages: [...requestMessages.filter((message) => message.role === "system"), { role: "user", content: summaryPrompt }],
-    });
+    };
+    applyMaxOutputTokens(compactionPayload);
+    const completion = await client.chat.completions.create(compactionPayload);
     const content = completion?.choices?.[0]?.message?.content;
     summaryText = typeof content === "string" ? content.trim() : "";
   } catch (error) {
@@ -8473,6 +8532,7 @@ async function runNamedAgentCompaction(customInstruction = "") {
     payload.reasoning = { enabled: false };
     payload.thinking = { type: "disabled" };
   }
+  applyMaxOutputTokens(payload, runtime.settings);
 
   let completion;
   let summaryText = "";
@@ -9558,7 +9618,8 @@ async function executeNativeToolCall(toolCall, generation) {
       toolResultPayload.toolOk,
       generation,
       toolResultPayload.uiKind,
-      toolResultPayload.uiSections
+      toolResultPayload.uiSections,
+      toolResultPayload.planAction
     );
     return { execResult };
   } catch (error) {
@@ -9921,18 +9982,25 @@ function formatPlanUiMarkdown(event) {
   if (!event || event.type !== "plan" || !Array.isArray(event.entries)) {
     return "";
   }
-  const title = typeof event.title === "string" && event.title.trim()
-    ? event.title.trim().replace(/[\r\n]+/g, " ")
-    : "Plan";
-  const lines = [`## ${title}`, ""];
+  const lines = [];
+  let sawCurrent = false;
   for (const entry of event.entries) {
     if (!entry || typeof entry.text !== "string" || !entry.text.trim()) {
       continue;
     }
     const text = entry.text.trim().replace(/[\r\n]+/g, " ");
-    lines.push(`${entry.completed === true ? "🗹" : "☐"} ${text}`);
+    let marker;
+    if (entry.completed === true) {
+      marker = "🗹";
+    } else if (!sawCurrent) {
+      marker = "▶";
+      sawCurrent = true;
+    } else {
+      marker = "☐";
+    }
+    lines.push(`  ${marker} ${text}`);
   }
-  return lines.length > 2 ? lines.join("\n") : "";
+  return lines.length > 0 ? lines.join("\n") : "";
 }
 
 function buildToolResultPayload(result) {
@@ -9950,6 +10018,11 @@ function buildToolResultPayload(result) {
     : [];
   const planUiMarkdown = planUiEvents.length > 0
     ? formatPlanUiMarkdown(planUiEvents[planUiEvents.length - 1])
+    : "";
+  const planAction = planUiEvents.length > 0
+    ? (typeof planUiEvents[planUiEvents.length - 1]?.action === "string"
+      ? planUiEvents[planUiEvents.length - 1].action.trim()
+      : "")
     : "";
 
   if (result?.ok) {
@@ -10003,6 +10076,7 @@ function buildToolResultPayload(result) {
       historyText,
       uiKind: planUiMarkdown ? "plan" : "",
       uiSections,
+      planAction,
       toolOk: getToolUiOk(result),
     };
   }
@@ -10285,18 +10359,14 @@ function removePendingAssistantMessage(index, generation) {
 }
 
 function hideSupersededPlanUiEntries(entries) {
+  // Keep every plan UI entry visible so the full plan history can be reviewed
+  // while scrolling. Only the index of the latest plan is still reported for
+  // callers that care; no entry is marked hidden.
   let latestPlanIndex = -1;
   for (let index = 0; index < entries.length; index += 1) {
-    if (entries[index]?.uiKind !== "plan") {
-      continue;
+    if (entries[index]?.uiKind === "plan") {
+      latestPlanIndex = index;
     }
-    if (latestPlanIndex >= 0) {
-      entries[latestPlanIndex].hidden = true;
-    }
-    latestPlanIndex = index;
-  }
-  if (latestPlanIndex >= 0) {
-    entries[latestPlanIndex].hidden = false;
   }
   return latestPlanIndex;
 }
@@ -10311,7 +10381,8 @@ function appendToolMessages(
   toolOk,
   generation,
   uiKind = "",
-  uiSections = null
+  uiSections = null,
+  planAction = ""
 ) {
   if (generation !== chatGeneration) {
     return;
@@ -10322,6 +10393,7 @@ function appendToolMessages(
   const normalizedCode = String(executedCode ?? "");
   const normalizedResult = String(resultText ?? "");
   const normalizedHistoryResult = String(historyResultText ?? "");
+  const normalizedPlanAction = String(planAction ?? "").trim();
   const normalizedUiSections = Array.isArray(uiSections)
     ? uiSections.filter((section) =>
         section && typeof section.text === "string" && section.text.trim().length > 0
@@ -10370,6 +10442,7 @@ function appendToolMessages(
     content: safeHistoryResult,
     uiContent: safeResult,
     ...(normalizedUiKind ? { uiKind: normalizedUiKind } : {}),
+    ...(normalizedPlanAction ? { planAction: normalizedPlanAction } : {}),
   });
   if (normalizedUiKind === "plan") {
     hideSupersededPlanUiEntries(messages);
@@ -10381,6 +10454,7 @@ function appendToolMessages(
     toolCode: normalizedCode,
     toolOk: Boolean(toolOk),
     ...(normalizedUiKind ? { uiKind: normalizedUiKind, uiContent: safeResult } : {}),
+    ...(normalizedPlanAction ? { planAction: normalizedPlanAction } : {}),
   });
   scrollChatToBottom();
   // Replace the live tool register with the permanent result in place. A full
@@ -10472,10 +10546,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
       applyThinkingRequestSettings(payload, resolvedModel, includeReasoning);
       payload.tools = CODE_EXECUTION_TOOL_SCHEMA;
       payload.tool_choice = "auto";
-      const requestedMaxTokens = Number(getMainSessionRuntimeSettings().max_output_tokens || 0);
-      if (Number.isFinite(requestedMaxTokens) && requestedMaxTokens > 0) {
-        payload.max_tokens = requestedMaxTokens;
-      }
+      applyMaxOutputTokens(payload);
 
       const requestController = new AbortController();
       activeLlmAbortController = requestController;
@@ -10579,13 +10650,16 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
 
     const reasoningEnabledNow = getReasoningEnabledForModel(resolvedModel);
     let assistantPayload = extractAssistantPayloadFromCompletion(completion, {
-      allowReasoningTextFallback: reasoningEnabledNow,
+      allowReasoningTextFallback: false,
     });
     // Empty assistant message (reasoning-only or transient provider response
     // with no tool calls): re-run with reasoning off a few times so the turn
     // does not silently stall. A tool-call-only reply is a valid turn and is
     // handled below, not retried here.
     if (assistantPayload.text.trim().length === 0 && (assistantPayload.toolCalls || []).length === 0) {
+      // Preserve the reasoning trace from the original response before a
+      // reasoning-off retry replaces the payload (the retry has no reasoning).
+      const originalReasoningDetails = assistantPayload.reasoningDetails;
       try {
         const retried = await retryAssistantPayloadForEmpty(requestMessages, resolvedModel, {
           maxAttempts: 3,
@@ -10595,19 +10669,33 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
           completion = retried.completion;
           updateContextBudgetFromCompletion(completion, resolvedModel);
           assistantPayload = retried.payload;
-          if (retried.disabledReasoning && getReasoningEnabledForModel(resolvedModel)) {
-            setReasoningEnabledForModel(resolvedModel, false);
-            appendAssistantMessage(
-              "Auto-disabled thinking for this model (empty content after retries). Use /settings to re-enable it.",
-              { excludeFromRequest: true, persistHistory: false }
-            );
-            await rewriteSessionWithCurrentMessages().catch(() => {});
-            markDirty();
-            renderFrame(false);
+          if (
+            originalReasoningDetails &&
+            (!assistantPayload.reasoningDetails || assistantPayload.reasoningDetails.length === 0)
+          ) {
+            assistantPayload.reasoningDetails = originalReasoningDetails;
           }
+          // NOTE: do not auto-disable thinking here. DeepSeek reasoning models
+          // legitimately return reasoning_content with an empty content field;
+          // a reasoning-off retry keeps the loop alive but must not permanently
+          // turn off the user's thinking toggle.
         }
       } catch {
-        // Keep original payload and fall through to user-facing error text.
+        // Keep the original payload; the reasoning fallback below applies.
+      }
+    }
+
+    // Last resort for a reasoning-only response: if the retries still produced
+    // no text and no tool calls, surface the reasoning as the assistant content
+    // once (and clear the reasoning block) instead of rendering it twice.
+    if (
+      assistantPayload.text.trim().length === 0 &&
+      (assistantPayload.toolCalls || []).length === 0
+    ) {
+      const reasoningPreview = extractReasoningDisplayText(assistantPayload.reasoningDetails);
+      if (reasoningPreview.trim().length > 0) {
+        assistantPayload.text = reasoningPreview;
+        assistantPayload.reasoningDetails = null;
       }
     }
 
@@ -10901,7 +10989,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
 
       const followUpReasoningEnabled = getReasoningEnabledForModel(resolvedModel);
       let followUpPayload = extractAssistantPayloadFromCompletion(followUpCompletion, {
-        allowReasoningTextFallback: followUpReasoningEnabled,
+        allowReasoningTextFallback: false,
       });
       const followUpNativeToolCalls = Array.isArray(followUpPayload?.toolCalls)
         ? followUpPayload.toolCalls
@@ -10953,19 +11041,19 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
             updateContextBudgetFromCompletion(followUpCompletion, resolvedModel);
             followUpContent = retried.payload.text;
             followUpReasoningDetails = null;
-            if (retried.disabledReasoning && getReasoningEnabledForModel(resolvedModel)) {
-              setReasoningEnabledForModel(resolvedModel, false);
-              appendAssistantMessage(
-                "Auto-disabled thinking for this model (empty follow-up content after retries). Use /settings to re-enable it.",
-                { excludeFromRequest: true, persistHistory: false }
-              );
-              await rewriteSessionWithCurrentMessages().catch(() => {});
-              markDirty();
-              renderFrame(false);
-            }
+            // NOTE: do not auto-disable thinking here (see the empty-content
+            // path above); a reasoning-only response is normal for reasoning
+            // models and must not silently clear the user's thinking toggle.
           }
         } catch {
-          // Keep the original empty result; the notice below will explain.
+          // Keep the original empty result; the reasoning fallback below applies.
+        }
+      }
+      if (followUpContent.trim().length === 0 && followUpReasoningDetails) {
+        const followUpReasoningPreview = extractReasoningDisplayText(followUpReasoningDetails);
+        if (followUpReasoningPreview.trim().length > 0) {
+          followUpContent = followUpReasoningPreview;
+          followUpReasoningDetails = null;
         }
       }
       followUpContent = normalizeAssistantToolUseResponse(followUpContent);
@@ -11658,6 +11746,7 @@ async function runSolveLoop(taskText) {
   const requestWithTimeout = async (messagesForRequest, options = {}) => {
     const payload = { model: resolvedModel, messages: messagesForRequest };
     applyThinkingRequestSettings(payload, resolvedModel, true);
+    applyMaxOutputTokens(payload);
     const controller = new AbortController();
     solveRequestAbortController = controller;
     const requestPromise = client.chat.completions.create(payload, { signal: controller.signal });
@@ -12878,6 +12967,9 @@ function mainSessionMessageToNamedMessage(entry) {
       tool_ok: typeof entry.toolOk === "boolean" ? entry.toolOk : true,
       ...(entry.uiKind === "plan" ? { ui_kind: "plan" } : {}),
       ...(typeof entry.uiContent === "string" ? { ui_content: entry.uiContent } : {}),
+      ...(typeof entry.planAction === "string" && entry.planAction.trim()
+        ? { plan_action: entry.planAction.trim() }
+        : {}),
     };
   }
   if (entry.role !== "user" && entry.role !== "assistant") return null;
@@ -12903,6 +12995,9 @@ function namedSessionMessageToMainMessage(entry) {
       toolOk: typeof entry.tool_ok === "boolean" ? entry.tool_ok : true,
       ...(entry.ui_kind === "plan" ? { uiKind: "plan" } : {}),
       ...(typeof entry.ui_content === "string" ? { uiContent: entry.ui_content } : {}),
+      ...(typeof entry.plan_action === "string" && entry.plan_action.trim()
+        ? { planAction: entry.plan_action.trim() }
+        : {}),
     };
   }
   if (entry.role !== "user" && entry.role !== "assistant") return null;
@@ -14589,6 +14684,9 @@ function parseSessionHistory(raw, options = {}) {
             ...(typeof parsed?.toolOk === "boolean" ? { toolOk: parsed.toolOk } : {}),
             ...(parsed?.uiKind === "plan" ? { uiKind: "plan" } : {}),
             ...(typeof parsed?.uiContent === "string" ? { uiContent: parsed.uiContent } : {}),
+            ...(typeof parsed?.planAction === "string" && parsed.planAction.trim()
+              ? { planAction: parsed.planAction.trim() }
+              : {}),
             ...(parsed?.hidden === true ? { hidden: true } : {}),
             ...(parsed?.excludeFromRequest === true ? { excludeFromRequest: true } : {}),
           });
@@ -15256,6 +15354,40 @@ async function runSlashCommand(commandName, commandArgs = "") {
       return true;
     }
     await startNewChat();
+    return true;
+  }
+
+  if (commandName === "/update") {
+    if (activeAgentName !== "main") {
+      showAgentCommandNotice("/update is only available in the main session.", true);
+      return true;
+    }
+    if (pendingAssistantRequests > 0) {
+      appendTuiErrorMessage("/update");
+      return true;
+    }
+    // Force a fresh registry check (bypasses any throttle) and show the
+    // update buffer if a newer release exists.
+    updateAvailable = false;
+    updateCurrentVersion = getAppCurrentVersion();
+    updateCheckState = "checking";
+    const latestVersion = await fetchLatestReleaseVersion();
+    if (!latestVersion) {
+      showAgentCommandNotice("Could not reach the npm registry. Check your network and try again.", true);
+      return true;
+    }
+    updateLatestVersion = latestVersion;
+    if (compareVersions(latestVersion, updateCurrentVersion) > 0) {
+      updateAvailable = true;
+      updateCheckState = "available";
+      openUpdateBuffer();
+    } else {
+      showAgentCommandNotice(
+        `You are on the latest version (@bevren/nexus ${updateCurrentVersion}).`,
+        false
+      );
+      refreshMainBufferAfterCommand();
+    }
     return true;
   }
 
@@ -16139,6 +16271,14 @@ function formatContextWindow(value) {
   return String(amount);
 }
 
+function formatMaxOutputTokens(value) {
+  const amount = Number(value);
+  if (Number.isFinite(amount) && amount >= 1024 && amount % 1024 === 0) {
+    return `${amount / 1024}k`;
+  }
+  return String(amount);
+}
+
 function formatRequestTimeout(value) {
   const amount = Number(value);
   if (amount >= 60000 && amount % 60000 === 0) return `${amount / 60000}m`;
@@ -16218,8 +16358,8 @@ function getRuntimeSettings() {
       key: "max_output_tokens",
       label: "max output tokens",
       value: runtimeSettings.max_output_tokens,
-      options: uniqueSettingOptions([1024, 2048, 4096, 8192, 16384], runtimeSettings.max_output_tokens),
-      format: (value) => String(value),
+      options: uniqueSettingOptions([16384, 32768, 65536, 131072, 262144, 393216], runtimeSettings.max_output_tokens),
+      format: formatMaxOutputTokens,
     },
   ];
 }
@@ -16436,6 +16576,8 @@ async function cycleSelectedRuntimeSetting(direction = 1) {
           runtime.settings.context_window = normalizeModelContextWindow(nextValue);
         } else if (setting.key === "request_timeout") {
           runtime.settings.request_timeout_ms = normalizeLlmRequestTimeoutMs(nextValue);
+        } else if (setting.key === "max_output_tokens") {
+          runtime.settings.max_output_tokens = normalizeLlmMaxOutputTokens(nextValue);
         }
       });
       cachedChatLines = null;
@@ -16461,9 +16603,15 @@ async function cycleSelectedRuntimeSetting(direction = 1) {
     } else if (setting.key === "context_window") {
       getMainSessionRuntimeSettings().context_window = normalizeModelContextWindow(nextValue);
       await rewriteSessionWithCurrentMessages();
+      await saveNexusConfig().catch(() => {});
     } else if (setting.key === "request_timeout") {
       getMainSessionRuntimeSettings().request_timeout_ms = normalizeLlmRequestTimeoutMs(nextValue);
       await rewriteSessionWithCurrentMessages();
+      await saveNexusConfig().catch(() => {});
+    } else if (setting.key === "max_output_tokens") {
+      getMainSessionRuntimeSettings().max_output_tokens = normalizeLlmMaxOutputTokens(nextValue);
+      await rewriteSessionWithCurrentMessages();
+      await saveNexusConfig().catch(() => {});
     }
     const updated = getRuntimeSettings().find((entry) => entry.key === setting.key);
     const formattedValue = updated?.format ? updated.format(updated.value) : String(updated?.value ?? nextValue);
@@ -16529,7 +16677,8 @@ function buildRemoteControlStatus() {
 }
 
 function getRemoteToolHeader(message) {
-  const name = typeof message?.name === "string" && message.name ? message.name : "code_execution";
+  const planAction = typeof message?.planAction === "string" ? message.planAction.trim() : "";
+  const name = planAction || (typeof message?.name === "string" && message.name ? message.name : "code_execution");
   const editSummary = extractEditSummaryFromToolOutput(
     typeof message?.content === "string" ? message.content : ""
   );
@@ -16539,7 +16688,6 @@ function getRemoteToolHeader(message) {
 
 function getRemoteToolCode(message) {
   if (message?.name !== "code_execution") return "";
-  if (typeof message?.toolCallId !== "string" || !message.toolCallId) return "";
   return typeof message.toolInput === "string" ? message.toolInput : "";
 }
 
@@ -16571,9 +16719,9 @@ function getRemoteControlVisibleMessages() {
         });
       }
     }
-    const raw = typeof message.content === "string"
-      ? message.content
-      : JSON.stringify(message.content ?? "", null, 2);
+    const raw = message.uiKind === "plan" && typeof message.uiContent === "string"
+      ? message.uiContent
+      : (typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "", null, 2));
     let content;
     if (message.role === "tool") {
       const displayLines = getToolResultLinesForDisplay(raw);
@@ -16590,11 +16738,15 @@ function getRemoteControlVisibleMessages() {
         ? `${raw.slice(0, REMOTE_CONTROL_MAX_MESSAGE_CHARS)}\n... [truncated on remote]`
         : raw;
     }
+    if (message.role === "tool" && message.uiKind !== "plan") {
+      const code = getRemoteToolCode(message);
+      if (code.trim()) {
+        remoteMessages.push({ role: "code", content: code });
+      }
+    }
     const entry = { role: message.role, content };
     if (message.role === "tool") {
       entry.header = getRemoteToolHeader(message);
-      const code = getRemoteToolCode(message);
-      if (code.trim()) entry.code = code;
     }
     if (message.role === "assistant") {
       const annotated = annotateAssistantCodeBlocks(content);
@@ -17778,6 +17930,396 @@ function renderLoopsBuffer() {
   dirty = false;
 }
 
+// ---------------------------------------------------------------------------
+// Update-check buffer: shown on startup when a newer npm release exists.
+// ---------------------------------------------------------------------------
+function getUpdatePanelVisibleRows() {
+  const rows = process.stdout.rows || 24;
+  return Math.max(3, Math.min(8, rows - 8));
+}
+
+function compareVersions(a, b) {
+  const parse = (v) => String(v || "").split(".").map((n) => parseInt(n, 10) || 0);
+  const pa = parse(a);
+  const pb = parse(b);
+  for (let i = 0; i < 3; i += 1) {
+    if (pa[i] > pb[i]) return 1;
+    if (pa[i] < pb[i]) return -1;
+  }
+  return 0;
+}
+
+function getAppCurrentVersion() {
+  try {
+    // eslint-disable-next-line global-require
+    const pkg = require(path.join(PACKAGE_ROOT, "package.json"));
+    if (pkg && typeof pkg.version === "string") {
+      return pkg.version;
+    }
+  } catch {
+    // fall through
+  }
+  return "0.0.0";
+}
+
+async function fetchLatestReleaseVersion(timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs || UPDATE_FETCH_TIMEOUT_MS);
+  try {
+    const resp = await fetch(UPDATE_REGISTRY_URL, { signal: controller.signal, headers: { Accept: "application/json" } });
+    if (!resp.ok) {
+      return "";
+    }
+    const data = await resp.json();
+    const version = data && typeof data.version === "string" ? data.version : "";
+    return version;
+  } catch {
+    return "";
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function checkForUpdate({ force = false } = {}) {
+  // Refresh the release check on every startup so a new published version is
+  // surfaced as soon as it is released (no throttle delay). The fetch is
+  // non-blocking with a short timeout, so an offline registry never blocks the TUI.
+  const currentVersion = getAppCurrentVersion();
+  updateCurrentVersion = currentVersion;
+  updateCheckState = "checking";
+  const latestVersion = await fetchLatestReleaseVersion();
+  if (!latestVersion) {
+    updateCheckState = "idle";
+    return;
+  }
+  updateLatestVersion = latestVersion;
+  if (compareVersions(latestVersion, currentVersion) > 0) {
+    updateAvailable = true;
+    updateCheckState = "available";
+    openUpdateBuffer();
+  } else {
+    updateAvailable = false;
+    updateCheckState = "idle";
+  }
+}
+
+async function runUpdateSelfTest() {
+  const out = process.stdout.write.bind(process.stdout);
+  try {
+    if (compareVersions("1.0.0", "1.0.0") !== 0) {
+      out("UPDATE_FAIL: equal versions must compare 0\n");
+      return 1;
+    }
+    if (compareVersions("1.2.0", "1.10.0") !== -1) {
+      out("UPDATE_FAIL: 1.2.0 must be < 1.10.0\n");
+      return 1;
+    }
+    if (compareVersions("2.0.0", "1.9.9") !== 1) {
+      out("UPDATE_FAIL: 2.0.0 must be > 1.9.9\n");
+      return 1;
+    }
+    if (compareVersions("1.0.0", "1.0.1") !== -1) {
+      out("UPDATE_FAIL: patch bump must be newer\n");
+      return 1;
+    }
+
+    // Windows cannot exec .cmd files without a shell (spawn EINVAL). Verify the
+    // update installer's spawn path works on the current platform by running a
+    // trivial, no-network npm command through the same options. npm is always
+    // present when running from a source checkout (this file's own launcher).
+    const spawnProbe = await new Promise((resolve) => {
+      execFile(`${UPDATE_INSTALL_CMD} --version`, [], {
+        timeout: 15000,
+        maxBuffer: 1024 * 1024,
+        shell: true,
+      }, (error, stdout) => {
+        resolve({ ok: !error && String(stdout || "").trim().length > 0, error: error?.code || error?.message || "" });
+      });
+    });
+    if (!spawnProbe.ok) {
+      out(`UPDATE_FAIL: npm spawn probe failed (${spawnProbe.error}) - update installer would fail\n`);
+      return 1;
+    }
+    if (!COMMANDS.some((command) => command.name === "/update")) {
+      out("UPDATE_FAIL: /update command must be registered\n");
+      return 1;
+    }
+
+    const savedCurrent = updateCurrentVersion;
+    const savedLatest = updateLatestVersion;
+    const savedAvailable = updateAvailable;
+    const savedState = updateCheckState;
+    updateCurrentVersion = "1.0.0";
+    updateLatestVersion = "1.1.0";
+    updateAvailable = true;
+    updateCheckState = "available";
+    const updateCommand = buildUpdateInstallCommand();
+
+    // Ensure the update buffer renders without throwing (no TTY uses defaults).
+    renderUpdateBuffer();
+
+    // Reset to a clean state so the test main path can re-open the buffer.
+    closeUpdateBuffer();
+
+    updateCurrentVersion = savedCurrent;
+    updateLatestVersion = savedLatest;
+    updateAvailable = savedAvailable;
+    updateCheckState = savedState;
+
+    if (
+      !updateCommand.includes("@bevren/nexus@1.1.0") ||
+      !updateCommand.includes("--prefer-online") ||
+      updateCommand.includes("@latest")
+    ) {
+      out(`UPDATE_FAIL: update install command must pin the requested version: ${updateCommand}\n`);
+      return 1;
+    }
+
+    out("UPDATE_OK\n");
+    return 0;
+  } catch (error) {
+    out(`UPDATE_FAIL: ${String(error?.message || error)}\n`);
+    return 1;
+  }
+}
+
+function openUpdateBuffer() {
+  const reuseAltScreen = altScreenActive;
+  commandBufferQuery = "";
+  activeBuffer = "update";
+  enterAltScreenIfNeeded();
+  isBracketedPasteActive = false;
+  bracketedPasteBuffer = "";
+  pasteParserBuffer = "";
+  updatePanelSelected = 0;
+  lastUpdateRenderedRows = [];
+  lastUpdateRenderedCols = 0;
+  lastUpdateRenderedHeight = 0;
+  forceFullClearOnNextRender = !reuseAltScreen;
+  cancelIdleFlush();
+  burstMode = false;
+  markDirty();
+  renderFrame(true);
+}
+
+function closeUpdateBuffer() {
+  exitAltScreenIfNeeded({ preserveRestoredScreen: true });
+  activeBuffer = "main";
+  lastUpdateRenderedRows = [];
+  lastUpdateRenderedCols = 0;
+  lastUpdateRenderedHeight = 0;
+  cancelIdleFlush();
+  burstMode = false;
+  markDirty();
+  renderFrame(false);
+}
+
+function dismissUpdateBufferOrExit() {
+  if (updateCheckState === "done") {
+    // The new version is installed: exit so the user relaunches into it.
+    // The running process still holds the pre-update code in memory; reloading
+    // in place is not safe, so exit and let the user relaunch `nexus`.
+    try {
+      cleanupTerminal({ clearScreen: true });
+    } catch {
+      // Never let cleanup failures block the exit.
+    }
+    process.exit(0);
+    return;
+  }
+  closeUpdateBuffer();
+}
+
+function updateReplUpdateBuffer() {
+  if (activeBuffer !== "update") {
+    return;
+  }
+  markDirty();
+  renderFrame(true);
+}
+
+function buildUpdateInstallCommand() {
+  // Single command string through the shell: avoids Node's DEP0190 warning
+  // (args array + shell:true concatenates unescaped) and lets npm.cmd resolve
+  // from PATH on Windows (spawn EINVAL if exec'd directly). Pin the exact
+  // version the registry reported (not the @latest dist-tag) so a lagging
+  // CDN/cache surfaces as a retryable ETARGET instead of silently reinstalling
+  // the previous release, and --prefer-online bypasses stale metadata.
+  const version = typeof updateLatestVersion === "string" && updateLatestVersion.trim()
+    ? updateLatestVersion.trim()
+    : "latest";
+  return `${UPDATE_INSTALL_CMD} install -g @bevren/nexus@${version} --prefer-online --no-fund --no-audit`;
+}
+
+async function readInstalledGlobalVersion() {
+  const command = `${UPDATE_INSTALL_CMD} ls -g @bevren/nexus --json --depth=0`;
+  try {
+    const result = await execFileAsync(command, [], {
+      timeout: 30000,
+      maxBuffer: 1024 * 1024,
+      shell: true,
+    });
+    const parsed = JSON.parse(String(result.stdout || ""));
+    const entry = parsed && parsed.dependencies && parsed.dependencies["@bevren/nexus"];
+    return entry && typeof entry.version === "string" ? entry.version : "";
+  } catch {
+    return "";
+  }
+}
+
+async function runUpdateInstall() {
+  if (!updateAvailable) {
+    return;
+  }
+  updateCheckState = "installing";
+  updateOutputLog = `Updating @bevren/nexus ${updateCurrentVersion} -> ${updateLatestVersion}...\n`;
+  updateReplUpdateBuffer();
+  const install = async () => {
+    try {
+      const result = await execFileAsync(buildUpdateInstallCommand(), [], {
+        timeout: 240000,
+        maxBuffer: 16 * 1024 * 1024,
+        shell: true,
+      });
+      return { ok: true, stdout: result.stdout || "", stderr: result.stderr || "" };
+    } catch (error) {
+      return { ok: false, stdout: String(error?.stdout || ""), stderr: String(error?.stderr || error?.message || "") };
+    }
+  };
+  // Right after a publish the registry CDN may lag: dist-tags.latest points at
+  // the new version while the packument fetch still lists the previous one,
+  // which surfaces as ETARGET. Retry briefly so the update succeeds without
+  // making the user wait out a long failure.
+  let result = { ok: false, stdout: "", stderr: "" };
+  const MAX_ATTEMPTS = 4;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    result = await install();
+    const combined = (result.stdout || "") + (result.stderr || "");
+    const targetMiss = /ETARGET|No matching version found/i.test(combined);
+    if (result.ok && !targetMiss) {
+      break;
+    }
+    if (attempt < MAX_ATTEMPTS && targetMiss) {
+      updateOutputLog += `Registry still propagating new release (attempt ${attempt}/${MAX_ATTEMPTS})...\n`;
+      updateReplUpdateBuffer();
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+    }
+  }
+  updateOutputLog += (result.stdout || "") + (result.stderr || "");
+  const trimmed = (result.stdout + " " + result.stderr).trim();
+  const installOk = result.ok && !/(npm error|npm warn|ENEEDAUTH|EACCES|E2BIG|failed|ETARGET|No matching version found)/i.test(trimmed);
+
+  // npm can exit 0 while a lagging registry/cache still serves the previous
+  // release, so confirm the installed version actually matches before claiming
+  // the update succeeded.
+  let verifiedVersion = "";
+  if (installOk && typeof updateLatestVersion === "string" && updateLatestVersion.trim()) {
+    verifiedVersion = await readInstalledGlobalVersion();
+  }
+  const versionMismatch = verifiedVersion.length > 0 && compareVersions(verifiedVersion, updateLatestVersion) < 0;
+  const succeeded = installOk && !versionMismatch;
+  updateCheckState = succeeded ? "done" : "error";
+  if (succeeded) {
+    updateOutputLog += "\nUpdate complete. Press any key to exit, then run 'nexus' again to use the new version.";
+  } else if (versionMismatch) {
+    updateOutputLog += `\nUpdate did not apply: registry still served ${verifiedVersion} (expected ${updateLatestVersion}). Try again in a moment. Press any key to continue.`;
+  } else {
+    updateOutputLog += "\nUpdate failed. Press any key to continue.";
+  }
+  updateReplUpdateBuffer();
+}
+
+function renderUpdateBuffer() {
+  process.stdout.write(HIDE_CURSOR);
+  const rows = process.stdout.rows || 24;
+  const cols = process.stdout.columns || 80;
+  const panelWidth = Math.min(Math.max(60, Math.floor(cols * 0.9)), cols);
+  const panelLeft = Math.max(0, Math.floor((cols - panelWidth) / 2));
+
+  if (!hasInitializedScreen || forceFullClearOnNextRender) {
+    readline.cursorTo(process.stdout, 0, 0);
+    readline.clearScreenDown(process.stdout);
+    hasInitializedScreen = true;
+    forceFullClearOnNextRender = false;
+    lastUpdateRenderedRows = [];
+  }
+  if (lastUpdateRenderedCols !== cols || lastUpdateRenderedHeight !== rows) {
+    lastUpdateRenderedRows = [];
+    lastUpdateRenderedCols = cols;
+    lastUpdateRenderedHeight = rows;
+  }
+
+  const frameRows = Array.from({ length: rows }, () => ({ text: " ".repeat(cols), color: null }));
+  const setPanelRow = (y, content, color = null, styledContent = "") => {
+    if (y < 0 || y >= rows) return;
+    const clipped = String(content || "").slice(0, panelWidth).padEnd(panelWidth, " ");
+    const left = " ".repeat(panelLeft);
+    const right = " ".repeat(Math.max(0, cols - panelLeft - panelWidth));
+    frameRows[y] = { text: `${left}${clipped}${right}`.slice(0, cols), color, styledContent };
+  };
+
+  setPanelRow(0, "Update Available", BOLD_WHITE);
+  setPanelRow(1, `A newer version of @bevren/nexus is available.`, PLACEHOLDER_COLOR);
+  setPanelRow(2, `Current: ${updateCurrentVersion || "?"}   Latest: ${updateLatestVersion || "?"}`, PLACEHOLDER_COLOR);
+
+  if (updateCheckState === "installing" || updateCheckState === "done" || updateCheckState === "error") {
+    const logLines = String(updateOutputLog || "").split("\n").slice(-(rows - 6));
+    logLines.forEach((line, i) => {
+      setPanelRow(3 + i, line, line.trim().length ? PLACEHOLDER_COLOR : null);
+    });
+    setPanelRow(
+      rows - 1,
+      updateCheckState === "error"
+        ? "Update failed. Press any key to continue."
+        : updateCheckState === "done"
+          ? "Update complete. Press any key to continue."
+          : "Updating... please wait",
+      updateCheckState === "error" ? RED_COLOR : GREEN_COLOR
+    );
+  } else {
+    const options = [
+      { label: "Update now", hint: "installs the latest version" },
+      { label: "Continue", hint: "dismiss and start Nexus" },
+    ];
+    const optionsStart = Math.max(3, Math.floor(rows / 2) - 2);
+    options.forEach((opt, i) => {
+      const selected = i === updatePanelSelected;
+      const marker = selected ? "●" : "○";
+      const styled = `${selected ? GREEN_COLOR : ""}  ${marker} ${opt.label}  ${opt.hint}${RESET_COLOR}`;
+      setPanelRow(optionsStart + i, `  ${marker} ${opt.label}  ${opt.hint}`, selected ? GREEN_COLOR : null, styled);
+    });
+    setPanelRow(optionsStart + options.length + 1, "↑/↓ to select  Enter: choose  Esc: continue", PLACEHOLDER_COLOR);
+  }
+
+  for (let y = 0; y < rows; y += 1) {
+    const nextRow = frameRows[y];
+    const prevRow = lastUpdateRenderedRows[y];
+    if (
+      prevRow &&
+      prevRow.text === nextRow.text &&
+      prevRow.color === nextRow.color &&
+      prevRow.styledText === nextRow.styledText
+    ) {
+      continue;
+    }
+    if (nextRow.styledText) {
+      writeStyledLine(y, nextRow.text, nextRow.styledText, cols);
+    } else if (nextRow.color === BOLD_WHITE) {
+      writeColoredLine(y, nextRow.text, cols, BOLD_WHITE);
+    } else if (nextRow.color === GREEN_COLOR) {
+      writeColoredLine(y, nextRow.text, cols, GREEN_COLOR);
+    } else if (nextRow.color === PLACEHOLDER_COLOR) {
+      writeColoredLine(y, nextRow.text, cols, PLACEHOLDER_COLOR);
+    } else if (nextRow.color === RED_COLOR) {
+      writeColoredLine(y, nextRow.text, cols, RED_COLOR);
+    } else {
+      writeLine(y, nextRow.text, cols);
+    }
+  }
+  lastUpdateRenderedRows = frameRows;
+  dirty = false;
+}
+
 function openProviderEditorBuffer(mode, index) {
   providerEditorMode = mode === "create" ? "create" : "edit";
   providerEditorIndex = index;
@@ -18746,8 +19288,15 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
     logicalLines = logicalLineMeta.map((item) => item.text);
   }
 
+  if (isPlanUi && typeof entry?.planAction === "string" && entry.planAction.trim()) {
+    const planHeader = "• Ran " + entry.planAction.trim();
+    logicalLines.unshift(planHeader);
+    logicalLineMeta.unshift({ text: planHeader, python: false, fence: false, planHeader: true });
+  }
+
   const isToolCall =
-    displayRole === "tool" || (logicalLines.length > 0 && logicalLines[0].trim().startsWith("\u2022 Ran "));
+    !isPlanUi &&
+    (displayRole === "tool" || (logicalLines.length > 0 && logicalLines[0].trim().startsWith("\u2022 Ran ")));
   // Unified-diff detection for the whole tool payload; +/- lines only get
   // the diff background when the output genuinely contains a patch.
   const looksLikeDiff = isToolCall && isUnifiedDiffText(message);
@@ -18864,9 +19413,13 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
             line = `${color}${visibleText}${RESET_COLOR}`;
           }
         }
-      } else if (isPlanUi && /^🗹\s/.test(body)) {
+      } else if (isPlanUi && lineMeta.planHeader) {
+        line = styleToolExecutionHeaderLine(visibleText, toolColor) || `${PLACEHOLDER_COLOR}${visibleText}${RESET_COLOR}`;
+      } else if (isPlanUi && /^\s*🗹\s/.test(body)) {
         line = `${PLACEHOLDER_COLOR}${DIFF_DIM_TEXT}${STRIKETHROUGH_TEXT}${visibleText}${NORMAL_TEXT_DECORATION}${DIFF_NORMAL_INTENSITY}${RESET_COLOR}`;
-      } else if (isPlanUi && /^☐\s/.test(body)) {
+      } else if (isPlanUi && /^\s*▶\s/.test(body)) {
+        line = `${GOLDENROD_COLOR}${visibleText}${RESET_COLOR}`;
+      } else if (isPlanUi && /^\s*☐\s/.test(body)) {
         const pendingMarker = visibleText.indexOf("☐");
         line = pendingMarker >= 0
           ? `${visibleText.slice(0, pendingMarker)}${MARKDOWN_LIST_MARKER_COLOR}☐${RESET_COLOR}${visibleText.slice(pendingMarker + 1)}`
@@ -21154,6 +21707,10 @@ function renderFrame(forceChatRefresh = false) {
     renderKernelsBuffer();
     return;
   }
+  if (activeBuffer === "update") {
+    renderUpdateBuffer();
+    return;
+  }
 
   if (!dirty && !forceChatRefresh) {
     return;
@@ -22763,6 +23320,13 @@ function runFormatSelfTest() {
       formatRuntimeModelSetting("") !== "not set" ||
       getRuntimeSettings().find((setting) => setting.key === "context_window")?.options.join(",") !==
         "128000,256000,384000,512000,768000,1000000" ||
+      !(() => {
+        const opts = getRuntimeSettings().find((setting) => setting.key === "max_output_tokens")?.options || [];
+        return [16384, 32768, 65536, 131072, 262144, 393216].every((o) => opts.includes(o));
+      })() ||
+      formatMaxOutputTokens(16384) !== "16k" ||
+      formatMaxOutputTokens(393216) !== "384k" ||
+      normalizeLlmMaxOutputTokens(393216) !== 393216 ||
       capitalizeSettingLabel("external thinking") !== "External thinking"
     ) {
       out(`FORMAT_FAIL: runtime settings buffer is incomplete: ${JSON.stringify(runtimeSettingKeys)}\n`);
@@ -22834,6 +23398,7 @@ function runFormatSelfTest() {
             thinking_effort: "xhigh",
             context_window: 256000,
             request_timeout_ms: 120000,
+            max_output_tokens: 65536,
           },
           context_left_by_model: { "worker-model": 37 },
           cache_telemetry_by_model: {
@@ -22864,6 +23429,7 @@ function runFormatSelfTest() {
         workerSettings.find((setting) => setting.key === "thinking_effort")?.value === "xhigh" &&
         workerSettings.find((setting) => setting.key === "context_window")?.value === 256000 &&
         workerSettings.find((setting) => setting.key === "request_timeout")?.value === 120000 &&
+        workerSettings.find((setting) => setting.key === "max_output_tokens")?.value === 65536 &&
         workerFooter === `context 37% · PLAN · worker-model xhigh · ${formatWorkspacePathForFooter(WORKSPACE_ROOT)} · runtime-worker` &&
         workerStyledFooter.includes(`${FOOTER_CONTEXT_WARN_COLOR}context 37%${RESET_COLOR}`) &&
         workerStyledFooter.includes(`${FOOTER_PLAN_COLOR}PLAN${RESET_COLOR}`) &&
@@ -23114,6 +23680,21 @@ function runFormatSelfTest() {
       !shownReasoningLines.some((line) => line.includes("private reasoning trace"))
     ) {
       out("FORMAT_FAIL: thinking blocks display setting did not hide reasoning only\n");
+      return 1;
+    }
+    const reasoningOnlyPayload = extractAssistantPayloadFromCompletion(
+      { choices: [{ message: { content: "", reasoning_content: "model thought" } }] },
+      { allowReasoningTextFallback: false }
+    );
+    const reasoningOnlyLegacyPayload = extractAssistantPayloadFromCompletion(
+      { choices: [{ message: { content: "", reasoning_content: "model thought" } }] },
+      { allowReasoningTextFallback: true }
+    );
+    if (
+      reasoningOnlyPayload.text.trim() !== "" ||
+      reasoningOnlyLegacyPayload.text.trim() !== "model thought"
+    ) {
+      out("FORMAT_FAIL: reasoning-only response fallback contract is incorrect\n");
       return 1;
     }
     const sessionNow = Date.UTC(2026, 0, 1, 12, 0, 0);
@@ -23447,7 +24028,7 @@ function runFormatSelfTest() {
       ],
     });
     if (
-      planMarkdown !== "## Plan\n\n🗹 Inspect project\n☐ Implement change"
+      planMarkdown !== "  🗹 Inspect project\n  ▶ Implement change"
     ) {
       out(`FORMAT_FAIL: plan markdown is incorrect: ${JSON.stringify(planMarkdown)}\n`);
       return 1;
@@ -23726,9 +24307,8 @@ function runFormatSelfTest() {
     const renderedPlan = styledRenderedPlan.map(stripAnsiSgr);
     const renderedPlanText = renderedPlan.join("\n");
     if (
-      !renderedPlanText.includes("## Plan") ||
       !renderedPlanText.includes("🗹 Inspect project") ||
-      !renderedPlanText.includes("☐ Implement change") ||
+      !renderedPlanText.includes("▶ Implement change") ||
       !styledRenderedPlan.some((line) =>
         line.includes(DIFF_DIM_TEXT) && line.includes(STRIKETHROUGH_TEXT)
       ) ||
@@ -23744,8 +24324,8 @@ function runFormatSelfTest() {
       { role: "tool", uiKind: "plan", content: "new" },
     ];
     hideSupersededPlanUiEntries(planVersions);
-    if (planVersions[0].hidden !== true || planVersions[2].hidden === true) {
-      out("FORMAT_FAIL: updated plan should supersede the previous plan UI\n");
+    if (planVersions[0].hidden === true || planVersions[2].hidden === true) {
+      out("FORMAT_FAIL: every plan version should stay visible in history\n");
       return 1;
     }
     const resumedPlanSession = parseSessionHistory([
@@ -23755,6 +24335,7 @@ function runFormatSelfTest() {
         name: "code_execution",
         uiKind: "plan",
         uiContent: "## Plan\n\n☐ Old task",
+        planAction: "create_plan",
       }),
       JSON.stringify({
         role: "tool",
@@ -23773,14 +24354,17 @@ function runFormatSelfTest() {
         sessionCacheTelemetryByModel: { "resumed-model": { cachePercent: 91 } },
         uiKind: "plan",
         uiContent: "## Plan\n\n🗹 Old task",
+        planAction: "update_plan",
       }),
     ].join("\n"));
     const resumedPlanHistory = resumedPlanSession.loadedMessages;
     if (
       resumedPlanHistory.length !== 2 ||
-      resumedPlanHistory[0].hidden !== true ||
+      resumedPlanHistory[0].hidden === true ||
       resumedPlanHistory[1].hidden === true ||
       resumedPlanHistory[1].uiContent !== "## Plan\n\n🗹 Old task" ||
+      resumedPlanHistory[0].planAction !== "create_plan" ||
+      resumedPlanHistory[1].planAction !== "update_plan" ||
       resumedPlanSession.sessionMode !== "plan" ||
       resumedPlanSession.sessionModel !== "resumed-model" ||
       resumedPlanSession.sessionRuntimeSettings?.thinking_effort !== "max" ||
@@ -23788,7 +24372,7 @@ function runFormatSelfTest() {
       resumedPlanSession.sessionContextLeftByModel?.["resumed-model"] !== 44 ||
       resumedPlanSession.sessionCacheTelemetryByModel?.["resumed-model"]?.cachePercent !== 91
     ) {
-      out("FORMAT_FAIL: resumed session should show only the newest plan UI\n");
+      out("FORMAT_FAIL: resumed session should keep every plan UI entry visible\n");
       return 1;
     }
 
@@ -25506,6 +26090,13 @@ async function runRemoteControlSelfTest() {
       role: "tool",
       content: Array.from({ length: 30 }, (_, index) => `tool line ${index + 1}`).join("\n"),
     });
+    messages.push({
+      role: "tool",
+      name: "code_execution",
+      toolCallId: "call_remote_native_1",
+      toolInput: "print('native remote code')",
+      content: "native tool result",
+    });
 
     const started = await startRemoteControlServer({
       port: 0,
@@ -25582,6 +26173,18 @@ async function runRemoteControlSelfTest() {
     }
     if (!toolMessage?.content.includes("... +") || toolMessage.content.includes("tool line 15")) {
       throw new Error("remote snapshot did not truncate tool output");
+    }
+    const nativeToolMessage = snapshot.messages.find(
+      (message) => message.role === "tool" && message.content === "native tool result"
+    );
+    const nativeCodeMessage = snapshot.messages.find(
+      (message) => message.role === "code" && message.content === "print('native remote code')"
+    );
+    if (
+      !nativeCodeMessage?.content?.includes("native remote code") ||
+      !nativeToolMessage?.header?.includes("Ran code_execution")
+    ) {
+      throw new Error("remote snapshot omitted native code_execution code or header");
     }
     const sessionsPayloadPromise = new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -25897,6 +26500,16 @@ if (process.argv.includes("--self-test-agents")) {
   return;
 }
 
+if (process.argv.includes("--self-test-update")) {
+  runUpdateSelfTest().then((code) => process.exit(code));
+  return;
+}
+
+if (process.argv.includes("--version") || process.argv.includes("-v")) {
+  process.stdout.write(`${getAppCurrentVersion()}\n`);
+  process.exit(0);
+}
+
 setTerminalTitle();
 readline.emitKeypressEvents(process.stdin);
 
@@ -25957,6 +26570,10 @@ process.stdin.on("data", (rawChunk) => {
     return;
   } else if (activeBuffer === "kernels" && chunk === "\u001b") {
     closeKernelsBuffer();
+  } else if (activeBuffer === "update" && chunk === "\u001b") {
+    suppressUpdateEscapeKeypressUntil = Date.now() + 1500;
+    dismissUpdateBufferOrExit();
+    return;
   } else if (activeBuffer === "provider_editor" && chunk === "\u001b") {
     ignoreNextProvidersEscape = true;
     suppressKeypressUntil = Date.now() + 200;
@@ -26022,6 +26639,10 @@ process.stdin.on("keypress", async (str, key) => {
   }
   if (isEscapeKey && Date.now() < suppressRemoteControlEscapeKeypressUntil) {
     suppressRemoteControlEscapeKeypressUntil = 0;
+    return;
+  }
+  if (isEscapeKey && Date.now() < suppressUpdateEscapeKeypressUntil) {
+    suppressUpdateEscapeKeypressUntil = 0;
     return;
   }
   if (isEscapeKey && Date.now() < suppressModelEscapeKeypressUntil) {
@@ -26341,6 +26962,42 @@ process.stdin.on("keypress", async (str, key) => {
       return;
     }
 
+    return;
+  }
+
+  if (activeBuffer === "update") {
+    if (updateCheckState === "installing") {
+      // Ignore all keys while the install is running except Escape.
+      if (key?.name === "escape" || key?.sequence === "\u001b" || str === "\u001b") {
+        closeUpdateBuffer();
+      }
+      return;
+    }
+    if (updateCheckState === "done" || updateCheckState === "error") {
+      // Update finished: any key exits so the new version takes effect; a
+      // failed update dismisses back to the main buffer instead.
+      dismissUpdateBufferOrExit();
+      return;
+    }
+    // Selecting an option view (idle).
+    if (key?.name === "escape" || key?.sequence === "\u001b" || str === "\u001b") {
+      closeUpdateBuffer();
+      return;
+    }
+    if (key?.name === "up" || key?.name === "down") {
+      updatePanelSelected = updatePanelSelected === 0 ? 1 : 0;
+      markDirty();
+      renderFrame(true);
+      return;
+    }
+    if (key?.sequence === "\r" || key?.name === "return" || key?.name === "enter") {
+      if (updatePanelSelected === 0) {
+        await runUpdateInstall();
+        return;
+      }
+      closeUpdateBuffer();
+      return;
+    }
     return;
   }
 
@@ -27474,6 +28131,11 @@ async function initializeApp() {
   startNamedAgentRefreshLoop();
   await startVoiceCaptureHelper().catch(() => false);
   renderFrame(true);
+
+  // Startup release check: fetch the latest npm version, and if a newer release
+  // exists open the update buffer (Update now / Continue). Non-blocking; a slow
+  // or offline registry never delays startup.
+  checkForUpdate().catch(() => {});
 }
 
 initializeApp();

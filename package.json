@@ -1,6 +1,6 @@
 {
   "name": "@bevren/nexus",
-  "version": "1.0.0",
+  "version": "1.1.10",
   "description": "Terminal coding agent with persistent tools, skills, MCP, and kernels",
   "license": "ISC",
   "author": "duxx",
@@ -44,8 +44,7 @@
   },
   "scripts": {
     "start": "node index.js",
-    "test": "node index.js --self-test-append && node index.js --self-test-format && node index.js --self-test-execute && node index.js --self-test-background && node index.js --self-test-loop && node index.js --self-test-compact && node index.js --self-test-remote && node index.js --self-test-agents && python tools.py --self-test-subagents && node --check index.js",
-    "build": "esbuild index.js --bundle --platform=node --format=cjs --outfile=dist/bundle.js && node --experimental-sea-config sea-config.json && node -e \"require('fs').copyFileSync(process.execPath,'nexus.exe')\" && postject nexus.exe NODE_SEA_BLOB sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 && python -m PyInstaller --noconfirm --distpath dist tools_launcher.spec && python -m PyInstaller --noconfirm --distpath dist tools_worker.spec && copy /Y dist\\tools.exe tools.exe && copy /Y dist\\tools-worker.exe tools-worker.exe",
+    "test": "node index.js --self-test-append && node index.js --self-test-format && node index.js --self-test-execute && node index.js --self-test-background && node index.js --self-test-loop && node index.js --self-test-compact && node index.js --self-test-remote && node index.js --self-test-agents && node index.js --self-test-update && python tools.py --self-test-subagents && node --check index.js",
     "prepublishOnly": "npm test"
   },
   "dependencies": {
@@ -53,9 +52,5 @@
     "pptxgenjs": "^4.0.1",
     "qrcode-terminal": "^0.12.0",
     "ws": "^8.21.3"
-  },
-  "devDependencies": {
-    "esbuild": "^0.28.1",
-    "postject": "^1.0.0-alpha.6"
   }
 }

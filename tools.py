@@ -683,10 +683,11 @@ def drain_background_job_events() -> list[dict[str, object]]:
     return events
 
 
-def _record_plan_ui_event(entries: list[dict[str, object]]) -> None:
+def _record_plan_ui_event(entries: list[dict[str, object]], action: str = "plan") -> None:
     PLAN_UI_EVENT_LOG.append(
         {
             "type": "plan",
+            "action": action,
             "title": "Plan",
             "entries": [
                 {
@@ -935,7 +936,7 @@ def create_plan(entries: str | list[str]) -> dict[str, object]:
 
     plan_entries = [{"text": text, "completed": False} for text in plan_texts]
     _save_plan_entries(plan_entries)
-    _record_plan_ui_event(plan_entries)
+    _record_plan_ui_event(plan_entries, "create_plan")
 
     return {
         "created_count": len(plan_entries),
@@ -991,7 +992,7 @@ def update_plan(
             unmatched.append(identifier)
 
     _save_plan_entries(entries)
-    _record_plan_ui_event(entries)
+    _record_plan_ui_event(entries, "update_plan")
     updated_entries = [entries[idx] for idx in sorted(updated_indexes)]
 
     return {

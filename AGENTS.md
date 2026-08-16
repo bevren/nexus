@@ -10,7 +10,7 @@
 - `npm start` runs the TUI from source with `node index.js`.
 - `npm test` runs the Node UI/format/execution/background/remote self-tests, the Python subagent test, and a JavaScript syntax check.
 - `python tools.py --self-test-subagents` runs the focused persistent-worker regression suite.
-- `npm run build` bundles the SEA executable and builds the console and windowless Python helpers with PyInstaller. This command is Windows-oriented.
+- `npm run build` is not used: the npm package ships source only (`index.js` + Python tooling). Run `npm start` from source or install `@bevren/nexus` from npm.
 
 Run `npm test` before submitting changes. Use focused self-tests while iterating, then run the complete suite.
 

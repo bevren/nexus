@@ -4,12 +4,4 @@ sessions/
 tests/
 .npmrc
 __pycache__/
-sea.exe
-nexus.exe
-sea-prep.blob
-dist/
-tools.exe
-tools-worker.exe
-build/
 
-tools.exe.stale
