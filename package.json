@@ -1,6 +1,6 @@
 {
   "name": "@bevren/nexus",
-  "version": "1.1.10",
+  "version": "1.1.11",
   "description": "Terminal coding agent with persistent tools, skills, MCP, and kernels",
   "license": "ISC",
   "author": "duxx",

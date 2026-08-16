@@ -3980,24 +3980,34 @@ function getMcpConfigFingerprint(config) {
 async function startMcpServers() {
   const config = loadMcpConfig();
   const entries = Object.entries(config.mcpServers || {});
-  const running = [];
 
-  for (const [name, serverConfig] of entries) {
-    const client = createMcpClient(name, serverConfig);
-    try {
-      await client.start();
-      const tools = await client.listTools();
-      running.push({ name, client, tools });
-    } catch (error) {
-      running.push({
-        name,
-        client,
-        tools: [],
-        error: error?.message || String(error),
-      });
-    }
-  }
-  mcpServers = running.map((entry) => ({
+  // Start every server concurrently instead of serially. Several common
+  // transports are slow to boot independently (npx/uvx package resolution,
+  // remote HTTP servers, DB connections), and a sequential loop made startup
+  // the SUM of all of them. Parallel startup makes it the MAX of them.
+  const started = await Promise.all(
+    entries.map(async ([name, serverConfig]) => {
+      const client = createMcpClient(name, serverConfig);
+      try {
+        await client.start();
+        const tools = await client.listTools();
+        return { name, client, tools };
+      } catch (error) {
+        return {
+          name,
+          client,
+          tools: [],
+          error: error?.message || String(error),
+        };
+      }
+    })
+  );
+
+  // Preserve the configured order in the UI, not the race-completion order.
+  const order = new Map(entries.map(([name], index) => [name, index]));
+  started.sort((left, right) => (order.get(left.name) ?? 0) - (order.get(right.name) ?? 0));
+
+  mcpServers = started.map((entry) => ({
     name: entry.name,
     client: entry.client,
     tools: entry.tools || [],
