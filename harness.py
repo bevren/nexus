@@ -44,6 +44,38 @@ _PLAN_ALLOWED_TOOLS = {
 HARNESS_FILE = Path.home() / ".nexus" / "harness.json"
 DEFAULT_SUBAGENT_ROOT = Path.home() / ".nexus" / "subagents"
 
+# Mirrors CODE_EXECUTION_TOOL_SCHEMA in index.js: subagents run the same
+# native tool-calling flow as the main session instead of relying on the
+# model to emit fenced ```execute blocks.
+SUBAGENT_TOOL_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "code_execution",
+            "description": (
+                "Run Python code with the Nexus helper functions available in scope. Pass the Python "
+                "source as the code argument. Helper functions (file read/write/edit, shell, search, "
+                "plans, subagents, MCP, and more) are listed in the system prompt and are called "
+                "directly inside the code."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": (
+                            "Python source to execute. Call helper functions directly, e.g. "
+                            "get_file_content(path='x'), write_file(path='x', content='...'), "
+                            "run_shell(command='...')."
+                        ),
+                    },
+                },
+                "required": ["code"],
+            },
+        },
+    }
+]
+
 SUBAGENT_EXECUTION_CONTRACT = """SUBAGENT EXECUTION CONTRACT:
 - Complete the delegated task with the available execute tools before returning a final answer.
 - A sentence announcing a next step (for example, "I need to inspect..." or "Let me implement...") is not a final answer. Emit the execute block in that same response instead.
@@ -332,6 +364,147 @@ def _assistant_reasoning_details(response: dict) -> list[dict]:
     return []
 
 
+def _assistant_tool_calls(response: dict) -> list[dict]:
+    """Normalize message.tool_calls exactly like extractAssistantPayloadFromCompletion."""
+    choices = response.get("choices") or []
+    message = (choices[0] or {}).get("message", {}) if choices else {}
+    calls = message.get("tool_calls") if isinstance(message, dict) else None
+    if not isinstance(calls, list):
+        return []
+    normalized: list[dict] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+        arguments = function.get("arguments")
+        if not isinstance(arguments, str):
+            try:
+                arguments = json.dumps(arguments if arguments is not None else {})
+            except (TypeError, ValueError):
+                arguments = "{}"
+        normalized.append({
+            "id": str(call.get("id") or "").strip(),
+            "type": str(call.get("type") or "function"),
+            "function": {"name": name, "arguments": arguments},
+        })
+    return normalized
+
+
+def _known_predefined_tool(tool_name: str) -> bool:
+    """True when the tool is exposed in the execute scope (tools.FUNCTIONS)."""
+    import tools  # Lazy import mirrors _execute_nexus_code.
+
+    if isinstance(getattr(tools, "FUNCTIONS", None), dict) and tool_name in tools.FUNCTIONS:
+        return True
+    maybe = tools.get_functions() if hasattr(tools, "get_functions") else None
+    return isinstance(maybe, dict) and tool_name in maybe
+
+
+def _build_code_for_tool_call(tool_name: str, tool_args: dict) -> dict:
+    """Mirrors buildExecutableCodeForToolCall in index.js.
+
+    code_execution runs its code argument directly; every other predefined
+    tool (fetch_url, web_search, delegate_agent, notify_agent, set_reminder,
+    ...) is invoked through a generated wrapper that resolves the function
+    from the same execute scope the fenced blocks use. This keeps the native
+    tool-calling flow able to reach the full helper registry, not just
+    code_execution.
+    """
+    if tool_name == "code_execution":
+        code = tool_args.get("code") if isinstance(tool_args.get("code"), str) else ""
+        if not str(code or "").strip():
+            return {"error": "Tool argument error: 'code' must be a non-empty string."}
+        return {"code": code}
+    if not _known_predefined_tool(tool_name):
+        return {"error": f"Unsupported tool: {tool_name or '(unknown)'}"}
+    args_value = tool_args if isinstance(tool_args, dict) else {}
+    args_json = json.dumps(args_value, ensure_ascii=False)
+    generated = "\n".join(
+        [
+            "import json",
+            f"__tool_name = {json.dumps(tool_name)}",
+            f"__args = json.loads({json.dumps(args_json)})",
+            "__fn = globals().get(__tool_name)",
+            "if __fn is None:",
+            '    raise RuntimeError(f"Unknown predefined tool function: {__tool_name}")',
+            "if isinstance(__args, dict):",
+            "    __result = __fn(**__args)",
+            "elif isinstance(__args, list):",
+            "    __result = __fn(*__args)",
+            "else:",
+            "    __result = __fn(__args)",
+            "print(__result)",
+        ]
+    )
+    return {"code": generated}
+
+
+def _format_tool_result_text(tool_result: dict) -> str:
+    if not isinstance(tool_result, dict):
+        return str(tool_result)
+    parts = []
+    output = tool_result.get("output")
+    if isinstance(output, str) and output.strip():
+        parts.append(output)
+    error = tool_result.get("error")
+    if error:
+        parts.append(f"[error] {error}")
+    return "\n".join(parts) if parts else "(no output)"
+
+
+def _parse_tool_call_args(call: dict) -> dict:
+    function = call.get("function") if isinstance(call.get("function"), dict) else {}
+    raw_args = str(function.get("arguments") or "")
+    try:
+        parsed = json.loads(raw_args) if raw_args.strip() else {}
+    except (ValueError, TypeError):
+        parsed = {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _run_subagent_tool_calls(entry: dict, tool_calls: list[dict], notify) -> None:
+    """Execute every tool call, append its tool message, and persist progress.
+
+    Mirrors the native tool-calling loop in index.js (executeNativeToolCall +
+    finalizePendingAssistantMessage): each call is answered with a tool
+    message carrying the same tool_call_id so the provider accepts the next
+    request.
+    """
+    for call in tool_calls:
+        call_id = str(call.get("id") or "").strip()
+        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+        call_name = str(function.get("name") or "")
+        raw_args = str(function.get("arguments") or "")
+        parsed_args = _parse_tool_call_args(call)
+        built = _build_code_for_tool_call(call_name, parsed_args)
+        if built.get("error"):
+            tool_result = {"ok": False, "output": "", "error": built["error"]}
+        else:
+            try:
+                tool_timeout = max(0.05, float(entry.get("timeout", 300)))
+            except (TypeError, ValueError):
+                tool_timeout = 300.0
+            tool_result = _run_with_hard_timeout(
+                lambda code=built["code"]: _execute_nexus_code(code),
+                tool_timeout,
+                "subagent tool call",
+            )
+        entry["messages"].append(
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": call_name,
+                "tool_input": str(parsed_args.get("code") or raw_args),
+                "tool_ok": bool(tool_result.get("ok")) if isinstance(tool_result, dict) else False,
+                "content": _format_tool_result_text(tool_result),
+            }
+        )
+        notify(entry)
+
+
 def _matching_fence(line: str, character: str, minimum: int) -> bool:
     value = line.strip()
     return len(value) >= minimum and set(value) == {character}
@@ -485,23 +658,92 @@ def _run_with_hard_timeout(operation, timeout_seconds: float, label: str):
     raise value
 
 
-def _perform_subagent_request(entry: dict) -> dict:
+def _pair_subagent_tool_calls(request_messages: list[dict]) -> list[dict]:
+    """Python port of pairAssistantToolCallsWithResponses in index.js.
+
+    Providers reject a request when an assistant message with tool_calls is
+    not followed by a tool message for every tool_call_id (interrupted batch,
+    crashed worker). Fill missing responses with placeholders right after the
+    batch and demote orphan tool messages to plain user context.
+    """
+    if not request_messages:
+        return request_messages
+    sanitized: list[dict] = []
+    pending_ids: list[str] = []
+    pending_set: set[str] = set()
+
+    def close_open_batch() -> None:
+        for call_id in pending_ids:
+            if call_id in pending_set:
+                sanitized.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": "[tool call did not complete]",
+                })
+        pending_ids.clear()
+        pending_set.clear()
+
+    for message in request_messages:
+        role = message.get("role") if isinstance(message, dict) else ""
+        if role == "tool":
+            call_id = message.get("tool_call_id") if isinstance(message, dict) else ""
+            if isinstance(call_id, str) and call_id and call_id in pending_set:
+                sanitized.append(message)
+                pending_set.discard(call_id)
+                continue
+            text = message.get("content") if isinstance(message.get("content"), str) else ""
+            sanitized.append({"role": "user", "content": f"[tool result]\n{text}".strip()})
+            continue
+        if role == "assistant" and isinstance(message.get("tool_calls"), list) and message["tool_calls"]:
+            close_open_batch()
+            sanitized.append(message)
+            pending_ids[:] = [
+                str(call.get("id"))
+                for call in message["tool_calls"]
+                if isinstance(call, dict) and str(call.get("id") or "")
+            ]
+            pending_set.update(pending_ids)
+            continue
+        close_open_batch()
+        sanitized.append(message)
+    close_open_batch()
+    return sanitized
+
+
+def _perform_subagent_request(entry: dict, disable_reasoning: bool = False) -> dict:
     provider_messages = []
     for item in entry.get("messages") or []:
         if not isinstance(item, dict):
             continue
         role = item.get("role")
         content = item.get("content")
-        if isinstance(role, str) and isinstance(content, str):
-            provider_messages.append({"role": role, "content": content})
+        if not isinstance(role, str):
+            continue
+        message: dict = {"role": role, "content": content if isinstance(content, str) else ""}
+        if role == "assistant":
+            tool_calls = item.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                message["tool_calls"] = [call for call in tool_calls if isinstance(call, dict)]
+            reasoning_details = item.get("reasoning_details")
+            if entry.get("reasoning_enabled") and isinstance(reasoning_details, list) and reasoning_details:
+                message["reasoning_details"] = reasoning_details
+        if role == "tool":
+            tool_call_id = item.get("tool_call_id")
+            if isinstance(tool_call_id, str) and tool_call_id:
+                message["tool_call_id"] = tool_call_id
+        provider_messages.append(message)
+    provider_messages = _pair_subagent_tool_calls(provider_messages)
     payload = {
         "model": entry.get("model") or "",
         "messages": provider_messages,
+        # Same native execution flow as the main loop in index.js.
+        "tools": SUBAGENT_TOOL_SCHEMA,
+        "tool_choice": "auto",
     }
     max_tokens = entry.get("max_tokens", 2048)
     if isinstance(max_tokens, (int, float)) and max_tokens > 0:
         payload["max_tokens"] = int(max_tokens)
-    if entry.get("reasoning_enabled"):
+    if entry.get("reasoning_enabled") and not disable_reasoning:
         payload["reasoning_effort"] = entry.get("reasoning_effort") or "low"
         payload["reasoning"] = {"enabled": True}
         payload["thinking"] = {"type": "enabled"}
@@ -521,7 +763,7 @@ def _perform_subagent_request(entry: dict) -> dict:
         return json.loads(resp.read().decode("utf-8", errors="replace"))
 
 
-def _request_subagent(entry: dict) -> dict:
+def _request_subagent(entry: dict, disable_reasoning: bool = False) -> dict:
     if os.environ.get("NEXUS_SUBAGENT_SELF_TEST") == "1":
         responses = entry.get("self_test_responses")
         if isinstance(responses, list) and responses:
@@ -532,7 +774,7 @@ def _request_subagent(entry: dict) -> dict:
     except (TypeError, ValueError):
         timeout_seconds = 300.0
     return _run_with_hard_timeout(
-        lambda: _perform_subagent_request(entry),
+        lambda: _perform_subagent_request(entry, disable_reasoning=disable_reasoning),
         timeout_seconds,
         "subagent provider request",
     )
@@ -654,16 +896,66 @@ def _subagent_worker(entry: dict, on_update=None) -> None:
             response = _request_subagent(entry)
             _update_subagent_telemetry(entry, response)
             content = _assistant_text(response)
+            tool_calls = _assistant_tool_calls(response)
             reasoning_details = (
                 _assistant_reasoning_details(response)
                 if entry.get("reasoning_enabled")
                 else []
             )
-            if not content.strip():
-                entry["status"] = "error"
-                entry["error"] = "subagent returned no content"
+
+            # Native tool-calling flow (same as index.js): execute every
+            # tool_calls request, answer each call id with a tool message,
+            # then loop so the model sees the results.
+            if tool_calls:
+                assistant_message = {"role": "assistant", "content": content}
+                if reasoning_details:
+                    assistant_message["reasoning_details"] = reasoning_details
+                assistant_message["tool_calls"] = tool_calls
+                entry["messages"].append(assistant_message)
                 notify(entry)
-                return
+                _run_subagent_tool_calls(entry, tool_calls, notify)
+                continue
+
+            # Empty assistant message (reasoning-only or transient provider
+            # response): bounded reasoning-off retries, mirroring
+            # retryAssistantPayloadForEmpty in index.js.
+            if not content.strip():
+                recovered = None
+                if entry.get("reasoning_enabled"):
+                    for attempt in range(1, 4):
+                        retry_response = _request_subagent(entry, disable_reasoning=True)
+                        _update_subagent_telemetry(entry, retry_response)
+                        retry_text = _assistant_text(retry_response)
+                        if retry_text.strip() or _assistant_tool_calls(retry_response):
+                            recovered = retry_response
+                            break
+                        if attempt < 3:
+                            time.sleep(0.8 * attempt)
+                if recovered is None:
+                    entry["status"] = "error"
+                    entry["error"] = "subagent returned no content"
+                    notify(entry)
+                    return
+                response = recovered
+                content = _assistant_text(response)
+                tool_calls = _assistant_tool_calls(response)
+                # Preserve the original response's trace when the
+                # reasoning-off retry has none (mergeReasoningDetailsAfterEmptyRetry).
+                retry_reasoning = (
+                    _assistant_reasoning_details(response)
+                    if entry.get("reasoning_enabled")
+                    else []
+                )
+                reasoning_details = retry_reasoning or reasoning_details
+                # Do not auto-disable thinking here (matches index.js): a
+                # reasoning-only response is normal for reasoning models.
+                if tool_calls:
+                    entry["turn"] = turn
+                    entry["messages"].append({"role": "assistant", "content": content, "tool_calls": tool_calls})
+                    notify(entry)
+                    _run_subagent_tool_calls(entry, tool_calls, notify)
+                    continue
+
             assistant_message = {"role": "assistant", "content": content}
             if reasoning_details:
                 assistant_message["reasoning_details"] = reasoning_details
@@ -1017,6 +1309,117 @@ def run_subagent_self_test() -> dict:
     ):
         raise AssertionError("thinking-off named agent retained provider reasoning traces")
 
+    # Native tool-calling request contract: the worker must send the same
+    # code_execution tools schema as index.js, keep tool_calls and tool
+    # messages (with their tool_call_id) intact in the payload, and repair
+    # interrupted batches so the provider never sees an unanswered batch.
+    native_probe = {
+        "model": "native-model",
+        "url": "http://provider.test/v1",
+        "api_key": "k",
+        "timeout": 5,
+        "reasoning_enabled": True,
+        "reasoning_effort": "high",
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_native_1",
+                        "type": "function",
+                        "function": {
+                            "name": "code_execution",
+                            "arguments": json.dumps({"code": "print(1)"}),
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_native_1", "name": "code_execution", "content": "1"},
+        ],
+    }
+    captured: dict = {}
+    real_urlopen = urllib.request.urlopen
+
+    def _fake_urlopen(request, timeout=None):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        captured["url"] = request.full_url
+
+        class _FakeResponse:
+            def read(self):
+                return json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        return _FakeResponse()
+
+    urllib.request.urlopen = _fake_urlopen
+    try:
+        probe_result = _perform_subagent_request(native_probe)
+    finally:
+        urllib.request.urlopen = real_urlopen
+    probe_body = captured.get("body") or {}
+    if probe_result.get("choices", [{}])[0].get("message", {}).get("content") != "ok":
+        raise AssertionError("subagent request probe failed")
+    if not isinstance(probe_body.get("tools"), list) or probe_body["tools"][0]["function"]["name"] != "code_execution":
+        raise AssertionError("subagent request did not send the code_execution tools schema")
+    if probe_body.get("tool_choice") != "auto":
+        raise AssertionError("subagent request did not set tool_choice=auto")
+    if probe_body.get("reasoning", {}).get("enabled") is not True or probe_body.get("thinking", {}).get("type") != "enabled":
+        raise AssertionError("subagent request did not forward reasoning settings")
+    if not any(
+        isinstance(message, dict)
+        and message.get("role") == "assistant"
+        and isinstance(message.get("tool_calls"), list)
+        and message["tool_calls"][0].get("id") == "call_native_1"
+        for message in probe_body.get("messages", [])
+    ):
+        raise AssertionError("subagent request did not serialize assistant tool_calls")
+    serialized_tool = [
+        message
+        for message in probe_body.get("messages", [])
+        if isinstance(message, dict) and message.get("role") == "tool"
+    ]
+    if not serialized_tool or serialized_tool[0].get("tool_call_id") != "call_native_1":
+        raise AssertionError("subagent request did not serialize tool messages with tool_call_id")
+    disabled_probe_body: dict = {}
+    urllib.request.urlopen = _fake_urlopen
+    try:
+        _perform_subagent_request(native_probe, disable_reasoning=True)
+    finally:
+        urllib.request.urlopen = real_urlopen
+    disabled_probe_body = captured.get("body") or {}
+    if disabled_probe_body.get("reasoning", {}).get("enabled") is not False:
+        raise AssertionError("subagent reasoning-off retry did not disable provider reasoning")
+
+    interrupted_pairing = _pair_subagent_tool_calls([
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call_a", "type": "function", "function": {"name": "code_execution", "arguments": "{}"}}
+            ],
+        },
+        {"role": "user", "content": "next"},
+    ])
+    if (
+        len(interrupted_pairing) != 4
+        or interrupted_pairing[2].get("role") != "tool"
+        or interrupted_pairing[2].get("tool_call_id") != "call_a"
+        or "did not complete" not in str(interrupted_pairing[2].get("content") or "")
+        or interrupted_pairing[3].get("content") != "next"
+    ):
+        raise AssertionError("subagent tool-call pairing did not repair an interrupted batch")
+    if _pair_subagent_tool_calls([]) != []:
+        raise AssertionError("subagent tool-call pairing must tolerate an empty request")
+
     test_root = Path(tempfile.mkdtemp(prefix="nexus-subagent-test-", dir=Path.cwd()))
     previous_root = os.environ.get("NEXUS_SUBAGENT_ROOT")
     os.environ["NEXUS_SUBAGENT_ROOT"] = str(test_root)
@@ -1169,6 +1572,113 @@ def run_subagent_self_test() -> dict:
             or unlimited_entry.get("result") != "Unlimited loop complete."
         ):
             raise AssertionError("child did not continue beyond the former 16-turn ceiling")
+
+        # Predefined-tool wrapper: native tool calls for any helper in the
+        # execute scope (fetch_url, web_search, get_file_list, ...) must be
+        # dispatched through the generated wrapper instead of failing with
+        # "Unsupported tool" (mirrors buildExecutableCodeForToolCall).
+        list_build = _build_code_for_tool_call("get_file_list", {"path": "."})
+        fetch_build = _build_code_for_tool_call("fetch_url", {"url": "https://example.com", "max_chars": 100})
+        unknown_build = _build_code_for_tool_call("nonexistent_tool", {})
+        empty_build = _build_code_for_tool_call("code_execution", {})
+        if (
+            not isinstance(list_build.get("code"), str)
+            or "get_file_list" not in list_build["code"]
+            or "print(__result)" not in list_build["code"]
+            or not isinstance(fetch_build.get("code"), str)
+            or unknown_build.get("error") != "Unsupported tool: nonexistent_tool"
+            or "code" not in empty_build.get("error", "")
+        ):
+            raise AssertionError(f"predefined-tool wrapper contract is incorrect: {list_build} {fetch_build} {unknown_build} {empty_build}")
+        list_run = _execute_nexus_code(list_build["code"])
+        if not list_run.get("ok") or "AGENTS.md" not in str(list_run.get("output") or ""):
+            raise AssertionError(f"predefined-tool wrapper did not execute: {list_run}")
+        if _known_predefined_tool("get_file_list") is not True or _known_predefined_tool("bogus_tool") is not False:
+            raise AssertionError("_known_predefined_tool classification is incorrect")
+
+        # Native tool-calling flow end to end: the worker must execute the
+        # model's code_execution tool call, answer its tool_call_id, persist
+        # the assistant tool_calls turn, and keep looping until a plain final
+        # answer arrives (mirroring the main session agent loop in index.js).
+        native_entry_id = uuid.uuid4().hex[:12]
+        native_entry = {
+            "id": native_entry_id,
+            "prompt": f"use the native code_execution tool to write {output_name}",
+            "model": "inherited-model",
+            "timeout": 5,
+            "max_tokens": 256,
+            "reasoning_enabled": True,
+            "reasoning_effort": "low",
+            "messages": [
+                {"role": "system", "content": _with_subagent_contract("PARENT NEXUS SYSTEM PROMPT")},
+                {"role": "user", "content": f"use the native code_execution tool to write {output_name}"},
+            ],
+            "status": "admitted",
+            "result": None,
+            "error": None,
+            "turn": 0,
+            "self_test_responses": [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "reasoning_content": "native child reasoning trace",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_native_flow_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "code_execution",
+                                            "arguments": json.dumps({
+                                                "code": f"print(write_file({output_name!r}, 'native-landed'))"
+                                            }),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                {"choices": [{"message": {"content": "Native tool loop complete."}}]},
+            ],
+        }
+        previous_self_test = os.environ.get("NEXUS_SUBAGENT_SELF_TEST")
+        os.environ["NEXUS_SUBAGENT_SELF_TEST"] = "1"
+        try:
+            _subagent_worker(native_entry)
+        finally:
+            if previous_self_test is None:
+                os.environ.pop("NEXUS_SUBAGENT_SELF_TEST", None)
+            else:
+                os.environ["NEXUS_SUBAGENT_SELF_TEST"] = previous_self_test
+        native_assistant_turns = [
+            message
+            for message in native_entry.get("messages", [])
+            if isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and isinstance(message.get("tool_calls"), list)
+        ]
+        native_tool_messages = [
+            message
+            for message in native_entry.get("messages", [])
+            if isinstance(message, dict) and message.get("role") == "tool"
+        ]
+        if native_entry.get("status") != "done" or native_entry.get("result") != "Native tool loop complete.":
+            raise AssertionError(f"native tool-call child did not finish: {native_entry}")
+        if native_entry.get("turn") != 2:
+            raise AssertionError(f"native tool-call child made {native_entry.get('turn')} turns, expected 2")
+        if len(native_assistant_turns) != 1 or len(native_tool_messages) != 1:
+            raise AssertionError("native tool-call child did not persist the assistant tool_calls turn and its tool message")
+        if native_tool_messages[0].get("tool_call_id") != "call_native_flow_1":
+            raise AssertionError("native tool-call child did not answer the model's tool_call_id")
+        if not any(
+            isinstance(detail, dict) and detail.get("text") == "native child reasoning trace"
+            for detail in native_assistant_turns[0].get("reasoning_details", [])
+        ):
+            raise AssertionError("native tool-call child did not retain the reasoning trace")
+        if not output_path.exists() or output_path.read_text(encoding="utf-8") != "native-landed":
+            raise AssertionError("native tool-call child workspace write did not land")
         listed = rlm.list_subagents()
         if not any(item.get("id") == entry_id and item.get("status") == "done" for item in listed):
             raise AssertionError("completed child was not visible from the persistent registry")

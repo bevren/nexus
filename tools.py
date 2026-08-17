@@ -2498,6 +2498,99 @@ def get_skill(name: str) -> dict[str, object]:
     }
 
 
+_SKILL_INDEX_CACHE: dict = {"url": "", "data": None, "fetched_at": 0.0}
+SKILL_INDEX_TTL_SECONDS = 600
+DEFAULT_SKILLS_REPO = "bevren/nexus-skills"
+
+
+def search_skill(
+    query: str,
+    max_results: int = 10,
+    repo: str = "",
+) -> dict[str, object]:
+    """Search the public nexus-skills registry for installable skills.
+
+    Fetches the registry index (index.json) from a GitHub repo and matches the
+    query against each skill's name and description. The default registry is
+    bevren/nexus-skills on the main branch; override with the repo parameter
+    ("owner/name") or the NEXUS_SKILLS_REPO environment variable.
+
+    Returns a dict with:
+      - ok: True if the registry was fetched and searched successfully
+      - query: the original query
+      - repo: the registry repo actually used
+      - skills: list of {name, description, raw_url} matches (raw_url points at
+        the skill's SKILL.md for direct install with manage_skill)
+      - error: error message if the registry could not be reached/parsed
+    """
+    import urllib.error
+    import urllib.request
+
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("query must be a non-empty string")
+    if not isinstance(max_results, int):
+        raise ValueError("max_results must be an integer")
+    max_results = max(1, min(max_results, 50))
+
+    repo_key = str(repo or os.environ.get("NEXUS_SKILLS_REPO") or DEFAULT_SKILLS_REPO).strip().rstrip("/")
+    index_url = f"https://raw.githubusercontent.com/{repo_key}/main/index.json"
+
+    now = time.time()
+    cache = _SKILL_INDEX_CACHE
+    if cache.get("url") == index_url and cache.get("data") is not None and now - cache.get("fetched_at", 0.0) < SKILL_INDEX_TTL_SECONDS:
+        payload = cache["data"]
+    else:
+        try:
+            req = urllib.request.Request(
+                index_url,
+                headers={"User-Agent": "Mozilla/5.0 nexus-skills-search"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read(1_000_000)
+            payload = json.loads(raw.decode("utf-8", errors="replace"))
+            if not isinstance(payload, dict) or not isinstance(payload.get("skills"), list):
+                return {"ok": False, "query": query.strip(), "repo": repo_key, "skills": [], "error": "registry index has no skills list"}
+            cache["url"] = index_url
+            cache["data"] = payload
+            cache["fetched_at"] = now
+        except urllib.error.HTTPError as exc:
+            return {"ok": False, "query": query.strip(), "repo": repo_key, "skills": [], "error": "HTTP " + str(exc.code) + ": " + str(exc.reason)}
+        except urllib.error.URLError as exc:
+            return {"ok": False, "query": query.strip(), "repo": repo_key, "skills": [], "error": "request failed: " + str(exc.reason)}
+        except Exception as exc:
+            return {"ok": False, "query": query.strip(), "repo": repo_key, "skills": [], "error": "search failed: " + str(exc)}
+
+    q = query.strip().lower()
+    q_tokens = set(re.findall(r"[a-z0-9]+", q))
+    scored = []
+    for skill in payload["skills"]:
+        if not isinstance(skill, dict):
+            continue
+        name = str(skill.get("name") or "")
+        description = str(skill.get("description") or "")
+        haystack = (name + " " + description).lower()
+        score = 0
+        if name.lower() == q:
+            score += 500
+        if q in name.lower():
+            score += 200
+        if q in haystack:
+            score += 100
+        score += len(q_tokens & set(re.findall(r"[a-z0-9]+", haystack))) * 10
+        if score > 0:
+            scored.append((score, name, description))
+    scored.sort(key=lambda t: (-t[0], t[1].lower()))
+    skills = [
+        {
+            "name": name,
+            "description": description,
+            "raw_url": f"https://raw.githubusercontent.com/{repo_key}/main/{name}/SKILL.md",
+        }
+        for _score, name, description in scored[:max_results]
+    ]
+    return {"ok": True, "query": query.strip(), "repo": repo_key, "skills": skills, "error": ""}
+
+
 def manage_skill(
     name: str,
     description: str = "",
@@ -3567,6 +3660,7 @@ FUNCTIONS = {
     "describe_image": describe_image,
     "list_skills": list_skills,
     "get_skill": get_skill,
+    "search_skill": search_skill,
     "manage_skill": manage_skill,
     "rlm_spawn": rlm_spawn,
     "list_subagents": list_subagents,
@@ -3621,6 +3715,7 @@ FUNCTION_DESCRIPTIONS = {
     "skill_python_path": "skill_python_path() -> str: Return the shared skill venv python executable (creates venv if needed). Use with run_shell to run skill scripts that depend on requirements.txt packages.",
     "list_skills": "list_skills() -> dict: List available skills. Returns {skills: [{name, description}], error}.",
     "get_skill": "get_skill(name: str) -> dict: Get a skill by name. Returns {name, description, path, body, error}. Load the body only when using the skill.",
+    "search_skill": "search_skill(query: str, max_results: int = 10, repo: str = '') -> dict: Search the public nexus-skills registry on GitHub (default bevren/nexus-skills) for installable skills matching the query against name/description. Override with repo='owner/name' or the NEXUS_SKILLS_REPO env var. Returns {ok, query, repo, skills: [{name, description, raw_url}], error}. Use it before web_search when a needed skill is not installed; fall back to web_search only when it returns no match.",
     "manage_skill": "manage_skill(name: str, description: str = '', body: str = '', delete: bool = False) -> dict: Create, update, or delete a personal skill under ~/.nexus/skills. Workspace and bundled skills are read-only.",
     "web_search": "web_search(query: str, max_results: int = 5) -> dict: Search the web via DuckDuckGo (Lite HTML with Instant Answer fallback). Returns {query, results: [{title, snippet, url}], error}.",
     "rlm_spawn": "rlm_spawn(prompt: str, system: str = '', timeout: int = 300, max_tokens: int = 2048, template: str = '') -> dict: Non-blocking spawn of a persistent concurrent Nexus child process using the active provider/model, parent system prompt, unlimited tool turns, shared workspace, and tools. timeout is a hard wall-clock limit for each provider request and code_execution call. Returns an admitted handle immediately; end the current code_execution call after spawning so the child continues in the background.",

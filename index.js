@@ -1182,6 +1182,7 @@ const PLAN_MODE_ALLOWED_TOOL_NAMES = new Set([
   "fetch_url",
   "list_skills",
   "get_skill",
+  "search_skill",
   "harness_overview",
   "web_search",
   "deep_think",
@@ -1193,6 +1194,7 @@ const SYSTEM_PROMPT_VISIBLE_TOOL_NAMES = new Set([
   "mcp_search",
   "list_skills",
   "get_skill",
+  "search_skill",
   "manage_skill",
   "harness_overview",
   "harness_memory",
@@ -1237,6 +1239,8 @@ const FALLBACK_TOOL_DESCRIPTIONS = {
     "harness_memory(key: str, content: str = '', delete: bool = False) -> dict: Read a persistent memory when content is omitted; create/update it when content is supplied; delete it with delete=True.",
   manage_skill:
     "manage_skill(name: str, description: str = '', body: str = '', delete: bool = False) -> dict: Create, update, or delete a personal skill under ~/.nexus/skills. Workspace and bundled skills are read-only.",
+  search_skill:
+    "search_skill(query: str, max_results: int = 10, repo: str = '') -> dict: Search the public nexus-skills registry on GitHub (default bevren/nexus-skills) for installable skills matching name/description. Override with repo='owner/name' or the NEXUS_SKILLS_REPO env var. Returns {ok, query, repo, skills: [{name, description, raw_url}], error}. Use before web_search when a needed skill is not installed; fall back to web_search only when it returns no match.",
   harness_prompt_note:
     "harness_prompt_note(name: str, content: str = '', delete: bool = False) -> dict: Create, update, or delete persistent reusable prompt guidance.",
   harness_subagent:
@@ -2285,7 +2289,7 @@ function insertTranscribedText(text) {
   input = merged.input;
   inputCursorIndex = merged.cursorIndex;
   updateCommandMenuState();
-  scrollChatToBottom();
+  scrollChatToBottom({ force: true });
   markDirty();
   renderFrame(false);
   return true;
@@ -2302,7 +2306,7 @@ function insertTranscribedTextAtPosition(text, position) {
   input = merged.input;
   inputCursorIndex = merged.cursorIndex;
   updateCommandMenuState();
-  scrollChatToBottom();
+  scrollChatToBottom({ force: true });
   markDirty();
   renderFrame(false);
   return true;
@@ -2344,7 +2348,7 @@ function applyUtterancePreview(anchorInput, anchorPosition, partialText) {
   input = composed.input;
   inputCursorIndex = composed.cursorIndex;
   updateCommandMenuState();
-  scrollChatToBottom();
+  scrollChatToBottom({ force: true });
   markDirty();
   renderFrame(false);
 }
@@ -2805,7 +2809,7 @@ async function handleVoiceCaptureEvent(event) {
         inputCursorIndex = input.length;
         lastApplied = { input: String(next), cursorIndex: input.length };
         updateCommandMenuState();
-        scrollChatToBottom();
+        scrollChatToBottom({ force: true });
         markDirty();
         renderFrame(false);
       };
@@ -3281,6 +3285,7 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
       "SKILL USE (MUST FOLLOW):",
       "- Before planning specialized or artifact work (including PDF, PowerPoint/slides, Word documents, spreadsheets, Android apps, or service integrations), call list_skills() to discover applicable workflows.",
       "- If a relevant skill exists, call get_skill(name), read its complete instructions, and incorporate them into the plan. Do not substitute an ad-hoc library workflow without checking skills first.",
+      "- To install a skill that is not installed locally, call search_skill(query) to find it in the public nexus-skills registry first; fall back to web_search only when search_skill returns no match.",
       "- Skip skill discovery only for clearly trivial requests or ordinary code work with no plausible specialized skill. When unsure, check.",
       "",
       "PLAN MODE (MANDATORY):",
@@ -3328,6 +3333,7 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
     "SKILL USE (MUST FOLLOW):",
     "- Before starting specialized or artifact work (including PDF, PowerPoint/slides, Word documents, spreadsheets, Android apps, or service integrations), call list_skills() to discover applicable workflows.",
     "- If a relevant skill exists, call get_skill(name), read its complete instructions, and follow it before other implementation actions, package installation, or ad-hoc tooling.",
+    "- To install a skill that is not installed locally, call search_skill(query) to find it in the public nexus-skills registry first, then fetch its SKILL.md raw_url and create it with manage_skill(name, description, body). Fall back to web_search only when search_skill returns no match.",
     "- Do not install dependencies for a specialized task until skill discovery is complete; the skill may provide its own scripts, environment, dependencies, or required validation workflow.",
     "- Skip skill discovery only for clearly trivial requests or ordinary code work with no plausible specialized skill. When unsure, check.",
     "",
@@ -4990,9 +4996,7 @@ async function handleMcpBridgeRequest(parsed) {
     const when = typeof parsed.when === "string" ? parsed.when.trim() : "";
     const prompt = typeof parsed.prompt === "string" ? parsed.prompt.trim() : "";
     const runtimeSessionId = String(parsed.session_id || "").trim();
-    const reminderOwner = runtimeSessionId.toLowerCase().startsWith("named-")
-      ? normalizeLoopOwnerAgent(runtimeSessionId.slice("named-".length))
-      : "main";
+    const reminderOwner = resolveReminderOwnerFromSessionId(runtimeSessionId);
     if (!when || !prompt) {
       return { ok: false, error: "set_reminder requires 'when' and 'prompt' strings" };
     }
@@ -6797,6 +6801,35 @@ function normalizeLoopOwnerAgent(value) {
   return normalizeNamedAgentName(name) || "main";
 }
 
+// Named-agent runtimes post session_id in the form
+// "named-<agent-name>-<session-uid>" (see _new_named_agent_record in tools.py
+// and createNamedAgentRecord in this file), where the uid is a uuid/hex
+// suffix. Resolve the loop owner to the real agent name: keeping the suffix
+// makes getNamedAgentByName(owner) miss and the reminder never fires (the due
+// task is skipped every tick and left in place).
+function resolveReminderOwnerFromSessionId(runtimeSessionId) {
+  const trimmed = String(runtimeSessionId || "").trim();
+  if (!trimmed.toLowerCase().startsWith("named-")) {
+    return "main";
+  }
+  const candidate = trimmed.slice("named-".length);
+  const lowerCandidate = candidate.toLowerCase();
+  const knownAgents = (Array.isArray(namedAgents) ? namedAgents : [])
+    .map((agent) => String(agent?.name || "").toLowerCase())
+    .filter((name) => name && (lowerCandidate === name || lowerCandidate.startsWith(name + "-")));
+  if (knownAgents.length > 0) {
+    // Prefer the longest matching agent name so a name that is a prefix of
+    // another never captures the wrong owner.
+    knownAgents.sort((a, b) => b.length - a.length);
+    return normalizeLoopOwnerAgent(knownAgents[0]);
+  }
+  // Fallback when the agent list is not loaded yet: strip a uuid/hex suffix.
+  const stripped = candidate
+    .replace(/-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i, "")
+    .replace(/-[0-9a-f]{32}$/i, "");
+  return normalizeLoopOwnerAgent(stripped);
+}
+
 function getLoopTasksForAgent(name = activeAgentName) {
   const owner = normalizeLoopOwnerAgent(name).toLowerCase();
   return loopTasks.filter(
@@ -7347,14 +7380,22 @@ function buildLoopsSummaryText(ownerAgent = activeAgentName) {
     return "No scheduled loops.";
   }
   const lines = tasks.map((task) => {
-    const intervalLabel = task.dynamic
-      ? "dynamic"
-      : task.oneshot
-        ? "once"
-        : formatLoopIntervalLabel(task.intervalMs);
+    const intervalLabel = task.paused
+      ? "paused"
+      : task.dynamic
+        ? "dynamic"
+        : task.oneshot
+          ? task.displayLabel
+            ? `once ${task.displayLabel}`
+            : "once"
+          : formatLoopIntervalLabel(task.intervalMs);
     const promptPreview = task.prompt.replace(/\r?\n/g, " ").slice(0, 60);
     const truncated = promptPreview.length < task.prompt.length ? "…" : "";
-    return `- ${task.id} | every ${intervalLabel} | ${promptPreview}${truncated}`;
+    const fireText =
+      Number.isFinite(Number(task.nextFireAt)) && Number(task.nextFireAt) > 0
+        ? ` | fires ${formatLoopFireTime(task.nextFireAt)} (${formatLoopFireRelative(task.nextFireAt)})`
+        : "";
+    return `- ${task.id} | every ${intervalLabel} | ${promptPreview}${truncated}${fireText}`;
   });
   return `Scheduled loops for ${normalizeLoopOwnerAgent(ownerAgent)} (${tasks.length}):\n${lines.join("\n")}\n\nCancel with: /loops cancel <id>`;
 }
@@ -8488,9 +8529,27 @@ function buildNamedAgentCompactionMessages(record, runtime) {
       continue;
     }
     const role = String(entry.role || "");
-    if (!["system", "user", "assistant"].includes(role)) continue;
+    if (!["system", "user", "assistant", "tool"].includes(role)) continue;
     const content = typeof entry.content === "string" ? entry.content : "";
     if (!content.trim()) continue;
+    if (role === "tool") {
+      // Native tool results (role "tool" with tool_call_id, written by the
+      // harness worker) must reach the summarizer or the tool outcome is lost
+      // from the summary. Emit them as user context, never as tool-role
+      // messages: the compaction request carries no tool_calls to pair with.
+      const toolName = typeof entry.name === "string" && entry.name.trim()
+        ? entry.name.trim()
+        : "code_execution";
+      output.push({ role: "user", content: `[tool ${toolName} result]\n${content}` });
+      continue;
+    }
+    if (role === "assistant" && Array.isArray(entry.tool_calls) && entry.tool_calls.length > 0) {
+      // The native tool_calls turn is summarized through its tool results
+      // above; sending tool_calls without their responses would make the
+      // provider reject the compaction request.
+      output.push({ role: "assistant", content });
+      continue;
+    }
     const next = { role, content };
     const details = normalizeReasoningDetails(entry.reasoning_details);
     if (role === "assistant" && includeReasoning && details) next.reasoning_details = details;
@@ -13242,6 +13301,20 @@ function mainSessionMessageToNamedMessage(entry) {
 
 function namedSessionMessageToMainMessage(entry) {
   if (!entry || entry.role === "system" || typeof entry.content !== "string") return null;
+  // Native tool-calling entries written by the harness worker (role "tool"
+  // with tool_call_id): keep them so the assistant tool_calls turn stays
+  // paired when the named session is transferred into the main session.
+  if (entry.role === "tool" && typeof entry.tool_call_id === "string" && entry.tool_call_id.trim()) {
+    return {
+      role: "tool",
+      content: entry.content,
+      name: typeof entry.name === "string" && entry.name.trim() ? entry.name.trim() : "code_execution",
+      toolCallId: entry.tool_call_id,
+      toolInput: typeof entry.tool_input === "string" ? entry.tool_input : "",
+      toolCode: "",
+      toolOk: typeof entry.tool_ok === "boolean" ? entry.tool_ok : true,
+    };
+  }
   const toolMatch = entry.role === "user"
     ? entry.content.match(/^\[tool ([A-Za-z0-9._-]+) result\]\s*/)
     : null;
@@ -13833,6 +13906,34 @@ function namedAgentMessagesForDisplay(agent) {
   for (const entry of Array.isArray(agent?.messages) ? agent.messages : []) {
     if (!entry || entry.role === "system" || entry.hidden === true || isCompactionSummaryEntry(entry)) continue;
     const content = String(entry.content || "");
+    // Native tool-calling entries written by the Python harness worker mirror
+    // the main session's appendToolMessages shape (toolCallId + toolInput +
+    // toolOk): render them exactly like native tool results in the main chat.
+    if (entry.role === "tool" && typeof entry.tool_call_id === "string" && entry.tool_call_id.trim()) {
+      const toolName = typeof entry.name === "string" && entry.name.trim()
+        ? entry.name.trim()
+        : "code_execution";
+      output.push({
+        role: "tool",
+        name: toolName,
+        toolCallId: entry.tool_call_id,
+        toolInput: typeof entry.tool_input === "string" ? entry.tool_input : "",
+        toolCode: "",
+        toolOk: typeof entry.tool_ok === "boolean" ? entry.tool_ok : true,
+        content,
+      });
+      continue;
+    }
+    // Empty assistant tool-call turns carry no visible text; the tool entries
+    // above render the executed work (matches isRenderableChatEntry).
+    if (
+      entry.role === "assistant" &&
+      !content.trim() &&
+      Array.isArray(entry.tool_calls) &&
+      entry.tool_calls.length > 0
+    ) {
+      continue;
+    }
     const toolResultMatch = entry.role === "user"
       ? content.match(/^\[tool ([A-Za-z0-9._-]+) result\]\s*/)
       : null;
@@ -14277,6 +14378,24 @@ async function appendNamedAgentToolResult(recordPath, sessionUid, payload) {
   return true;
 }
 
+// After a handoff (@mention / delegate / notify) executes the tool once, the
+// follow-up turn (the main agent's reply, or the source agent's continuation
+// worker) sees the user's mention text and the tool result in history and can
+// re-call delegate_agent/notify_agent for the same task, duplicating the
+// submission. Inject an explicit completion note so the follow-up turn knows
+// the delegation already ran and must not run it again.
+function buildHandoffCompletionNote(state) {
+  if (!state) return "";
+  const agentName = String(state.agentName || "").trim();
+  if (!agentName) return "";
+  const task = String(state.task || "").trim();
+  return (
+    `[orchestrator] The handoff to ${agentName}${task ? ` for "${task}"` : ""} has already been ` +
+    "completed via delegate_agent/notify_agent (see the tool result above). " +
+    "Do not call delegate_agent or notify_agent again for this task — simply continue."
+  );
+}
+
 async function finishAgentHandoff(state, record) {
   if (getActiveAgentHandoff(state.sourceAgent) !== state) return;
   const generation = state.generation;
@@ -14290,6 +14409,7 @@ async function finishAgentHandoff(state, record) {
   }
 
   const outcome = getAgentHandoffToolPayload(state, record);
+  const handoffNote = buildHandoffCompletionNote(state);
   if (state.sourceAgent === "main") {
     appendToolMessages(
       "code_execution",
@@ -14304,7 +14424,8 @@ async function finishAgentHandoff(state, record) {
       outcome.uiSections
     );
     for (const entry of queued) appendSubmittedUserMessage(entry.submission);
-    pendingHookContext = mergeAgentHandoffHookContext(state);
+    const hookContext = mergeAgentHandoffHookContext(state);
+    pendingHookContext = [hookContext, handoffNote].filter(Boolean).join("\n\n");
     activeAgentHandoffs.delete("main");
     updateThinkingAnimationState();
     if (!state.waitForUser || queued.length > 0) {
@@ -14323,7 +14444,8 @@ async function finishAgentHandoff(state, record) {
           outcome
         );
       } else {
-        await launchNamedAgentRecord(sourceRecordPath, sourceRecord, outcome.historyText, {
+        const followUpTask = [handoffNote, outcome.historyText].filter(Boolean).join("\n");
+        await launchNamedAgentRecord(sourceRecordPath, sourceRecord, followUpTask, {
           toolName: "code_execution",
           toolOk: outcome.toolOk,
           followUpTasks: queued.map((entry) => entry.submission.resolvedContent),
@@ -14359,6 +14481,9 @@ async function appendNamedAgentHandoffPrompt(agentName, content, mention, option
       mention?.task,
       options.toolName
     ).content,
+    // Kept in the worker's history but hidden from the UI: the executed tool
+    // result renders as the single visible entry (no duplicate delegate_agent).
+    hidden: true,
   });
   record.updated_at = Date.now() / 1000;
   await writeJsonAtomic(agent.recordPath, record);
@@ -14442,7 +14567,12 @@ function startAgentHandoff(mention, options = {}) {
   };
   activeAgentHandoffs.set(sourceAgent, state);
   if (sourceAgent === "main") {
-    appendAssistantMessage(executeMessage.content);
+    // Do not pre-render the fenced delegate_agent block as its own assistant
+    // message: finishAgentHandoff appends the executed tool result, which is
+    // the single visible representation. Pre-rendering produced a duplicate
+    // delegate_agent entry in the UI.
+    markDirty();
+    renderFrame(false);
   }
   thinkingStartedAt = state.startedAt;
   resetStopRequested();
@@ -14470,7 +14600,8 @@ async function runAgentNotification(mention, options = {}) {
   const sessionUid = getAgentSessionUid(sourceAgent);
   let sourceRecordPath = "";
   if (sourceAgent === "main") {
-    appendAssistantMessage(executeMessage.content);
+    // The executed notify_agent tool result (appendToolMessages below) is the
+    // single visible entry; do not pre-render the fenced block.
   } else {
     const source = getNamedAgentByName(sourceAgent);
     sourceRecordPath = source?.recordPath || getNamedAgentRecordPath(sourceAgent);
@@ -18034,6 +18165,23 @@ function formatLoopFireTime(ms) {
   return `${formatDayLabel(ms)} at ${formatTimeOfDay(at)}`;
 }
 
+function formatLoopFireRelative(ms) {
+  const totalMinutes = Math.max(0, Math.round((Number(ms) - Date.now()) / 60000));
+  if (totalMinutes < 1) {
+    return "now";
+  }
+  const days = Math.floor(totalMinutes / 1440);
+  if (days > 0) {
+    return `in ${days}d`;
+  }
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours > 0) {
+    return minutes > 0 ? `in ${hours}h ${minutes}m` : `in ${hours}h`;
+  }
+  return `in ${totalMinutes}m`;
+}
+
 function openLoopsBuffer() {
   commandBufferQuery = "";
   lastCommandRenderedRows = [];
@@ -18142,11 +18290,21 @@ function renderLoopsBuffer() {
         : task.dynamic
           ? "dynamic"
           : task.oneshot
-            ? "once"
+            ? task.displayLabel
+              ? `once ${task.displayLabel}`
+              : "once"
             : `every ${formatLoopIntervalLabel(task.intervalMs)}`;
-      const promptPreview = task.prompt.replace(/\r?\n/g, " ").slice(0, 48);
-      const nextText = task.paused || task.oneshot ? "" : `  next: ${formatLoopFireTime(task.nextFireAt)}`;
-      const text = `  ${marker} ${intervalLabel.padEnd(10)} ${promptPreview}${nextText}`;
+      const hasFireTime = Number.isFinite(Number(task.nextFireAt)) && Number(task.nextFireAt) > 0;
+      const nextText = hasFireTime
+        ? `  fires ${formatLoopFireTime(task.nextFireAt)} (${formatLoopFireRelative(task.nextFireAt)})`
+        : "";
+      // Keep the fire time visible: shrink the prompt preview to fit the row
+      // (reserve one char for the truncation ellipsis).
+      const fixedPrefix = 15; // "  ● " + interval column + space
+      const maxPrompt = Math.max(8, panelWidth - fixedPrefix - nextText.length - 1);
+      const promptPreview = task.prompt.replace(/\r?\n/g, " ").slice(0, maxPrompt);
+      const truncated = promptPreview.length < task.prompt.replace(/\r?\n/g, " ").length ? "…" : "";
+      const text = `  ${marker} ${intervalLabel.padEnd(10)} ${promptPreview}${truncated}${nextText}`;
       if (i === loopsSelected) {
         setPanelRow(row, text, BLUE_COLOR);
       } else if (task.paused) {
@@ -20742,8 +20900,18 @@ function scrollChatBy(delta) {
   return true;
 }
 
-function scrollChatToBottom() {
+function scrollChatToBottom(options = {}) {
   if (chatScrollOffset === 0) {
+    return false;
+  }
+
+  if (options.force !== true && activeAgentName !== "main") {
+    // The user is reading a named agent buffer. Main-session activity (a
+    // completed main turn, tool results, loop fires, compaction) must not
+    // yank the view: the shared scroll offset only auto-follows the buffer
+    // of the agent that is actually working. Named-agent updates re-render
+    // in place, so a user already at the bottom keeps following while a
+    // scrolled-up reader keeps their place.
     return false;
   }
 
@@ -23640,6 +23808,14 @@ function runFormatSelfTest() {
           reasoning_details: [{ type: "reasoning.text", text: "worker thought", format: "unknown" }],
         },
         { role: "user", content: "[tool set_reminder result]\nsay hello" },
+        {
+          role: "assistant",
+          content: "",
+          tool_calls: [
+            { id: "call_native_1", type: "function", function: { name: "code_execution", arguments: "{\"code\": \"print(42)\"}" } },
+          ],
+        },
+        { role: "tool", tool_call_id: "call_native_1", name: "code_execution", tool_input: "print(42)", tool_ok: true, content: "42" },
       ],
       queuedTasks: ["next task"],
     });
@@ -23659,7 +23835,19 @@ function runFormatSelfTest() {
       !namedAgentDisplayFixture.some(
         (entry) => entry.role === "assistant" && extractReasoningDisplayText(entry.reasoningDetails).includes("worker thought")
       ) ||
-      !namedAgentDisplayFixture.some((entry) => entry.queued === true && entry.content === "next task")
+      !namedAgentDisplayFixture.some((entry) => entry.queued === true && entry.content === "next task") ||
+      namedAgentDisplayFixture.some(
+        (entry) => entry.role === "assistant" && Array.isArray(entry.toolCalls)
+      ) ||
+      !namedAgentDisplayFixture.some(
+        (entry) =>
+          entry.role === "tool" &&
+          entry.name === "code_execution" &&
+          entry.toolCallId === "call_native_1" &&
+          entry.toolInput === "print(42)" &&
+          entry.toolOk === true &&
+          entry.content === "42"
+      )
     ) {
       out("FORMAT_FAIL: named agent session normalization is incorrect\n");
       return 1;
@@ -23748,6 +23936,71 @@ function runFormatSelfTest() {
       out("FORMAT_FAIL: named agent runtime state leaked into the main session\n");
       return 1;
     }
+    // Scroll-follow guard: main-session appends must not yank the view while
+    // the user is reading another agent's buffer. Auto-scroll applies only in
+    // the buffer of the agent that is working; user-initiated scrolls force
+    // through.
+    const savedScrollAgentForTest = activeAgentName;
+    const savedScrollOffsetForTest = chatScrollOffset;
+    try {
+      chatScrollOffset = 10;
+      activeAgentName = "runtime-worker";
+      const guardedScroll = scrollChatToBottom();
+      const guardedOffset = chatScrollOffset;
+      chatScrollOffset = 10;
+      const forcedScroll = scrollChatToBottom({ force: true });
+      const forcedOffset = chatScrollOffset;
+      chatScrollOffset = 10;
+      activeAgentName = "main";
+      const mainScroll = scrollChatToBottom();
+      const mainOffset = chatScrollOffset;
+      if (
+        guardedScroll !== false ||
+        guardedOffset !== 10 ||
+        forcedScroll !== true ||
+        forcedOffset !== 0 ||
+        mainScroll !== true ||
+        mainOffset !== 0
+      ) {
+        out("FORMAT_FAIL: scroll-follow guard is incorrect\n");
+        return 1;
+      }
+    } finally {
+      activeAgentName = savedScrollAgentForTest;
+      chatScrollOffset = savedScrollOffsetForTest;
+    }
+    // Session transfer of native tool-calling records: role "tool" entries
+    // with tool_call_id must map to main-session tool shape so the assistant
+    // tool_calls turn stays paired (no "[tool call did not complete]" noise).
+    const nativeTransferEntry = namedSessionMessageToMainMessage({
+      role: "tool",
+      tool_call_id: "call_transfer_1",
+      name: "code_execution",
+      tool_input: "print(42)",
+      tool_ok: true,
+      content: "42",
+    });
+    const legacyTransferEntry = namedSessionMessageToMainMessage({
+      role: "user",
+      content: "[tool delegate_agent result]\ndelegated answer",
+      tool_ok: true,
+    });
+    if (
+      !nativeTransferEntry ||
+      nativeTransferEntry.role !== "tool" ||
+      nativeTransferEntry.toolCallId !== "call_transfer_1" ||
+      nativeTransferEntry.toolInput !== "print(42)" ||
+      nativeTransferEntry.toolOk !== true ||
+      nativeTransferEntry.content !== "42" ||
+      !legacyTransferEntry ||
+      legacyTransferEntry.role !== "tool" ||
+      legacyTransferEntry.name !== "delegate_agent" ||
+      legacyTransferEntry.content !== "delegated answer" ||
+      namedSessionMessageToMainMessage({ role: "tool", content: "orphan", name: "code_execution" }) !== null
+    ) {
+      out("FORMAT_FAIL: native tool entries do not survive session transfer\n");
+      return 1;
+    }
     const mentionFixture = parseAgentDelegationInput(
       "@price_checker_agent hey please get current gold prices."
     );
@@ -23823,6 +24076,23 @@ function runFormatSelfTest() {
       handoffResultFixture.text !== "Gold is 100."
     ) {
       out("FORMAT_FAIL: main-agent @mention handoff parsing or status is incorrect\n");
+      return 1;
+    }
+    // The follow-up turn after a handoff must carry an explicit completion
+    // note so the model does not re-call delegate_agent/notify_agent for the
+    // same task (double submission).
+    const handoffNoteFixture = buildHandoffCompletionNote({
+      agentName: "price_checker_agent",
+      task: "get prices",
+    });
+    const emptyHandoffNoteFixture = buildHandoffCompletionNote({ agentName: "" });
+    if (
+      !handoffNoteFixture.includes("price_checker_agent") ||
+      !handoffNoteFixture.includes("get prices") ||
+      !handoffNoteFixture.includes("Do not call delegate_agent or notify_agent again") ||
+      emptyHandoffNoteFixture !== ""
+    ) {
+      out("FORMAT_FAIL: handoff completion note is incorrect\n");
       return 1;
     }
     const savedMentionAgents = namedAgents;
@@ -25503,6 +25773,59 @@ async function runLoopSelfTest() {
       out("LOOP_FAIL: reminder bridge did not preserve named-agent ownership\n");
       return 1;
     }
+    // A named-agent worker posts session_id as "named-<agent>-<session-uid>".
+    // The uid suffix must never leak into the loop owner or the due task is
+    // skipped every tick (getNamedAgentByName(owner) misses) and never fires.
+    const savedLoopTestNamedAgents = namedAgents;
+    loopTasks = [];
+    namedAgents = [{ name: "worker-a" }, { name: "worker-a-extra" }];
+    try {
+      const knownUidBridge = await handleMcpBridgeRequest({
+        method: "reminder",
+        when: "in 1 minute",
+        prompt: "uid bridge test",
+        session_id: "named-worker-a-" + "a".repeat(32),
+      });
+      const dashedUidBridge = await handleMcpBridgeRequest({
+        method: "reminder",
+        when: "in 1 minute",
+        prompt: "dashed uid bridge test",
+        session_id: "named-worker-a-11111111-2222-4333-8444-555555555555",
+      });
+      const longestPrefixBridge = await handleMcpBridgeRequest({
+        method: "reminder",
+        when: "in 1 minute",
+        prompt: "longest prefix bridge test",
+        session_id: "named-worker-a-extra-" + "b".repeat(32),
+      });
+      if (
+        !knownUidBridge?.ok ||
+        loopTasks.find((task) => task.prompt === "uid bridge test")?.ownerAgent !== "worker-a" ||
+        loopTasks.find((task) => task.prompt === "dashed uid bridge test")?.ownerAgent !== "worker-a" ||
+        loopTasks.find((task) => task.prompt === "longest prefix bridge test")?.ownerAgent !== "worker-a-extra"
+      ) {
+        out(`LOOP_FAIL: reminder bridge did not resolve the real agent from a uid session_id: ${JSON.stringify(loopTasks.map((t) => [t.prompt, t.ownerAgent]))}\n`);
+        return 1;
+      }
+    } finally {
+      namedAgents = savedLoopTestNamedAgents;
+    }
+    // Fallback without the agent list loaded: the uid suffix is stripped too.
+    loopTasks = [];
+    const fallbackUidBridge = await handleMcpBridgeRequest({
+      method: "reminder",
+      when: "in 1 minute",
+      prompt: "fallback uid bridge test",
+      session_id: "named-worker-a-" + "c".repeat(32),
+    });
+    if (
+      !fallbackUidBridge?.ok ||
+      loopTasks[0]?.ownerAgent !== "worker-a" ||
+      loopTasks[0]?.prompt !== "fallback uid bridge test"
+    ) {
+      out("LOOP_FAIL: reminder bridge uid fallback resolution is incorrect\n");
+      return 1;
+    }
     loopTasks = [];
     const badBridge = await handleMcpBridgeRequest({ method: "reminder", when: "sometime later", prompt: "x" });
     if (!badBridge || badBridge.ok !== false || loopTasks.length !== 0) {
@@ -25529,6 +25852,39 @@ async function runLoopSelfTest() {
       shot.displayLabel !== "tomorrow at 9:00am"
     ) {
       out("LOOP_FAIL: one-shot schedule fireAt/display wrong\n");
+      return 1;
+    }
+    // Fire-time display: the /loops buffer and command summary must surface
+    // when a task fires, including one-shot reminders and paused tasks.
+    const fireTimeNow = Date.now() + 10 * 60 * 1000;
+    const fireDisplay = formatLoopFireTime(fireTimeNow);
+    const fireRelative = formatLoopFireRelative(fireTimeNow);
+    if (
+      !fireDisplay.includes("at ") ||
+      !/^in \d+m$/.test(fireRelative) ||
+      formatLoopFireRelative(Date.now()) !== "now" ||
+      formatLoopFireRelative(Date.now() - 5000) !== "now"
+    ) {
+      out(`LOOP_FAIL: loop fire-time formatting is incorrect: ${fireDisplay} / ${fireRelative}\n`);
+      return 1;
+    }
+    const summaryTasks = [
+      { ...shot, ownerAgent: "main", nextFireAt: fireTimeNow },
+      { ...stored, id: "recurring-fire-test", ownerAgent: "main", dynamic: false, intervalMs: 5 * 60 * 1000, nextFireAt: fireTimeNow },
+      { ...stored, id: "paused-fire-test", ownerAgent: "main", paused: true, nextFireAt: fireTimeNow },
+    ];
+    const savedSummaryTasks = loopTasks;
+    loopTasks = summaryTasks;
+    const fireSummary = buildLoopsSummaryText("main");
+    loopTasks = savedSummaryTasks;
+    const summaryLines = fireSummary.split("\n");
+    if (
+      summaryLines.length !== 6 ||
+      !summaryLines.some((line) => line.includes("once tomorrow at 9:00am") && line.includes(fireDisplay)) ||
+      !summaryLines.some((line) => line.includes("every 5m") && line.includes(fireDisplay)) ||
+      !summaryLines.some((line) => line.includes("paused") && line.includes(fireDisplay))
+    ) {
+      out(`LOOP_FAIL: loop summary does not include the fire time for every task: ${JSON.stringify(summaryLines)}\n`);
       return 1;
     }
     removeLoopTask(shot.id);
@@ -25662,6 +26018,14 @@ function runCompactionSelfTest() {
       { role: "user", content: "_summary\nold named summary" },
       { role: "user", content: "named-only task" },
       { role: "assistant", content: "named-only answer" },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          { id: "call_compact_1", type: "function", function: { name: "code_execution", arguments: "{\"code\": \"print(1)\"}" } },
+        ],
+      },
+      { role: "tool", tool_call_id: "call_compact_1", name: "code_execution", content: "compact tool result" },
     ];
     const mainSnapshot = JSON.stringify(mainSessionFixture);
     const compactedNamedFixture = compactConversationEntries(namedSessionFixture, "fresh named summary");
@@ -25710,6 +26074,42 @@ function runCompactionSelfTest() {
       namedRequestFixture.some((entry) => Object.prototype.hasOwnProperty.call(entry, "reasoning_details"))
     ) {
       out(`COMPACT_FAIL: named-agent summary request used another session's runtime or messages: ${JSON.stringify({ namedSummaryPrompt, namedRequestFixture })}\n`);
+      return 1;
+    }
+    // Native tool-calling turns in a named agent record must survive
+    // compaction: the tool result reaches the summarizer as user context and
+    // the assistant tool_calls metadata is stripped so the request stays
+    // provider-valid (no orphaned tool_calls).
+    const nativeCompactionRequest = buildNamedAgentCompactionMessages(
+      {
+        messages: [
+          {
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              { id: "call_compact_2", type: "function", function: { name: "code_execution", arguments: "{\"code\": \"print(2)\"}" } },
+            ],
+          },
+          { role: "tool", tool_call_id: "call_compact_2", name: "code_execution", content: "native tool landed" },
+          { role: "assistant", content: "handoff delegated to another agent" },
+          { role: "user", content: "[tool delegate_agent result]\ndelegated result" },
+        ],
+      },
+      namedRuntimeFixture
+    );
+    const nativeToolUsers = nativeCompactionRequest.filter(
+      (entry) => entry.role === "user" && String(entry.content || "").includes("[tool code_execution result]")
+    );
+    if (
+      nativeCompactionRequest.some((entry) => entry.role === "tool") ||
+      nativeCompactionRequest.some((entry) => Object.prototype.hasOwnProperty.call(entry, "tool_calls")) ||
+      nativeToolUsers.length !== 1 ||
+      !String(nativeToolUsers[0].content || "").includes("native tool landed") ||
+      !nativeCompactionRequest.some((entry) => String(entry.content || "").includes("[tool delegate_agent result]")) ||
+      !nativeCompactionRequest.some((entry) => String(entry.content || "").includes("handoff delegated to another agent")) ||
+      nativeCompactionRequest.some((entry) => String(entry.content || "").includes("[tool code_execution result]\n[error]"))
+    ) {
+      out(`COMPACT_FAIL: native tool turns were not compacted provider-valid: ${JSON.stringify(nativeCompactionRequest)}\n`);
       return 1;
     }
     updateNamedAgentCompactionTelemetry(
@@ -26914,6 +27314,52 @@ async function runNamedAgentSelfTest() {
       )
     ) {
       throw new Error(`thinking-off named agent exposed provider reasoning: ${JSON.stringify(completed)}`);
+    }
+
+    // Handoff blocks are kept in the record for the worker's history but are
+    // hidden from the UI: the executed delegate_agent/notify_agent tool result
+    // is the single visible entry (no duplicate render).
+    const savedHandoffAgents = namedAgents;
+    try {
+      const handoffRecord = createNamedAgentRecord("handoff-hidden-test");
+      handoffRecord.messages = [
+        { role: "system", content: "sys" },
+        { role: "user", content: "delegate to another agent" },
+      ];
+      const handoffTestPath = getNamedAgentRecordPath("handoff-hidden-test");
+      await fs.mkdir(path.dirname(handoffTestPath), { recursive: true });
+      await writeJsonAtomic(handoffTestPath, handoffRecord);
+      await refreshNamedAgents();
+      const appended = await appendNamedAgentHandoffPrompt(
+        "handoff-hidden-test",
+        "task text",
+        { name: "target_agent", task: "do the thing" }
+      );
+      const updatedRecord = await readJsonObject(handoffTestPath);
+      const hiddenBlocks = (updatedRecord?.messages || []).filter(
+        (message) =>
+          message?.role === "assistant" &&
+          message.hidden === true &&
+          String(message.content || "").includes("delegate_agent")
+      );
+      const displayEntries = namedAgentMessagesForDisplay(updatedRecord || handoffRecord);
+      const visibleDelegateEntries = displayEntries.filter((entry) =>
+        String(entry.content || "").includes("delegate_agent")
+      );
+      const nativeToolEntries = displayEntries.filter((entry) => entry.role === "tool" && entry.toolCallId);
+      if (
+        !appended?.ok ||
+        hiddenBlocks.length !== 1 ||
+        visibleDelegateEntries.length !== 0 ||
+        nativeToolEntries.length !== 0
+      ) {
+        throw new Error(
+          `handoff block was not hidden from the UI: ${JSON.stringify({ hiddenBlocks, visibleDelegateEntries, nativeToolEntries, displayEntries })}`
+        );
+      }
+      await fs.unlink(handoffTestPath).catch(() => {});
+    } finally {
+      namedAgents = savedHandoffAgents;
     }
     out("AGENTS_OK\n");
     return 0;
@@ -28302,7 +28748,7 @@ process.stdin.on("keypress", async (str, key) => {
   }
 
   if (key?.name === "home" || key?.name === "end") {
-    const changed = key.name === "home" ? scrollChatToTop() : scrollChatToBottom();
+    const changed = key.name === "home" ? scrollChatToTop() : scrollChatToBottom({ force: true });
     if (changed) {
       cancelIdleFlush();
       burstMode = false;
@@ -28408,7 +28854,7 @@ process.stdin.on("keypress", async (str, key) => {
         if (agentMention.mode === "notify") {
           const result = await runAgentNotification(agentMention, { sourceAgent: targetAgent });
           agentsMessage = result.ok ? "" : result.error || "Could not notify the agent";
-          scrollChatToBottom();
+          scrollChatToBottom({ force: true });
           markDirty();
           renderFrame(true);
           return;
@@ -28423,7 +28869,7 @@ process.stdin.on("keypress", async (str, key) => {
           });
           agentsMessage = "";
         }
-        scrollChatToBottom();
+        scrollChatToBottom({ force: true });
         markDirty();
         renderFrame(true);
         return;
@@ -28437,7 +28883,7 @@ process.stdin.on("keypress", async (str, key) => {
         agentsMessage = "";
       }
       await refreshNamedAgents();
-      scrollChatToBottom();
+      scrollChatToBottom({ force: true });
       markDirty();
       renderFrame(true);
       return;
@@ -28474,8 +28920,10 @@ process.stdin.on("keypress", async (str, key) => {
     // Reminders go through the model via the set_reminder tool, which the
     // agent calls when the user asks to be reminded ("remind me in 5 min").
     const modelAtSubmit = selectedModel;
+    // The user's message always enters the transcript; notify defers nothing
+    // (runAgentNotification appends the assistant execute block + tool result).
     const submission = submit({
-      deferAppend: queueBehindActiveTurn || agentMention?.mode === "notify",
+      deferAppend: queueBehindActiveTurn,
     });
     if (submission) {
       if (APPEND_CHAT_TO_SCROLLBACK && !queueBehindActiveTurn) {
