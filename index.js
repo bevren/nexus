@@ -12954,6 +12954,17 @@ function namedSessionMessageToMainMessage(entry) {
   // with tool_call_id): keep them so the assistant tool_calls turn stays
   // paired when the named session is transferred into the main session.
   if (entry.role === "tool" && typeof entry.tool_call_id === "string" && entry.tool_call_id.trim()) {
+    const planEvents = Array.isArray(entry.plan_ui_events)
+      ? entry.plan_ui_events.filter((item) => item && typeof item === "object")
+      : [];
+    const planUiMarkdown = planEvents.length > 0
+      ? formatPlanUiMarkdown(planEvents[planEvents.length - 1])
+      : "";
+    const planAction = planEvents.length > 0
+      ? (typeof planEvents[planEvents.length - 1]?.action === "string"
+        ? planEvents[planEvents.length - 1].action.trim()
+        : "")
+      : "";
     return {
       role: "tool",
       content: entry.content,
@@ -12962,6 +12973,8 @@ function namedSessionMessageToMainMessage(entry) {
       toolInput: typeof entry.tool_input === "string" ? entry.tool_input : "",
       toolCode: "",
       toolOk: typeof entry.tool_ok === "boolean" ? entry.tool_ok : true,
+      ...(planUiMarkdown ? { uiKind: "plan", uiContent: planUiMarkdown } : {}),
+      ...(planAction ? { planAction } : {}),
     };
   }
   const toolMatch = entry.role === "user"
@@ -13195,6 +13208,7 @@ async function resetNamedAgentSessionAfterCut(clipboard) {
   applyNamedAgentSessionRuntime(reset, carriedRuntime);
   await writeJsonAtomic(agent.recordPath, reset);
   await writeNamedAgentQueue(agent.recordPath, []);
+  removeQueuedBusyPromptsForAgent(sourceName);
   removeLoopsForAgent(sourceName, { persist: false });
   namedAgentUiNotices.delete(sourceName.toLowerCase());
   await persistNamedAgentLoops();
@@ -13322,6 +13336,7 @@ async function deleteSelectedSessionFromBuffer() {
       applyNamedAgentSessionRuntime(reset, carriedRuntime);
       await writeJsonAtomic(agent.recordPath, reset);
       await writeNamedAgentQueue(agent.recordPath, []);
+      removeQueuedBusyPromptsForAgent(agent.name);
       removeLoopsForAgent(agent.name, { persist: false });
       namedAgentUiNotices.delete(agent.name.toLowerCase());
       await persistNamedAgentLoops();
@@ -13559,6 +13574,19 @@ function namedAgentMessagesForDisplay(agent) {
       const toolName = typeof entry.name === "string" && entry.name.trim()
         ? entry.name.trim()
         : "code_execution";
+      // Plan UI events persisted by the harness worker (create_plan /
+      // update_plan) render as a plan block, mirroring the main session.
+      const planEvents = Array.isArray(entry.plan_ui_events)
+        ? entry.plan_ui_events.filter((item) => item && typeof item === "object")
+        : [];
+      const planUiMarkdown = planEvents.length > 0
+        ? formatPlanUiMarkdown(planEvents[planEvents.length - 1])
+        : "";
+      const planAction = planEvents.length > 0
+        ? (typeof planEvents[planEvents.length - 1]?.action === "string"
+          ? planEvents[planEvents.length - 1].action.trim()
+          : "")
+        : "";
       output.push({
         role: "tool",
         name: toolName,
@@ -13567,6 +13595,8 @@ function namedAgentMessagesForDisplay(agent) {
         toolCode: "",
         toolOk: typeof entry.tool_ok === "boolean" ? entry.tool_ok : true,
         content,
+        ...(planUiMarkdown ? { uiKind: "plan", uiContent: planUiMarkdown } : {}),
+        ...(planAction ? { planAction } : {}),
       });
       continue;
     }
@@ -13638,16 +13668,17 @@ function namedAgentMessagesForDisplay(agent) {
       });
     }
   }
-  for (const queued of Array.isArray(agent?.queuedTasks) ? agent.queuedTasks : []) {
-    output.push({ role: "user", content: String(queued), queued: true });
-  }
+  // Queued tasks are NOT rendered as ordinary chat messages: like the main
+  // session, a pending submission shows as the "Queued for the next turn"
+  // indicator above the input (addNamedAgentQueuedPrompt) and becomes a real
+  // user message only when the agent starts processing it. The queue file
+  // remains the single source of truth for the worker.
   hideSupersededPlanUiEntries(output);
   return output;
 }
 
 function mergeNamedAgentUiNotices(displayMessages, notices) {
-  const stableMessages = Array.from(displayMessages || []).filter((entry) => entry?.queued !== true);
-  const queuedMessages = Array.from(displayMessages || []).filter((entry) => entry?.queued === true);
+  const stableMessages = Array.from(displayMessages || []);
   const buckets = Array.from({ length: stableMessages.length + 1 }, () => []);
   for (const notice of Array.from(notices || [])) {
     const requestedIndex = Number(notice?.afterMessageCount);
@@ -13661,7 +13692,6 @@ function mergeNamedAgentUiNotices(displayMessages, notices) {
     if (index > 0) output.push(stableMessages[index - 1]);
     output.push(...buckets[index]);
   }
-  output.push(...queuedMessages);
   return output;
 }
 
@@ -13862,6 +13892,7 @@ async function startNewNamedAgentChat() {
   applyNamedAgentSessionRuntime(reset, carriedRuntime);
   await writeJsonAtomic(agent.recordPath, reset);
   await writeNamedAgentQueue(agent.recordPath, []);
+  removeQueuedBusyPromptsForAgent(agent.name);
   removeLoopsForAgent(agent.name, { persist: false });
   namedAgentUiNotices.delete(agent.name.toLowerCase());
   await persistNamedAgentLoops();
@@ -14348,6 +14379,21 @@ async function launchNextQueuedNamedAgentTask(agent) {
   try {
     const [task, ...remaining] = tasks;
     await writeNamedAgentQueue(agent.recordPath, remaining);
+    // The queued indicator for this specific task is consumed now that the
+    // agent is about to process it (it becomes a real user turn); any tasks
+    // still in the queue keep their indicators.
+    const consumedKey = getAgentHandoffKey(agent.name);
+    const consumedSessionUid = getAgentSessionUid(agent.name);
+    const consumedPreview = buildQueuedBusyPreview(task);
+    for (const entry of [...queuedBusyPrompts]) {
+      if (
+        entry.agentName === consumedKey &&
+        entry.sessionUid === consumedSessionUid &&
+        entry.text === consumedPreview
+      ) {
+        removeQueuedBusyPrompt(entry);
+      }
+    }
     const latest = await readJsonObject(agent.recordPath, agent);
     await launchNamedAgentRecord(agent.recordPath, latest, task);
   } finally {
@@ -14399,6 +14445,14 @@ async function refreshNamedAgents() {
     } else {
       markDirty();
       renderFrame(activeAgentName !== "main");
+    }
+  }
+  // Re-hydrate main-style queued indicators for a running agent with pending
+  // queue tasks (e.g. after a TUI restart while the detached worker is busy),
+  // and drop stale ones the worker already drained into real turns.
+  for (const agent of namedAgents) {
+    if (getNamedAgentStatus(agent) === "running") {
+      syncNamedAgentQueuedIndicators(agent);
     }
   }
   for (const agent of namedAgents) {
@@ -14482,6 +14536,7 @@ async function deleteSelectedNamedAgentFromBuffer() {
   }
 
   if (activeAgentName.toLowerCase() === agentKey) switchToAgentSession("main");
+  removeQueuedBusyPromptsForAgent(agent.name);
   removeLoopsForAgent(agent.name, { persist: false });
   namedAgentUiNotices.delete(agentKey);
   await fs.rm(agent.recordPath, { force: true });
@@ -15444,6 +15499,7 @@ async function runSlashCommand(commandName, commandArgs = "") {
       await persistNamedAgentLoops();
       await writeJsonAtomic(agent.recordPath, reset);
       await writeNamedAgentQueue(agent.recordPath, []);
+      removeQueuedBusyPromptsForAgent(agent.name || activeAgentName);
       await rewriteSessionWithCurrentMessages().catch(() => {});
       await refreshNamedAgents();
       forceFullClearOnNextRender = true;
@@ -17115,6 +17171,9 @@ async function submitRemoteControlPrompt(rawText) {
       return { ok: true, handoff: true, agent: agentMention.name };
     }
     const result = await dispatchNamedAgentTask(activeAgentName, trimmedInput);
+    if (result?.queued) {
+      addNamedAgentQueuedPrompt(activeAgentName, trimmedInput);
+    }
     await refreshNamedAgents();
     scheduleRemoteControlBroadcast({ force: true });
     return result;
@@ -19615,13 +19674,18 @@ function getActiveSessionCompactionPromise(agentName = activeAgentName) {
     : null;
 }
 
+function buildQueuedBusyPreview(text) {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  const characters = Array.from(normalized);
+  return characters.length > QUEUED_BUSY_MAX_PREVIEW_CHARS
+    ? `${characters.slice(0, QUEUED_BUSY_MAX_PREVIEW_CHARS - 3).join("")}...`
+    : normalized;
+}
+
 function addQueuedBusyPrompt(text, agentName = "main", sessionUid = getAgentSessionUid(agentName)) {
   const normalized = String(text || "").replace(/\s+/g, " ").trim();
   if (!normalized) return null;
-  const characters = Array.from(normalized);
-  const preview = characters.length > QUEUED_BUSY_MAX_PREVIEW_CHARS
-    ? `${characters.slice(0, QUEUED_BUSY_MAX_PREVIEW_CHARS - 3).join("")}...`
-    : normalized;
+  const preview = buildQueuedBusyPreview(normalized);
   const entry = {
     id: ++queuedBusyPromptSequence,
     text: preview,
@@ -19630,6 +19694,60 @@ function addQueuedBusyPrompt(text, agentName = "main", sessionUid = getAgentSess
   };
   queuedBusyPrompts.push(entry);
   return entry;
+}
+
+// Main-style queued indicator for named-agent submissions. The message is
+// stored in the agent's queue file (single source of truth) and shown above
+// the input while the agent is busy, exactly like the main session.
+function addNamedAgentQueuedPrompt(agentName, text) {
+  const sessionUid = getAgentSessionUid(agentName);
+  const key = getAgentHandoffKey(agentName);
+  const preview = buildQueuedBusyPreview(text);
+  if (!preview) return null;
+  const exists = queuedBusyPrompts.some(
+    (entry) =>
+      entry.agentName === key &&
+      entry.sessionUid === sessionUid &&
+      entry.text === preview
+  );
+  if (exists) return null;
+  return addQueuedBusyPrompt(text, agentName, sessionUid);
+}
+
+function removeQueuedBusyPromptsForAgent(agentName, sessionUid = getAgentSessionUid(agentName)) {
+  const key = getAgentHandoffKey(agentName);
+  const sid = String(sessionUid || "");
+  const removed = queuedBusyPrompts.filter(
+    (entry) => entry.agentName === key && (!sid || entry.sessionUid === sid)
+  );
+  for (const entry of removed) removeQueuedBusyPrompt(entry);
+  return removed.length;
+}
+
+// Keep the named agent's queued indicators in sync with its queue file. The
+// detached worker drains the queue between turns (delivering each task as the
+// next turn), so indicators whose text is no longer in the queue are stale.
+function syncNamedAgentQueuedIndicators(agent) {
+  if (!agent) return;
+  const key = getAgentHandoffKey(agent.name);
+  const sid = getAgentSessionUid(agent.name);
+  const queuePreviews = new Set(
+    (Array.isArray(agent.queuedTasks) ? agent.queuedTasks : [])
+      .map((task) => buildQueuedBusyPreview(task))
+      .filter(Boolean)
+  );
+  for (const entry of [...queuedBusyPrompts]) {
+    if (
+      entry.agentName === key &&
+      entry.sessionUid === sid &&
+      !queuePreviews.has(entry.text)
+    ) {
+      removeQueuedBusyPrompt(entry);
+    }
+  }
+  for (const task of Array.isArray(agent.queuedTasks) ? agent.queuedTasks : []) {
+    addNamedAgentQueuedPrompt(agent.name, task);
+  }
 }
 
 function removeQueuedBusyPrompt(entry) {
@@ -23402,6 +23520,20 @@ function runFormatSelfTest() {
           ],
         },
         { role: "tool", tool_call_id: "call_native_1", name: "code_execution", tool_input: "print(42)", tool_ok: true, content: "42" },
+        {
+          role: "tool",
+          tool_call_id: "call_native_plan_1",
+          name: "code_execution",
+          tool_input: "create_plan(['one', 'two'])",
+          tool_ok: true,
+          content: "plan created",
+          plan_ui_events: [
+            { type: "plan", action: "create_plan", entries: [
+              { text: "one", completed: true },
+              { text: "two", completed: false },
+            ] },
+          ],
+        },
       ],
       queuedTasks: ["next task"],
     });
@@ -23421,7 +23553,10 @@ function runFormatSelfTest() {
       !namedAgentDisplayFixture.some(
         (entry) => entry.role === "assistant" && extractReasoningDisplayText(entry.reasoningDetails).includes("worker thought")
       ) ||
-      !namedAgentDisplayFixture.some((entry) => entry.queued === true && entry.content === "next task") ||
+      // Queued tasks are not rendered as ordinary chat messages (main parity):
+      // they surface through the "Queued for the next turn" indicator.
+      namedAgentDisplayFixture.some((entry) => entry.queued === true) ||
+      namedAgentDisplayFixture.some((entry) => entry.content === "next task") ||
       namedAgentDisplayFixture.some(
         (entry) => entry.role === "assistant" && Array.isArray(entry.toolCalls)
       ) ||
@@ -23433,6 +23568,18 @@ function runFormatSelfTest() {
           entry.toolInput === "print(42)" &&
           entry.toolOk === true &&
           entry.content === "42"
+      ) ||
+      // Plan UI from the harness worker renders as a plan block (uiKind +
+      // uiContent markdown), mirroring the main session.
+      !namedAgentDisplayFixture.some(
+        (entry) =>
+          entry.role === "tool" &&
+          entry.toolCallId === "call_native_plan_1" &&
+          entry.uiKind === "plan" &&
+          typeof entry.uiContent === "string" &&
+          entry.uiContent.includes("one") &&
+          entry.uiContent.includes("two") &&
+          entry.planAction === "create_plan"
       )
     ) {
       out("FORMAT_FAIL: named agent session normalization is incorrect\n");
@@ -24070,6 +24217,44 @@ function runFormatSelfTest() {
     const longQueuedPreview = addQueuedBusyPrompt("x".repeat(500));
     const narrowQueuedStatusLines = getQueuedBusyPromptStatusLines(20);
     removeQueuedBusyPrompt(longQueuedPreview);
+    // Named-agent queued indicators (main parity): per-agent prompts, dedup,
+    // and scoped removal.
+    const savedQueuedAgentsForTest = namedAgents;
+    const savedQueuedActiveForTest = activeAgentName;
+    try {
+      namedAgents = [{ name: "queue-worker", session_uid: "queue-worker-uid", status: "running" }];
+      activeAgentName = "queue-worker";
+      const namedQueued = addNamedAgentQueuedPrompt("queue-worker", "first queued task");
+      const namedQueuedDup = addNamedAgentQueuedPrompt("queue-worker", "first queued task");
+      const namedQueuedTwo = addNamedAgentQueuedPrompt("queue-worker", "second queued task");
+      const namedQueuedStatus = getQueuedBusyPromptStatusLines(80);
+      // Sync: after the worker drains a task into a real turn (queue no longer
+      // contains it), the indicator must be pruned; still-queued tasks stay.
+      addNamedAgentQueuedPrompt("queue-worker", "first queued task");
+      addNamedAgentQueuedPrompt("queue-worker", "second queued task");
+      syncNamedAgentQueuedIndicators({ name: "queue-worker", queuedTasks: ["second queued task"] });
+      const syncedStatus = getQueuedBusyPromptStatusLines(80);
+      if (
+        !namedQueued ||
+        namedQueued.agentName !== "queue-worker" ||
+        namedQueuedDup !== null ||
+        !namedQueuedTwo ||
+        namedQueuedStatus.length !== 3 ||
+        !namedQueuedStatus.some((line) => line.includes("first queued task")) ||
+        !namedQueuedStatus.some((line) => line.includes("second queued task")) ||
+        syncedStatus.length !== 2 ||
+        syncedStatus.some((line) => line.includes("first queued task")) ||
+        !syncedStatus.some((line) => line.includes("second queued task")) ||
+        removeQueuedBusyPromptsForAgent("queue-worker") !== 1 ||
+        getQueuedBusyPromptStatusLines(80).length !== 0
+      ) {
+        out("FORMAT_FAIL: named-agent queued prompt indicator is incorrect\n");
+        return 1;
+      }
+    } finally {
+      namedAgents = savedQueuedAgentsForTest;
+      activeAgentName = savedQueuedActiveForTest;
+    }
     const ordinaryInputGapRows = getMainStatusInputGapRows(80);
     pendingAssistantRequests = savedPendingAssistantRequests;
     if (
@@ -28400,6 +28585,7 @@ process.stdin.on("keypress", async (str, key) => {
       }
       if (compactionBarrier) {
         agentsMessage = `Queued for ${targetAgent}`;
+        addNamedAgentQueuedPrompt(targetAgent, trimmedInput);
         markDirty();
         renderFrame(false);
         await compactionBarrier.catch(() => {});
@@ -28436,6 +28622,8 @@ process.stdin.on("keypress", async (str, key) => {
         agentsMessage = result.error || "Could not submit the agent task";
       } else if (result.queued) {
         agentsMessage = `Queued for ${targetAgent}`;
+        // Main-style queued indicator above the input while the agent is busy.
+        addNamedAgentQueuedPrompt(targetAgent, trimmedInput);
       } else {
         agentsMessage = "";
       }

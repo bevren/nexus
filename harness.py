@@ -463,6 +463,51 @@ def _parse_tool_call_args(call: dict) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _queued_tasks_path(job_path) -> Path | None:
+    """Queue file for a named agent job: <record>.queue.json (TUI writes it)."""
+    if not job_path:
+        return None
+    return Path(str(job_path) + ".queue.json")
+
+
+def _read_queued_tasks(job_path) -> list[str]:
+    path = _queued_tasks_path(job_path)
+    if path is None or not path.exists():
+        return []
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return []
+    tasks = [str(task) for task in value.get("tasks", []) if str(task).strip()]
+    return tasks
+
+
+def _drain_queued_tasks(job_path) -> list[str]:
+    """Pop every queued task and clear the queue file.
+
+    Re-reads before writing the empty queue so a task appended between our
+    read and write is not clobbered (it stays for the next turn).
+    """
+    tasks = _read_queued_tasks(job_path)
+    if not tasks:
+        return []
+    path = _queued_tasks_path(job_path)
+    if path is not None:
+        try:
+            fresh = _read_queued_tasks(job_path)
+            remaining = fresh[len(tasks):] if len(fresh) >= len(tasks) else []
+            if remaining:
+                path.write_text(json.dumps({"tasks": remaining}, ensure_ascii=False), encoding="utf-8")
+            else:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+        except OSError:
+            pass
+    return tasks
+
+
 def _run_subagent_tool_calls(entry: dict, tool_calls: list[dict], notify) -> None:
     """Execute every tool call, append its tool message, and persist progress.
 
@@ -490,16 +535,24 @@ def _run_subagent_tool_calls(entry: dict, tool_calls: list[dict], notify) -> Non
                 tool_timeout,
                 "subagent tool call",
             )
-        entry["messages"].append(
-            {
-                "role": "tool",
-                "tool_call_id": call_id,
-                "name": call_name,
-                "tool_input": str(parsed_args.get("code") or raw_args),
-                "tool_ok": bool(tool_result.get("ok")) if isinstance(tool_result, dict) else False,
-                "content": _format_tool_result_text(tool_result),
-            }
+        plan_events = (
+            tool_result.get("plan_ui_events")
+            if isinstance(tool_result, dict) and isinstance(tool_result.get("plan_ui_events"), list)
+            else []
         )
+        tool_message: dict = {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "name": call_name,
+            "tool_input": str(parsed_args.get("code") or raw_args),
+            "tool_ok": bool(tool_result.get("ok")) if isinstance(tool_result, dict) else False,
+            "content": _format_tool_result_text(tool_result),
+        }
+        # Persist plan UI events (create_plan/update_plan) so the TUI renders
+        # the plan block for sub-agents exactly like the main session.
+        if plan_events:
+            tool_message["plan_ui_events"] = plan_events
+        entry["messages"].append(tool_message)
         notify(entry)
 
 
@@ -829,7 +882,7 @@ def _update_subagent_telemetry(entry: dict, response: dict) -> None:
             context_map[requested_model] = context_map[model]
 
 
-def _subagent_worker(entry: dict, on_update=None) -> None:
+def _subagent_worker(entry: dict, on_update=None, job_path=None) -> None:
     notify = on_update if callable(on_update) else (lambda _entry: None)
     entry["status"] = "running"
     entry["pid"] = os.getpid()
@@ -850,6 +903,15 @@ def _subagent_worker(entry: dict, on_update=None) -> None:
         while True:
             turn += 1
             entry["turn"] = turn
+            # Deliver messages queued by the user while the agent was busy as
+            # the NEXT turn of the ongoing run (not after the whole task
+            # finishes): drain the queue file and append each task as a user
+            # message before the next provider request.
+            queued_tasks = _drain_queued_tasks(job_path)
+            if queued_tasks:
+                for queued_text in queued_tasks:
+                    entry["messages"].append({"role": "user", "content": queued_text})
+                notify(entry)
             response = _request_subagent(entry)
             _update_subagent_telemetry(entry, response)
             content = _assistant_text(response)
@@ -932,6 +994,15 @@ def _subagent_worker(entry: dict, on_update=None) -> None:
                 )
                 notify(entry)
                 continue
+            # A final answer is only terminal when no messages are queued: if
+            # the user submitted something while this turn ran, keep going so
+            # it becomes the next turn instead of waiting for a fresh launch.
+            pending_queued = _read_queued_tasks(job_path)
+            if pending_queued:
+                for queued_text in _drain_queued_tasks(job_path):
+                    entry["messages"].append({"role": "user", "content": queued_text})
+                notify(entry)
+                continue
             entry["result"] = content
             entry["status"] = "done"
             notify(entry)
@@ -965,7 +1036,7 @@ def run_subagent_job(job_path: str) -> int:
         runtime_settings=(entry.get("session_runtime") or {}).get("settings")
         if isinstance(entry.get("session_runtime"), dict) else {},
     )
-    _subagent_worker(entry, on_update=lambda current: _write_job(path, current))
+    _subagent_worker(entry, on_update=lambda current: _write_job(path, current), job_path=path)
     return 0 if entry.get("status") == "done" else 1
 
 
@@ -1547,6 +1618,133 @@ def run_subagent_self_test() -> dict:
             raise AssertionError(f"predefined-tool wrapper did not execute: {list_run}")
         if _known_predefined_tool("get_file_list") is not True or _known_predefined_tool("bogus_tool") is not False:
             raise AssertionError("_known_predefined_tool classification is incorrect")
+
+        # Plan UI persistence: a code_execution run that emits plan_ui_events
+        # (create_plan/update_plan) must carry them on the persisted tool
+        # message so the TUI renders the plan block for sub-agents.
+        plan_entry = {
+            "id": "plan-ui-entry",
+            "model": "inherited-model",
+            "messages": [{"role": "user", "content": "make a plan"}],
+            "status": "admitted",
+            "result": None,
+            "error": None,
+            "turn": 0,
+            "self_test_responses": [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_plan_ui_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "code_execution",
+                                            "arguments": json.dumps({
+                                                "code": (
+                                                    "create_plan(['step one', 'step two'])\n"
+                                                    "update_plan(completed=1)"
+                                                )
+                                            }),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                {"choices": [{"message": {"content": "Plan done."}}]},
+            ],
+        }
+        previous_self_test = os.environ.get("NEXUS_SUBAGENT_SELF_TEST")
+        os.environ["NEXUS_SUBAGENT_SELF_TEST"] = "1"
+        try:
+            _subagent_worker(plan_entry)
+        finally:
+            if previous_self_test is None:
+                os.environ.pop("NEXUS_SUBAGENT_SELF_TEST", None)
+            else:
+                os.environ["NEXUS_SUBAGENT_SELF_TEST"] = previous_self_test
+        plan_tool_messages = [
+            message
+            for message in plan_entry.get("messages", [])
+            if isinstance(message, dict)
+            and message.get("role") == "tool"
+            and message.get("tool_call_id") == "call_plan_ui_1"
+        ]
+        if plan_entry.get("status") != "done" or plan_entry.get("result") != "Plan done.":
+            raise AssertionError(f"plan-ui subagent did not finish: {plan_entry}")
+        if not plan_tool_messages or not isinstance(plan_tool_messages[0].get("plan_ui_events"), list):
+            raise AssertionError("subagent tool message did not persist plan_ui_events")
+        if not any(
+            isinstance(event, dict)
+            and event.get("type") == "plan"
+            and isinstance(event.get("entries"), list)
+            for event in plan_tool_messages[0]["plan_ui_events"]
+        ):
+            raise AssertionError(f"subagent plan_ui_events missing a plan event: {plan_tool_messages[0]}")
+
+        # Queued-message delivery: a message queued while the agent is busy
+        # must become the agent's NEXT turn of the ongoing run (the worker
+        # drains the queue between turns), not wait for the task to finish.
+        queued_entry = {
+            "id": "queued-next-turn-entry",
+            "model": "inherited-model",
+            "messages": [{"role": "user", "content": "first task"}],
+            "status": "admitted",
+            "result": None,
+            "error": None,
+            "turn": 0,
+            "self_test_responses": [
+                {"choices": [{"message": {"content": "First task answer."}}]},
+                {"choices": [{"message": {"content": "Second task answer."}}]},
+            ],
+        }
+        queued_job_path = _job_path(queued_entry["id"])
+        queued_job_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_job(queued_job_path, queued_entry)
+        queue_path = Path(str(queued_job_path) + ".queue.json")
+        # Simulate a message landing in the queue WHILE turn 1 is in flight:
+        # the first provider request writes the queue file as a side effect,
+        # so the worker must pick it up as turn 2 instead of finalizing.
+        original_request = globals().get("_request_subagent")
+        request_count = {"n": 0}
+
+        def queued_request(entry, disable_reasoning=False):
+            request_count["n"] += 1
+            if request_count["n"] == 1:
+                queue_path.write_text(
+                    json.dumps({"tasks": ["queued during work"]}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            return original_request(entry, disable_reasoning=disable_reasoning)
+
+        globals()["_request_subagent"] = queued_request
+        previous_self_test = os.environ.get("NEXUS_SUBAGENT_SELF_TEST")
+        os.environ["NEXUS_SUBAGENT_SELF_TEST"] = "1"
+        try:
+            _subagent_worker(queued_entry, job_path=queued_job_path)
+        finally:
+            globals()["_request_subagent"] = original_request
+            if previous_self_test is None:
+                os.environ.pop("NEXUS_SUBAGENT_SELF_TEST", None)
+            else:
+                os.environ["NEXUS_SUBAGENT_SELF_TEST"] = previous_self_test
+        if queued_entry.get("status") != "done" or queued_entry.get("result") != "Second task answer.":
+            raise AssertionError(f"queued task did not become the next turn: {queued_entry}")
+        if queued_entry.get("turn") != 2:
+            raise AssertionError(f"queued task should run as turn 2, got turn {queued_entry.get('turn')}")
+        if not any(
+            isinstance(message, dict)
+            and message.get("role") == "user"
+            and str(message.get("content") or "") == "queued during work"
+            for message in queued_entry.get("messages", [])
+        ):
+            raise AssertionError("queued message was not delivered as a user turn")
+        if queue_path.exists():
+            raise AssertionError("queue file was not drained after delivery")
 
         # Native tool-calling flow end to end: the worker must execute the
         # model's code_execution tool call, answer its tool_call_id, persist
