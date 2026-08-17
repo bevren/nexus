@@ -3080,7 +3080,7 @@ def wait_subagents(
 ) -> list[dict]:
     """Wait for selected named or spawned agents to become idle/stopped.
 
-    Workers and status survive across execute blocks. A running status is
+    Workers and status survive across tool executions. A running status is
     progress, not a failure.
     """
     requested = [handle_ids] if isinstance(handle_ids, str) else (handle_ids or [])

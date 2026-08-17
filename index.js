@@ -813,28 +813,6 @@ const REMOTE_CONTROL_HTML = String.raw`<!doctype html>
           var line = lines[index];
           if (!line.trim()) { index += 1; continue; }
 
-          var xmlFence = line.match(/^\s{0,3}<execute[ \t]*>/i);
-          if (xmlFence) {
-            var codeLines = [];
-            var inlineCode = line.slice(line.indexOf('>') + 1);
-            var inlineClose = /<\/execute>/i.exec(inlineCode);
-            if (inlineClose) {
-              codeLines.push(inlineCode.slice(0, inlineClose.index));
-              index += 1;
-            } else {
-              if (inlineCode.trim()) codeLines.push(inlineCode);
-              index += 1;
-              while (index < lines.length) {
-                var closing = lines[index].trim();
-                if (/^<\/execute>\s*$/i.test(closing)) { index += 1; break; }
-                codeLines.push(lines[index]); index += 1;
-              }
-            }
-            var pre = document.createElement('pre'); pre.className = 'code';
-            appendHighlightedPython(pre, codeLines.join('\n'));
-            parent.appendChild(pre); continue;
-          }
-
           var fence = line.match(/^\s{0,3}((?:\x60){3,}|~{3,})\s*([^\s]*)\s*$/);
           if (fence) {
             var fenceChar = fence[1][0];
@@ -848,7 +826,7 @@ const REMOTE_CONTROL_HTML = String.raw`<!doctype html>
               codeLines.push(lines[index]); index += 1;
             }
             var pre = document.createElement('pre'); pre.className = 'code';
-            if (language === 'python' || language === 'py' || language === 'execute') appendHighlightedPython(pre, codeLines.join('\n'));
+            if (language === 'python' || language === 'py') appendHighlightedPython(pre, codeLines.join('\n'));
             else pre.textContent = codeLines.join('\n');
             parent.appendChild(pre); continue;
           }
@@ -5753,7 +5731,7 @@ function consumeTerminalFocusSequences(value) {
 
 function responseShouldRingBell(content) {
   const text = String(content ?? "");
-  return text.trim().length > 0 && !containsExecuteFence(text);
+  return text.trim().length > 0;
 }
 
 function formatWorkedDuration(durationMs) {
@@ -5778,15 +5756,18 @@ function formatWorkedDivider(durationMs, width) {
   return `${label}${"─".repeat(safeWidth - label.length)}`;
 }
 
-function turnHasExecuteBlock(startIndex, endIndex = messages.length, sourceEntries = messages) {
+function turnRanTool(startIndex, endIndex = messages.length, sourceEntries = messages) {
   const entries = Array.isArray(sourceEntries) ? sourceEntries : messages;
   const firstIndex = Math.max(0, Number(startIndex) || 0);
   const lastIndex = Math.max(firstIndex, Math.min(entries.length, Number(endIndex) || 0));
   for (let i = firstIndex; i < lastIndex; i += 1) {
     const entry = entries[i];
+    if (!entry) continue;
+    if (entry.role === "tool") return true;
     if (
-      entry?.role === "assistant" &&
-      containsExecuteFence(entry.content)
+      entry.role === "assistant" &&
+      Array.isArray(entry.toolCalls) &&
+      entry.toolCalls.length > 0
     ) {
       return true;
     }
@@ -5804,7 +5785,7 @@ function attachWorkedSummaryForTurn(startIndex, durationMs) {
     if (
       typeof entry.revealUntil !== "number" ||
       !responseShouldRingBell(entry.content) ||
-      !turnHasExecuteBlock(firstIndex, i)
+      !turnRanTool(firstIndex, i)
     ) {
       return false;
     }
@@ -9000,7 +8981,8 @@ function buildOpenRouterMessagesFromHistory(modelId = selectedModel) {
         pendingToolCallIds.delete(toolCallId);
         continue;
       }
-      // Legacy/fenced-execute history: feed the outcome back as user context.
+      // Legacy history (older execute-fence runs recorded as user tool results):
+     // feed the outcome back as user context.
       requestMessages.push({
         role: "user",
         content: `[tool ${toolName} result]\n${toolContent}`,
@@ -9254,8 +9236,7 @@ function triggerAnswerReveal(entry) {
     return;
   }
   const hasNativeToolCalls = Array.isArray(entry.toolCalls) && entry.toolCalls.length > 0;
-  const isExecuteBlock =
-    entry.role === "assistant" && (containsExecuteFence(entry.content) || hasNativeToolCalls);
+  const isExecuteBlock = entry.role === "assistant" && hasNativeToolCalls;
   if (isAssistantThinking() && !isExecuteBlock) {
     // Hold the initial black reveal frame until the Thinking status actually
     // collapses. Starting the clock here can consume the whole fade while a
@@ -9495,148 +9476,7 @@ function parseToolArguments(rawArgs) {
   }
 }
 
-function extractAllPythonCodeBlocks(text) {
-  return extractAllPythonCodeBlockEntries(text).map((entry) => entry.code);
-}
 
-function matchExecutableFenceOpening(line) {
-  const match = String(line ?? "").match(/^ {0,3}(`{3,}|~{3,})execute[ \t]*$/i);
-  if (match) {
-    return { character: match[1][0], length: match[1].length };
-  }
-  // XML-style alternative: <execute> code ... </execute>.
-  // Matches `<execute>`, `<execute >`, and inline `<execute>print(1)</execute>`.
-  const xml = String(line ?? "").match(/^ {0,3}<execute[ \t]*>/i);
-  if (xml) {
-    return { xmlTag: true };
-  }
-  return null;
-}
-
-function isMatchingFenceClosing(line, fence) {
-  if (fence.xmlTag) {
-    return /^ {0,3}<\/execute>\s*$/i.test(String(line ?? ""));
-  }
-  const match = String(line ?? "").match(/^ {0,3}(`{3,}|~{3,})[ \t]*$/);
-  return Boolean(
-    match &&
-    match[1][0] === fence.character &&
-    match[1].length >= fence.length
-  );
-}
-
-function containsExecuteFence(text) {
-  return String(text ?? "")
-    .replace(/\r\n?/g, "\n")
-    .split("\n")
-    .some((line) => matchExecutableFenceOpening(line) !== null);
-}
-
-function extractAllPythonCodeBlockEntries(text) {
-  if (typeof text !== "string" || text.length === 0) {
-    return [];
-  }
-
-  const lines = text.replace(/\r\n?/g, "\n").split("\n");
-  const blocks = [];
-  for (let openingIndex = 0; openingIndex < lines.length; openingIndex += 1) {
-    const fence = matchExecutableFenceOpening(lines[openingIndex]);
-    if (!fence) {
-      continue;
-    }
-
-    let closingIndex = -1;
-    let xmlInlineBody = "";
-    if (fence.xmlTag) {
-      // XML-style block: <execute> ... </execute>. The opener line may already
-      // contain code (<execute>print(1)</execute>), and the closing tag can sit
-      // at the end of a code line too (<execute>print('a')\nprint('b')</execute>).
-      const openerLineStr = String(lines[openingIndex]);
-      const openerTailIdx = openerLineStr.indexOf(">");
-      const openerTail =
-        openerTailIdx >= 0 ? openerLineStr.slice(openerTailIdx + 1) : "";
-      const openerCloseIdx = openerTail.search(/<\/execute>/i);
-      if (openerCloseIdx >= 0) {
-        closingIndex = openingIndex;
-        const prefix = openerTail.slice(0, openerCloseIdx);
-        if (prefix.trim()) xmlInlineBody = prefix;
-      } else {
-        if (openerTail.trim()) xmlInlineBody = openerTail;
-        for (let i = openingIndex + 1; i < lines.length; i += 1) {
-          const closeIdx = String(lines[i]).search(/<\/execute>/i);
-          if (closeIdx >= 0) {
-            closingIndex = i;
-            if (closeIdx > 0) {
-              const prefix = String(lines[i]).slice(0, closeIdx);
-              xmlInlineBody += (xmlInlineBody ? "\n" : "") + prefix;
-            }
-            break;
-          }
-        }
-      }
-    } else if (fence.length === 3) {
-      // Legacy triple fences are ambiguous when their Python payload contains
-      // Markdown fences. Use the final matching fence as the outer closer;
-      // this also recovers a valid execute block when the model incorrectly
-      // appends prose after it.
-      for (let i = openingIndex + 1; i < lines.length; i += 1) {
-        if (isMatchingFenceClosing(lines[i], fence)) closingIndex = i;
-      }
-    } else {
-      // Variable-length fences: prefer the first run at least as long as the
-      // opener (shorter runs remain payload). If no run qualifies - e.g. a
-      // 4-tick opener closed by a 3-tick run, a common mistake - fall back to
-      // the last 3+ run of the same character instead of truncating.
-      let fallbackClosingIndex = -1;
-      for (let i = openingIndex + 1; i < lines.length; i += 1) {
-        const candidate = String(lines[i]).match(/^ {0,3}(`{3,}|~{3,})[ \t]*$/);
-        if (!candidate || candidate[1][0] !== fence.character) {
-          continue;
-        }
-        if (candidate[1].length >= fence.length) {
-          closingIndex = i;
-          break;
-        }
-        fallbackClosingIndex = i;
-      }
-      let lastNonEmptyIndex = lines.length - 1;
-      while (lastNonEmptyIndex > openingIndex && !lines[lastNonEmptyIndex].trim()) {
-        lastNonEmptyIndex -= 1;
-      }
-      if (closingIndex < 0 && fallbackClosingIndex === lastNonEmptyIndex) {
-        closingIndex = fallbackClosingIndex;
-      }
-    }
-
-    const bodyEnd = closingIndex >= 0 ? closingIndex : lines.length;
-    const bodyParts = [];
-    if (xmlInlineBody) bodyParts.push(xmlInlineBody);
-    const restLines = lines.slice(openingIndex + 1, bodyEnd);
-    if (restLines.length > 0) bodyParts.push(restLines.join("\n"));
-    const body = bodyParts.join("\n").trim();
-    if (body) {
-      blocks.push({
-        code: body,
-        complete: closingIndex >= 0,
-        rawBlock: lines.slice(openingIndex, closingIndex >= 0 ? closingIndex + 1 : lines.length).join("\n"),
-      });
-    }
-
-    if (closingIndex < 0) {
-      break;
-    }
-    openingIndex = closingIndex;
-  }
-  return blocks;
-}
-
-function normalizeAssistantToolUseResponse(text) {
-  const source = String(text || "");
-  if (!containsExecuteFence(source)) return source;
-  const blocks = extractAllPythonCodeBlockEntries(source);
-  if (blocks.length === 0) return source;
-  return blocks.map((entry) => entry.rawBlock).join("\n\n");
-}
 
 function classifyToolDiscoveryCode(code) {
   const source = String(code || "");
@@ -10144,7 +9984,7 @@ sys.__stdout__.flush()
 
   try {
     // Passing base64 source as argv exceeds Windows' command-line limit for
-    // larger execute blocks. A short-lived UTF-8 file keeps transport size
+    // larger code payloads. A short-lived UTF-8 file keeps transport size
     // independent of the generated code length.
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-exec-"));
     const codePath = path.join(tempDir, "execute.py.txt");
@@ -10598,7 +10438,7 @@ function getToolResultLinesForDisplay(text) {
     if (nonDiffPrefix.length === 0) {
       return diffLines;
     }
-    // Execute blocks can edit a file and then print a run result. Keep that
+    // A tool run can edit a file and then print a run result. Keep that
     // non-diff output after the compact diff so it remains visible at the
     // bottom of the completed tool entry.
     const formattedOutput = nonDiffPrefix.map((line, index) =>
@@ -11011,7 +10851,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
     }
 
     const nativeToolCalls = assistantPayload.toolCalls || [];
-    const assistantContent = normalizeAssistantToolUseResponse(assistantPayload.text);
+    const assistantContent = assistantPayload.text;
     const assistantReasoningDetails = reasoningEnabledNow ? assistantPayload.reasoningDetails : null;
     const emptyContentMessage = getReasoningEnabledForModel(resolvedModel)
       ? "Provider returned no assistant content. Try disabling thinking in /settings for this model."
@@ -11037,8 +10877,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
     }
 
     // Native tool-calling loop: execute every assistant tool_calls request
-    // first (mirroring the classic API tool loop). Fenced execute blocks in
-    // the same reply are handled by the existing fallback loop below.
+    // first (mirroring the classic API tool loop).
     for (const toolCall of nativeToolCalls) {
       if (stopRequested) {
         emitStopNotice();
@@ -11054,7 +10893,7 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
       }
     }
     // Continue the follow-up request loop below from the fresh request so
-    // the model sees the native tool results (or the fenced blocks above).
+    // the model sees the native tool results.
     let latestAssistantContent = assistantContent;
     let needFollowUpRequest = nativeToolCalls.length > 0;
     for (;;) {
@@ -11062,197 +10901,8 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
         emitStopNotice();
         break;
       }
-      const pythonBlocks = [];
       if (!needFollowUpRequest) {
         break;
-      }
-
-      for (const pythonBlock of pythonBlocks) {
-        const pythonCode = pythonBlock.code;
-        if (stopRequested) {
-          break;
-        }
-        activeToolRun = {
-          label: getToolRunLabel(pythonCode),
-          startedAt: Date.now(),
-          done: false,
-          ok: false,
-        };
-        let liveToolEntry = null;
-        let liveToolOutput = "";
-        let liveRenderTimer = null;
-        const renderLiveToolOutput = () => {
-          liveRenderTimer = null;
-          if (!liveToolOutput || generation !== chatGeneration) return;
-          let visibleOutput = String(liveToolOutput)
-            .replace(/\r\n/g, "\n")
-            .replace(/\r/g, "\n");
-          let liveOutputTruncated = false;
-          const liveLines = visibleOutput.split("\n");
-          if (liveLines.length > EXECUTE_LIVE_MAX_LINES) {
-            visibleOutput = liveLines.slice(-EXECUTE_LIVE_MAX_LINES).join("\n");
-            liveOutputTruncated = true;
-          }
-          if (visibleOutput.length > EXECUTE_LIVE_MAX_OUTPUT_CHARS) {
-            visibleOutput = visibleOutput.slice(-EXECUTE_LIVE_MAX_OUTPUT_CHARS);
-            liveOutputTruncated = true;
-          }
-          if (liveOutputTruncated) {
-            visibleOutput = `... [live output truncated; showing latest ${EXECUTE_LIVE_MAX_LINES} lines / ${EXECUTE_LIVE_MAX_OUTPUT_CHARS} chars] ...\n${visibleOutput}`;
-          }
-          if (!liveToolEntry) {
-            liveToolEntry = {
-              role: "tool",
-              name: "code_execution",
-              toolInput: pythonCode,
-              toolCode: pythonCode,
-              content: visibleOutput,
-              uiContent: visibleOutput,
-              ephemeral: true,
-              live: true,
-            };
-            messages.push(liveToolEntry);
-          } else {
-            liveToolEntry.content = visibleOutput;
-            liveToolEntry.uiContent = visibleOutput;
-          }
-          // The live entry object is updated in place. The transcript cache
-          // keys on its object identity, so explicitly invalidate it or the
-          // first streamed frame will remain frozen for the rest of the run.
-          cachedChatLines = null;
-          // The render scheduler normally repaints chat only when its layout
-          // or entry count changes. Streaming mutates one entry in place, so
-          // request an explicit in-place repaint for every throttled frame.
-          forceChatRefreshFlag = true;
-          scrollChatToBottom();
-          markDirty();
-          renderFrame(false);
-        };
-        const handleLiveToolOutput = (_chunk, cumulative) => {
-          liveToolOutput = String(cumulative || "");
-          if (!liveRenderTimer) {
-            liveRenderTimer = setTimeout(renderLiveToolOutput, EXECUTE_LIVE_REFRESH_MS);
-          }
-        };
-        // PreToolUse hook: can block (exit 2) or inject context before a tool run.
-        let execResult = null;
-        if (!pythonBlock.complete) {
-          execResult = {
-            ok: false,
-            output: "",
-            error: "Execute block was truncated before its closing fence and was not run. Retry using a smaller, complete execute block.",
-            traceback: "",
-            editEvents: [],
-            editSummaries: [],
-            historyActions: [],
-            planUiEvents: [],
-          };
-        } else {
-          const preToolRun = await runHooks({
-            eventName: "PreToolUse",
-            matcherValue: "code_execution",
-            input: {
-              tool_name: "code_execution",
-              tool_input: { code: pythonCode },
-            },
-            timeoutMs: 30000,
-          });
-          if (preToolRun.blocked) {
-            execResult = {
-              ok: false,
-              output: "",
-              error: `Tool blocked by hook${preToolRun.blockReason ? `: ${preToolRun.blockReason}` : "."}`,
-              traceback: "",
-              editEvents: [],
-              editSummaries: [],
-              historyActions: [],
-            };
-          } else {
-            if (preToolRun.additionalContext) {
-              pendingHookContext = preToolRun.additionalContext;
-            }
-            execResult = await executeCodeWithPythonTool(pythonCode, {
-              onOutput: handleLiveToolOutput,
-            });
-          }
-        }
-        if (liveRenderTimer) {
-          clearTimeout(liveRenderTimer);
-          liveRenderTimer = null;
-        }
-        if (liveToolEntry) {
-          const liveIndex = messages.indexOf(liveToolEntry);
-          if (liveIndex >= 0) messages.splice(liveIndex, 1);
-          liveToolEntry = null;
-        }
-        if (stopRequested) {
-          // User pressed Esc while the process was running: per request,
-          // let the running process finish, show its output, then stop.
-          activeToolRun = { ...activeToolRun, done: true, ok: false, cancelled: true };
-        } else if (activeToolRun) {
-          activeToolRun.done = true;
-          activeToolRun.ok = getToolUiOk(execResult);
-        }
-        // PostToolUse / PostToolUseFailure: deterministic follow-up (format,
-        // notify, audit). Exit code 2 on PostToolUse blocks the tool result.
-        const postEventName = Boolean(execResult?.ok) ? "PostToolUse" : "PostToolUseFailure";
-        const postToolRun = await runHooks({
-          eventName: postEventName,
-          matcherValue: "code_execution",
-          input: {
-            tool_name: "code_execution",
-            tool_input: { code: pythonCode },
-            tool_output: execResult ? { done: true, ok: Boolean(execResult.ok), error: execResult.error || "" } : { done: false },
-          },
-          timeoutMs: 30000,
-        });
-        if (postToolRun.blocked) {
-          execResult = {
-            ok: false,
-            output: "",
-            error: `Tool result blocked by hook${postToolRun.blockReason ? `: ${postToolRun.blockReason}` : "."}`,
-            traceback: "",
-            editEvents: [],
-            editSummaries: [],
-            historyActions: [],
-          };
-        }
-        if (postToolRun.additionalContext) {
-          pendingHookContext = postToolRun.additionalContext;
-        }
-        const toolResultPayload = buildToolResultPayload(execResult);
-        const historyActionResult = applyHistoryActionsFromTool(execResult?.historyActions, generation);
-        if (historyActionResult.changed) {
-          await rewriteSessionWithCurrentMessages().catch(() => {});
-          markDirty();
-          renderFrame(false);
-        }
-        if (historyActionResult.processedActions > 0) {
-          const actionSummary =
-            historyActionResult.errorCount > 0
-              ? `history exclude applied: ${historyActionResult.appliedCount} (errors: ${historyActionResult.errorCount})`
-              : `history exclude applied: ${historyActionResult.appliedCount}`;
-          toolResultPayload.displayText = `${toolResultPayload.displayText}\n${actionSummary}`.trim();
-          toolResultPayload.historyText = `${toolResultPayload.historyText}\n${actionSummary}`.trim();
-        }
-        appendToolMessages(
-          "code_execution",
-          pythonCode,
-          pythonCode,
-          toolResultPayload.displayText,
-          toolResultPayload.historyText,
-          undefined,
-          toolResultPayload.toolOk,
-          generation,
-          toolResultPayload.uiKind,
-          toolResultPayload.uiSections
-        );
-        markBackgroundShellJobsDelivered(execResult?.backgroundJobEvents);
-
-        if (generation !== chatGeneration) {
-          return;
-        }
-
       }
 
       if (stopRequested) {
@@ -11373,7 +11023,6 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
           followUpReasoningDetails = null;
         }
       }
-      followUpContent = normalizeAssistantToolUseResponse(followUpContent);
       if (followUpContent.trim().length === 0) {
         appendAssistantMessage(
           getReasoningEnabledForModel(resolvedModel)
@@ -11939,9 +11588,9 @@ function getSolveStatusText() {
 
 function extractRawCodeFromReply(text) {
   const source = String(text ?? "");
-  // Priority: execute blocks, then python-marked fences, then any fenced
-  // code block, then the whole trimmed reply.
-  const preferredOrder = [extractAllPythonCodeBlocks, extractPythonFencedBlocks, extractAnyFencedBlocks, null];
+  // Priority: python-marked fences, then any fenced code block, then the
+  // whole trimmed reply.
+  const preferredOrder = [extractPythonFencedBlocks, extractAnyFencedBlocks, null];
   for (const extractor of preferredOrder) {
     if (extractor === null) {
       return source.trim();
@@ -13769,14 +13418,11 @@ function parseAgentDelegationInput(value) {
 function buildAgentHandoffExecuteMessage(name, task, toolName = "delegate_agent") {
   const normalizedToolName = toolName === "notify_agent" ? "notify_agent" : "delegate_agent";
   const code = `${normalizedToolName}(name=${JSON.stringify(String(name || ""))}, task=${JSON.stringify(String(task || ""))})`;
-  const longestBacktickRun = Math.max(
-    0,
-    ...Array.from(code.matchAll(/`+/g), (match) => match[0].length)
-  );
-  const fence = "`".repeat(Math.max(4, longestBacktickRun + 1));
+  // The content is the plain call (no fenced execute block): the executed
+  // tool result is the visible representation in the UI.
   return {
     code,
-    content: `${fence}execute\n${code}\n${fence}`,
+    content: code,
   };
 }
 
@@ -19016,6 +18662,15 @@ const PYTHON_BUILTINS = new Set([
   "zip",
 ]);
 
+function isFenceClosingLine(line, fence) {
+  const match = String(line ?? "").match(/^ {0,3}(`{3,}|~{3,})[ \t]*$/);
+  return Boolean(
+    match &&
+    match[1][0] === fence.character &&
+    match[1].length >= fence.length
+  );
+}
+
 function annotateAssistantCodeBlocks(message) {
   const sourceLines = String(message ?? "").replace(/\r/g, "\n").split("\n");
   const annotated = [];
@@ -19025,38 +18680,15 @@ function annotateAssistantCodeBlocks(message) {
     const line = sourceLines[lineIndex];
     const trimmed = line.trim();
     if (!activeFence) {
-      const xmlOpening = trimmed.match(/^<execute[ \t]*>/i);
-      if (xmlOpening) {
-        activeFence = { xmlTag: true, closeIndex: -1 };
-        continue;
-      }
-      const opening = trimmed.match(/^(`{3,}|~{3,})(python|py|execute)\s*$/i);
+      // Plain python-marked fences (```python / ```py) are highlighted for
+      // display. Execute fences are not used: native tool calls carry code.
+      const opening = trimmed.match(/^(`{3,}|~{3,})(python|py)\s*$/i);
       if (opening) {
-        activeFence = {
-          character: opening[1][0],
-          length: opening[1].length,
-          closeIndex: -1,
-          useFinalClose: opening[2].toLowerCase() === "execute" && opening[1].length === 3,
-        };
-        if (activeFence.useFinalClose) {
-          for (let i = sourceLines.length - 1; i > lineIndex; i -= 1) {
-            if (!sourceLines[i].trim()) continue;
-            if (isMatchingFenceClosing(sourceLines[i], activeFence)) {
-              activeFence.closeIndex = i;
-            }
-            break;
-          }
-        }
-        continue;
-      }
-    } else if (activeFence.xmlTag) {
-      if (trimmed.match(/^<\/execute>\s*$/i)) {
-        activeFence = null;
+        activeFence = { character: opening[1][0], length: opening[1].length };
         continue;
       }
     } else if (
-      isMatchingFenceClosing(trimmed, activeFence) &&
-      (!activeFence.useFinalClose || activeFence.closeIndex === lineIndex)
+      isFenceClosingLine(trimmed, activeFence)
     ) {
       activeFence = null;
       continue;
@@ -23336,74 +22968,28 @@ function runAppendSelfTest() {
 
     const BT = String.fromCharCode(96, 96, 96);
     const NL = String.fromCharCode(10);
-    const completeExecute = BT + "execute" + NL + "print(1)" + NL + BT;
-    const completeEntries = extractAllPythonCodeBlockEntries(completeExecute);
-    if (completeEntries.length !== 1 || completeEntries[0].complete !== true) {
-      out("SELFTEST_FAIL: complete execute block classification\n");
-      return 1;
-    }
-    const executeWithFalseClaim = `${completeExecute}${NL}${NL}hey, it worked`;
-    const recoveredEntries = extractAllPythonCodeBlockEntries(executeWithFalseClaim);
-    if (
-      recoveredEntries.length !== 1 ||
-      recoveredEntries[0].complete !== true ||
-      recoveredEntries[0].code !== "print(1)" ||
-      normalizeAssistantToolUseResponse(executeWithFalseClaim) !== completeExecute
-    ) {
-      out("SELFTEST_FAIL: execute block with trailing result claim was not recovered and normalized\n");
-      return 1;
-    }
-    const truncatedExecute = BT + "execute" + NL + "print(";
-    const truncatedEntries = extractAllPythonCodeBlockEntries(truncatedExecute);
-    if (
-      truncatedEntries.length !== 1 ||
-      truncatedEntries[0].complete !== false ||
-      truncatedEntries[0].code !== "print("
-    ) {
-      out("SELFTEST_FAIL: truncated execute block classification\n");
-      return 1;
-    }
-    const BT4 = BT + String.fromCharCode(96);
-    const nestedMarkdownCode = [
-      'markdown = """',
+    // Display highlighting for plain python-marked fences still works.
+    const pythonFenced = [
       BT + "python",
       "print('hello')",
+      "x = 1",
       BT,
-      '"""',
-      'write_file("README.md", markdown)',
     ].join(NL);
-    const dynamicNestedEntries = extractAllPythonCodeBlockEntries(
-      BT4 + "execute" + NL + nestedMarkdownCode + NL + BT4
-    );
-    const legacyNestedEntries = extractAllPythonCodeBlockEntries(
-      BT + "execute" + NL + nestedMarkdownCode + NL + BT
-    );
-    const truncatedNestedEntries = extractAllPythonCodeBlockEntries(
-      BT4 + "execute" + NL + nestedMarkdownCode
-    );
+    const annotatedPython = annotateAssistantCodeBlocks(pythonFenced);
     if (
-      dynamicNestedEntries.length !== 1 ||
-      dynamicNestedEntries[0].complete !== true ||
-      dynamicNestedEntries[0].code !== nestedMarkdownCode ||
-      legacyNestedEntries.length !== 1 ||
-      legacyNestedEntries[0].complete !== true ||
-      legacyNestedEntries[0].code !== nestedMarkdownCode ||
-      truncatedNestedEntries.length !== 1 ||
-      truncatedNestedEntries[0].complete !== false ||
-      truncatedNestedEntries[0].code !== nestedMarkdownCode
+      annotatedPython.length !== 2 ||
+      !annotatedPython.every((line) => line.python === true) ||
+      annotatedPython[0].text !== "print('hello')"
     ) {
-      out("SELFTEST_FAIL: nested Markdown execute-fence extraction\n");
+      out(`SELFTEST_FAIL: python-fence display highlighting is incorrect: ${JSON.stringify(annotatedPython)}\n`);
       return 1;
     }
-    const annotatedNested = annotateAssistantCodeBlocks(
-      BT4 + "execute" + NL + nestedMarkdownCode + NL + BT4
-    );
-    if (
-      annotatedNested.length !== nestedMarkdownCode.split(NL).length ||
-      !annotatedNested.every((line) => line.python === true) ||
-      !annotatedNested.some((line) => line.text === BT)
-    ) {
-      out("SELFTEST_FAIL: dynamic execute-fence rendering lost nested Markdown fences\n");
+    // Execute fences are not used: a ```execute block must be treated as
+    // ordinary assistant text (no extraction, no python highlighting).
+    const executeFenced = BT + "execute" + NL + "print(1)" + NL + BT;
+    const annotatedExecute = annotateAssistantCodeBlocks(executeFenced);
+    if (annotatedExecute.some((line) => line.python === true)) {
+      out("SELFTEST_FAIL: execute fences must not be highlighted\n");
       return 1;
     }
 
@@ -23800,7 +23386,7 @@ function runFormatSelfTest() {
       messages: [
         { role: "system", content: "hidden system" },
         { role: "user", content: "inspect it" },
-        { role: "assistant", content: "````execute\nprint(1)\n````" },
+        { role: "assistant", content: "I will inspect the workspace now." },
         { role: "user", content: "[tool code_execution result]\n{\"ok\":true}" },
         {
           role: "assistant",
@@ -24008,7 +23594,6 @@ function runFormatSelfTest() {
       "price_checker_agent",
       "read ```nested``` markdown"
     );
-    const handoffExecuteEntries = extractAllPythonCodeBlockEntries(handoffExecuteFixture.content);
     const notifyMentionFixture = parseAgentDelegationInput(
       "@Kral check the weather -notify"
     );
@@ -24058,9 +23643,9 @@ function runFormatSelfTest() {
     if (
       mentionFixture?.name !== "price_checker_agent" ||
       mentionFixture?.task !== "hey please get current gold prices." ||
-      handoffExecuteEntries.length !== 1 ||
-      handoffExecuteEntries[0].complete !== true ||
-      handoffExecuteEntries[0].code !== handoffExecuteFixture.code ||
+      handoffExecuteFixture.content !== handoffExecuteFixture.code ||
+      handoffExecuteFixture.content.startsWith("```") ||
+      handoffExecuteFixture.content.startsWith("<execute") ||
       !handoffExecuteFixture.code.includes('delegate_agent(name="price_checker_agent"') ||
       notifyMentionFixture?.mode !== "notify" ||
       notifyMentionFixture?.task !== "check the weather" ||
@@ -24418,7 +24003,7 @@ function runFormatSelfTest() {
 
     if (
       !responseShouldRingBell("Finished the task.") ||
-      responseShouldRingBell("```execute\nprint('still working')\n```")
+      responseShouldRingBell("")
     ) {
       out("FORMAT_FAIL: completed-turn bell classification is incorrect\n");
       return 1;
@@ -24430,7 +24015,7 @@ function runFormatSelfTest() {
     ];
     const toolAnswerTurn = [
       { role: "user", content: "check this" },
-      { role: "assistant", content: "```execute\nprint('checking')\n```" },
+      { role: "assistant", content: "", toolCalls: [{ id: "call_worked_1", type: "function", function: { name: "code_execution", arguments: "{\"code\": \"print('checking')\"}" } }] },
       { role: "tool", content: "checked" },
       { role: "assistant", content: "Everything looks good." },
     ];
@@ -24449,8 +24034,8 @@ function runFormatSelfTest() {
     if (
       !workedDivider.startsWith("─ Worked for 10m 17s ") ||
       workedDivider.length !== 80 ||
-      turnHasExecuteBlock(0, directAnswerTurn.length - 1, directAnswerTurn) ||
-      !turnHasExecuteBlock(0, toolAnswerTurn.length - 1, toolAnswerTurn) ||
+      turnRanTool(0, directAnswerTurn.length - 1, directAnswerTurn) ||
+      !turnRanTool(0, toolAnswerTurn.length - 1, toolAnswerTurn) ||
       !completedAnswerLines.includes(workedDivider) ||
       fadingAnswerLines.some((line) => line.includes("Worked for"))
     ) {
@@ -26384,41 +25969,13 @@ async function runKernelSelfTest() {
     }
 
     // Truncation tolerance: a reply cut off before the closing fence must
-    // still yield the code written so far (execute and python fences alike).
+    // still yield the code written so far.
     const truncPythonReply =
       "Here is the program:" + NL + BT + "python" + NL +
       "def rot(g):" + NL + "    return g" + NL; // no closing fence
     const truncPythonCode = extractPythonFencedBlocks(truncPythonReply)[0] || "";
     if (!truncPythonCode.includes("def rot(g)")) {
       out(`KERNEL_FAIL: unterminated python fence should yield partial code: ${JSON.stringify(truncPythonCode)}\n`);
-      return 1;
-    }
-    const truncExecReply =
-      "Run this:" + NL + BT + "execute" + NL + "x = 6 * 7" + NL; // no closing fence
-    const truncExecCode = extractAllPythonCodeBlocks(truncExecReply)[0] || "";
-    if (!truncExecCode.includes("x = 6 * 7")) {
-      out(`KERNEL_FAIL: unterminated execute fence should yield partial code: ${JSON.stringify(truncExecCode)}\n`);
-      return 1;
-    }
-
-    // XML execute blocks: multi-line and inline forms both extract, and a
-    // payload containing backticks stays intact (no nested-fence ambiguity).
-    const xmlReply = "<execute>" + NL + "print('SOLVE_OK_XML')" + NL + "</execute>";
-    const xmlCode = extractAllPythonCodeBlocks(xmlReply)[0] || "";
-    if (!xmlCode.includes("SOLVE_OK_XML") || xmlCode.includes("<execute>") || xmlCode.includes("</execute>")) {
-      out(`KERNEL_FAIL: xml execute block extraction wrong: ${JSON.stringify(xmlCode)}\n`);
-      return 1;
-    }
-    const xmlInlineReply = `<execute>print('INLINE_OK')</execute>`;
-    const xmlInlineCode = extractAllPythonCodeBlocks(xmlInlineReply)[0] || "";
-    if (!xmlInlineCode.includes("INLINE_OK")) {
-      out(`KERNEL_FAIL: inline xml execute block extraction wrong: ${JSON.stringify(xmlInlineCode)}\n`);
-      return 1;
-    }
-    const xmlBacktickReply = "<execute>" + NL + "print('backtick ' + '" + BT + "')" + NL + "</execute>";
-    const xmlBacktickCode = extractAllPythonCodeBlocks(xmlBacktickReply)[0] || "";
-    if (!xmlBacktickCode.includes(BT)) {
-      out(`KERNEL_FAIL: xml execute block with backticks inside should extract cleanly: ${JSON.stringify(xmlBacktickCode)}\n`);
       return 1;
     }
 
@@ -26949,7 +26506,7 @@ async function runRemoteControlSelfTest() {
     nexusConfig.show_thinking_blocks = true;
     messages.push({
       role: "assistant",
-      content: ["````execute", "print('hello from remote')", "````"].join("\n"),
+      content: ["```python", "print('hello from remote')", "```"].join("\n"),
       reasoningDetails: [{ type: "reasoning.text", text: "private reasoning trace" }],
     });
     messages.push({
@@ -27035,7 +26592,7 @@ async function runRemoteControlSelfTest() {
     if (!assistantMessage?.blocks.some(
       (block) => block.type === "code" && block.content.includes("print('hello from remote')")
     )) {
-      throw new Error("remote snapshot omitted execute block metadata");
+      throw new Error("remote snapshot omitted python code block metadata");
     }
     if (!toolMessage?.content.includes("... +") || toolMessage.content.includes("tool line 15")) {
       throw new Error("remote snapshot did not truncate tool output");
@@ -28921,7 +28478,7 @@ process.stdin.on("keypress", async (str, key) => {
     // agent calls when the user asks to be reminded ("remind me in 5 min").
     const modelAtSubmit = selectedModel;
     // The user's message always enters the transcript; notify defers nothing
-    // (runAgentNotification appends the assistant execute block + tool result).
+    // (runAgentNotification appends the executed notify_agent tool result).
     const submission = submit({
       deferAppend: queueBehindActiveTurn,
     });

@@ -45,8 +45,7 @@ HARNESS_FILE = Path.home() / ".nexus" / "harness.json"
 DEFAULT_SUBAGENT_ROOT = Path.home() / ".nexus" / "subagents"
 
 # Mirrors CODE_EXECUTION_TOOL_SCHEMA in index.js: subagents run the same
-# native tool-calling flow as the main session instead of relying on the
-# model to emit fenced ```execute blocks.
+# native tool-calling flow as the main session.
 SUBAGENT_TOOL_SCHEMA = [
     {
         "type": "function",
@@ -78,7 +77,7 @@ SUBAGENT_TOOL_SCHEMA = [
 
 SUBAGENT_EXECUTION_CONTRACT = """SUBAGENT EXECUTION CONTRACT:
 - Complete the delegated task with the available execute tools before returning a final answer.
-- A sentence announcing a next step (for example, "I need to inspect..." or "Let me implement...") is not a final answer. Emit the execute block in that same response instead.
+- A sentence announcing a next step (for example, "I need to inspect..." or "Let me implement...") is not a final answer. Call the code_execution tool in that same response instead.
 - Return a normal final answer only after the requested work is complete and verified, or when you have a concrete blocker that tools cannot resolve."""
 
 _UNFINISHED_RESPONSE_PATTERNS = (
@@ -409,9 +408,8 @@ def _build_code_for_tool_call(tool_name: str, tool_args: dict) -> dict:
     code_execution runs its code argument directly; every other predefined
     tool (fetch_url, web_search, delegate_agent, notify_agent, set_reminder,
     ...) is invoked through a generated wrapper that resolves the function
-    from the same execute scope the fenced blocks use. This keeps the native
-    tool-calling flow able to reach the full helper registry, not just
-    code_execution.
+    from the same execute scope the native tool-calling flow uses. This keeps
+    it able to reach the full helper registry, not just code_execution.
     """
     if tool_name == "code_execution":
         code = tool_args.get("code") if isinstance(tool_args.get("code"), str) else ""
@@ -505,49 +503,8 @@ def _run_subagent_tool_calls(entry: dict, tool_calls: list[dict], notify) -> Non
         notify(entry)
 
 
-def _matching_fence(line: str, character: str, minimum: int) -> bool:
-    value = line.strip()
-    return len(value) >= minimum and set(value) == {character}
-
-
-def _extract_execute_blocks(text: str) -> list[dict]:
-    lines = str(text or "").replace("\r", "").split("\n")
-    blocks: list[dict] = []
-    index = 0
-    while index < len(lines):
-        opening = re.match(r"^\s*(`{3,}|~{3,})execute\s*$", lines[index], re.IGNORECASE)
-        if not opening:
-            index += 1
-            continue
-        fence = opening.group(1)
-        # Any backtick/tilde run of 3+ is a potential closer. Runs at least as
-        # long as the opener are unambiguous and win; when only shorter runs
-        # exist (e.g. a 4-tick opener closed by a 3-tick run, a common
-        # mistake), fall back to the LAST such run instead of truncating.
-        close_candidates = [
-            position
-            for position in range(index + 1, len(lines))
-            if _matching_fence(lines[position], fence[0], 3)
-        ]
-        if not close_candidates:
-            blocks.append({"code": "\n".join(lines[index + 1 :]), "complete": False})
-            break
-        if len(fence) == 3:
-            close_index = close_candidates[-1]
-        else:
-            strong = [
-                position
-                for position in close_candidates
-                if len(lines[position].strip()) >= len(fence)
-            ]
-            close_index = strong[0] if strong else close_candidates[-1]
-        blocks.append({"code": "\n".join(lines[index + 1 : close_index]), "complete": True})
-        index = close_index + 1
-    return blocks
-
-
 def _execute_nexus_code(code: str) -> dict:
-    """Run one child execute block with the same helper registry as the parent."""
+    """Run one code_execution payload with the same helper registry as the parent."""
     import tools  # Lazy import avoids the harness.py <-> tools.py import cycle.
 
     output = io.StringIO()
@@ -960,59 +917,25 @@ def _subagent_worker(entry: dict, on_update=None) -> None:
             if reasoning_details:
                 assistant_message["reasoning_details"] = reasoning_details
             entry["messages"].append(assistant_message)
-            blocks = _extract_execute_blocks(content)
-            if not blocks:
-                if _looks_like_unfinished_response(content):
-                    entry["unfinished_response_retries"] = int(entry.get("unfinished_response_retries") or 0) + 1
-                    entry["messages"].append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "[orchestrator] That response only announced a next action, so the delegated task "
-                                "is still running. Perform the inspection or implementation now using one complete "
-                                "execute block. Return a final answer only after completion, verification, or a "
-                                "concrete blocker."
-                            ),
-                        }
-                    )
-                    notify(entry)
-                    continue
-                entry["result"] = content
-                entry["status"] = "done"
-                notify(entry)
-                return
-
-            # Execute turns remain visible while their tools run. Final turns
-            # are persisted only once above with status=done, avoiding two
-            # immediate Windows atomic replacements of the same job file.
-            notify(entry)
-
-            results = []
-            for block in blocks:
-                if not block["complete"]:
-                    tool_result = {
-                        "ok": False,
-                        "output": "",
-                        "error": "Execute block was truncated before its closing fence and was not run.",
+            if _looks_like_unfinished_response(content):
+                entry["unfinished_response_retries"] = int(entry.get("unfinished_response_retries") or 0) + 1
+                entry["messages"].append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "[orchestrator] That response only announced a next action, so the delegated task "
+                            "is still running. Perform the inspection or implementation now using the "
+                            "code_execution tool. Return a final answer only after completion, verification, "
+                            "or a concrete blocker."
+                        ),
                     }
-                else:
-                    try:
-                        tool_timeout = max(0.05, float(entry.get("timeout", 300)))
-                    except (TypeError, ValueError):
-                        tool_timeout = 300.0
-                    tool_result = _run_with_hard_timeout(
-                        lambda code=block["code"]: _execute_nexus_code(code),
-                        tool_timeout,
-                        "subagent execute block",
-                    )
-                results.append(tool_result)
-            entry["messages"].append(
-                {
-                    "role": "user",
-                    "content": "[tool code_execution result]\n" + json.dumps(results, ensure_ascii=False),
-                }
-            )
+                )
+                notify(entry)
+                continue
+            entry["result"] = content
+            entry["status"] = "done"
             notify(entry)
+            return
 
     except Exception as exc:
         entry["status"] = "error"
@@ -1466,7 +1389,24 @@ def run_subagent_self_test() -> dict:
                 "choices": [
                     {
                         "message": {
-                            "content": f"````execute\nimport time\ntime.sleep(3)\nprint(write_file({output_name!r}, 'landed'))\n````"
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_flow_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "code_execution",
+                                        "arguments": json.dumps({
+                                            "code": (
+                                                "import time\n"
+                                                f"time.sleep(3)\n"
+                                                f"_r = write_file({output_name!r}, 'landed')\n"
+                                                "print('landed:', _r.get('path'))"
+                                            )
+                                        }),
+                                    },
+                                }
+                            ],
                         }
                     }
                 ]
@@ -1549,7 +1489,19 @@ def run_subagent_self_test() -> dict:
                     "choices": [
                         {
                             "message": {
-                                "content": f"````execute\nprint('continuing turn {index}')\n````"
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": f"call_unlimited_{index}",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "code_execution",
+                                            "arguments": json.dumps({
+                                                "code": f"print('continuing turn {index}')"
+                                            }),
+                                        },
+                                    }
+                                ],
                             }
                         }
                     ]
