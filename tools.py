@@ -3589,7 +3589,7 @@ FUNCTIONS = {
 }
 
 FUNCTION_DESCRIPTIONS = {
-    "deep_think": "deep_think(thought: str) -> dict: Record a private deliberate reasoning step, then continue solving with the returned acknowledgement. Available when External thinking is enabled and native thinking is disabled.",
+    "deep_think": "deep_think(thought: str) -> dict: Record a private deliberate reasoning step, then continue solving with the returned acknowledgement. When External thinking is enabled and native thinking is disabled, call it once at the start of every assistant turn.",
     "delegate_agent": "delegate_agent(name: str, task: str, timeout: int|float = 240, poll_interval: int|float = 0.25) -> dict: Send a task to an idle named Nexus agent and wait for its final result. The target inherits its own persistent session, tools, MCP, skills, runtime settings, and shared workspace. Returns {ok, agent, status, result|error}.",
     "notify_agent": "notify_agent(name: str, task: str) -> dict: Start a task in an idle named Nexus agent and return immediately after admission. This is fire-and-forget: do not wait or poll unless the user later asks. Returns {ok, agent, status, pid|error}.",
     "tool_search": "tool_search(query: str, limit: int = 5) -> dict: Search deferred built-in helper names and descriptions. Returns the most relevant exact helper signatures; call a discovered helper in a later code_execution call.",

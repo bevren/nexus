@@ -1184,6 +1184,7 @@ const PLAN_MODE_ALLOWED_TOOL_NAMES = new Set([
   "get_skill",
   "harness_overview",
   "web_search",
+  "deep_think",
 ]);
 const SYSTEM_PROMPT_VISIBLE_TOOL_NAMES = new Set([
   "tool_search",
@@ -1223,7 +1224,7 @@ const SYSTEM_PROMPT_VISIBLE_TOOL_NAMES = new Set([
 ]);
 const FALLBACK_TOOL_DESCRIPTIONS = {
   deep_think:
-    "deep_think(thought: str) -> dict: Record a private deliberate reasoning step, then continue solving with the returned acknowledgement. Available when External thinking is enabled and native thinking is disabled.",
+    "deep_think(thought: str) -> dict: Record a private deliberate reasoning step, then continue solving with the returned acknowledgement. When External thinking is enabled and native thinking is disabled, call it once at the start of every assistant turn.",
   delegate_agent:
     "delegate_agent(name: str, task: str, timeout: int|float = 240, poll_interval: int|float = 0.25) -> dict: Send a task to an idle named Nexus agent and wait for its final result. The target inherits its own persistent session, tools, MCP, skills, runtime settings, and shared workspace. Returns {ok, agent, status, result|error}.",
   notify_agent:
@@ -1529,6 +1530,7 @@ let systemPromptLoadPromise = null;
 let mcpBridgeServer = null;
 let mcpBridgePort = 0;
 let mcpServers = [];
+let whatsAppApiSpawnedPid = 0;
 let mcpCatalog = [];
 let mcpCatalogDocumentFrequency = new Map();
 let mcpCatalogAverageDocumentLength = 0;
@@ -3267,6 +3269,14 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
       "CONTEXT USE (MUST FOLLOW):",
       "- Avoid repetition and re-reading unchanged files; inspect targeted context.",
       ...getWorkspaceGuidePromptLines(runtime),
+      ...(externalThinkingActive
+        ? [
+            "",
+            "EXTERNAL THINKING (MUST FOLLOW):",
+            "- Native model thinking is disabled. At the start of every assistant turn, call deep_think(\"your deliberate thought\") in a code_execution call, wait for its acknowledgement, then continue solving.",
+            "- Use deep_think for reasoning only; do not place file edits, shell commands, secrets, or user-facing answers inside it.",
+          ]
+        : []),
       "",
       "SKILL USE (MUST FOLLOW):",
       "- Before planning specialized or artifact work (including PDF, PowerPoint/slides, Word documents, spreadsheets, Android apps, or service integrations), call list_skills() to discover applicable workflows.",
@@ -3310,7 +3320,7 @@ function buildSystemPromptFromDescriptions(descriptions, runtime = {}) {
       ? [
           "",
           "EXTERNAL THINKING (MUST FOLLOW):",
-          "- Native model thinking is disabled. Before complex reasoning, call deep_think(\"your deliberate thought\") in a code_execution call, then continue from its acknowledgement.",
+          "- Native model thinking is disabled. At the start of every assistant turn, call deep_think(\"your deliberate thought\") in a code_execution call, wait for its acknowledgement, then continue solving.",
           "- Use deep_think for reasoning only; do not place file edits, shell commands, secrets, or user-facing answers inside it.",
         ]
       : []),
@@ -3977,9 +3987,126 @@ function getMcpConfigFingerprint(config) {
     .digest("hex");
 }
 
+// ---------------------------------------------------------------------------
+// API backend bootstrap for two-part MCP deployments (e.g. wweb-mcp WhatsApp:
+// a thin api-mode MCP client forwarding to a local REST server that holds the
+// Puppeteer/WhatsApp Web session). The backend is declared in mcp_config.json
+// as an "apiServer" object on the client entry, so everything machine-specific
+// lives in the config and the code below is generic plumbing:
+//
+//   "whatsapp": {
+//     "command": "C:/Program Files/nodejs/node.exe",
+//     "args": [ "...wweb-mcp/dist/main.js", "-m", "mcp", "-c", "api", ... ],
+//     "apiServer": {
+//       "command": "C:/Program Files/nodejs/node.exe",
+//       "args": [ "...wweb-mcp/dist/main.js", "-m", "whatsapp-api", "-s", "local",
+//                 "-a", ".../wwebjs_auth", "--log-level", "info" ],
+//       "cwd": ".../wwebjs_auth",
+//       "port": 3001,
+//       "readyPath": "/api/status",
+//       "logFile": ".../wwebjs_auth/server.log"
+//     }
+//   }
+//
+// The TUI makes sure the backend answers before the client boots (otherwise
+// every tool call fails with ECONNREFUSED) and tears down only the process it
+// spawned. Entries without an "apiServer" object are completely unaffected.
+// ---------------------------------------------------------------------------
+
+function getMcpApiServerConfig(serverConfig) {
+  const api = serverConfig?.apiServer;
+  if (!api || typeof api !== "object") return null;
+  if (typeof api.command !== "string" || api.command.trim() === "") return null;
+  const port = Number(api.port);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+  return {
+    command: api.command,
+    args: Array.isArray(api.args) ? api.args.map(String) : [],
+    cwd: typeof api.cwd === "string" && api.cwd ? api.cwd : process.cwd(),
+    port,
+    readyPath: typeof api.readyPath === "string" && api.readyPath.startsWith("/") ? api.readyPath : "/",
+    logFile: typeof api.logFile === "string" && api.logFile ? api.logFile : "",
+  };
+}
+
+function isMcpApiServerPortUp(apiConfig) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 1500);
+  return fetch(`http://127.0.0.1:${apiConfig.port}${apiConfig.readyPath}`, { signal: controller.signal })
+    .then(() => true) // any HTTP response means the server is listening
+    .catch(() => false)
+    .finally(() => clearTimeout(timer));
+}
+
+function spawnMcpApiServer(apiConfig) {
+  let logFd = "ignore";
+  if (apiConfig.logFile) {
+    try {
+      logFd = fsSync.openSync(apiConfig.logFile, "a");
+    } catch {
+      logFd = "ignore";
+    }
+  }
+  const child = spawn(apiConfig.command, apiConfig.args, {
+    cwd: apiConfig.cwd,
+    detached: true,
+    windowsHide: true,
+    stdio: ["ignore", logFd, logFd],
+  });
+  child.unref();
+  whatsAppApiSpawnedPid = child.pid;
+  return { ok: true, pid: child.pid, logFile: apiConfig.logFile };
+}
+
+async function ensureMcpApiServer(serverConfig, timeoutMs = 45000) {
+  const apiConfig = getMcpApiServerConfig(serverConfig);
+  if (!apiConfig) {
+    return { ok: false, reason: "no apiServer configured for this MCP entry" };
+  }
+  if (await isMcpApiServerPortUp(apiConfig)) {
+    return { ok: true, alreadyRunning: true };
+  }
+  const spawned = spawnMcpApiServer(apiConfig);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    if (await isMcpApiServerPortUp(apiConfig)) {
+      return { ok: true, alreadyRunning: false, pid: spawned.pid, logFile: spawned.logFile };
+    }
+  }
+  return { ok: false, timedOut: true, logFile: spawned.logFile };
+}
+
+// Tear down only the WhatsApp API backend this TUI session spawned. A server
+// that was already running when the TUI started (started manually or by an
+// earlier session) is left untouched. Sync so it can run inside exit handlers.
+function cleanupWhatsAppApiServer() {
+  const pid = whatsAppApiSpawnedPid;
+  whatsAppApiSpawnedPid = 0;
+  if (!pid) return;
+  try {
+    if (process.platform === "win32") {
+      spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
+    } else {
+      process.kill(pid, "SIGTERM");
+    }
+  } catch {
+    // Already exited — nothing to clean up.
+  }
+}
+
 async function startMcpServers() {
   const config = loadMcpConfig();
   const entries = Object.entries(config.mcpServers || {});
+
+  // Entries may declare an apiServer backend (e.g. the two-part wweb-mcp
+  // WhatsApp deployment). Make sure each backend answers before its client
+  // boots, otherwise every tool call fails with ECONNREFUSED. Bounded/silent.
+  for (const [, serverConfig] of entries) {
+    if (getMcpApiServerConfig(serverConfig)) {
+      await ensureMcpApiServer(serverConfig, 45000).catch(() => ({ ok: false }));
+    }
+  }
 
   // Start every server concurrently instead of serially. Several common
   // transports are slow to boot independently (npx/uvx package resolution,
@@ -4023,6 +4150,12 @@ async function startMcpServerByName(name) {
   const serverConfig = config.mcpServers?.[serverName];
   if (!serverName || !serverConfig || typeof serverConfig !== "object") {
     return { ok: false, error: `MCP server "${serverName}" is not configured` };
+  }
+
+  // Same guarantee as startMcpServers(): an entry declaring an apiServer
+  // backend needs it reachable before it can register tools.
+  if (getMcpApiServerConfig(serverConfig)) {
+    await ensureMcpApiServer(serverConfig, 45000).catch(() => ({ ok: false }));
   }
 
   mcpBusyNames.add(serverName);
@@ -5491,6 +5624,8 @@ function cleanupTerminal(options = {}) {
     }
     mcpBridgeServer = null;
   }
+  // Stop the WhatsApp API backend this session spawned, if any.
+  cleanupWhatsAppApiServer();
   if (remoteControlBroadcastTimer) {
     clearTimeout(remoteControlBroadcastTimer);
     remoteControlBroadcastTimer = null;
@@ -8636,6 +8771,72 @@ async function maybeCompactBeforeTurn() {
   return { ran: true, result };
 }
 
+// Providers reject a request when an assistant message with tool_calls is
+// not followed by a tool message for every tool_call_id. That state occurs
+// when a batch is interrupted (stop request, queued prompt at the tool
+// boundary, generation change, crash before all results were recorded), when
+// a tool result is excluded from the request, or when a tool result has
+// empty content. Walk the built request, answer any open batch before the
+// next conversational turn begins, and group each batch's responses right
+// after its assistant message so the request always stays valid.
+function pairAssistantToolCallsWithResponses(requestMessages) {
+  if (!Array.isArray(requestMessages) || requestMessages.length === 0) {
+    return requestMessages;
+  }
+
+  const sanitized = [];
+  let pendingIds = [];
+  let pendingSet = new Set();
+
+  const closeOpenBatch = () => {
+    for (const id of pendingIds) {
+      if (!pendingSet.has(id)) {
+        continue;
+      }
+      sanitized.push({
+        role: "tool",
+        tool_call_id: id,
+        content: "[tool call did not complete]",
+      });
+    }
+    pendingIds = [];
+    pendingSet = new Set();
+  };
+
+  for (const message of requestMessages) {
+    const role = typeof message?.role === "string" ? message.role : "";
+    if (role === "tool") {
+      const id = typeof message.tool_call_id === "string" ? message.tool_call_id : "";
+      if (id && pendingSet.has(id)) {
+        sanitized.push(message);
+        pendingSet.delete(id);
+        continue;
+      }
+      // A tool message outside any open batch (or a duplicate id) would be
+      // rejected too; keep its content as plain user context instead.
+      const text = typeof message.content === "string" ? message.content : "";
+      sanitized.push({ role: "user", content: `[tool result]\n${text}`.trim() });
+      continue;
+    }
+    if (role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      closeOpenBatch();
+      sanitized.push(message);
+      pendingIds = message.tool_calls
+        .map((call) => (typeof call?.id === "string" ? call.id : ""))
+        .filter((id) => id.length > 0);
+      pendingSet = new Set(pendingIds);
+      continue;
+    }
+    // Any other message starts a new conversational turn, so a still-open
+    // batch was interrupted and gets placeholder responses.
+    closeOpenBatch();
+    sanitized.push(message);
+  }
+  closeOpenBatch();
+
+  return sanitized;
+}
+
 function buildOpenRouterMessagesFromHistory(modelId = selectedModel) {
   ensureSystemMessageAtTop(modelId);
   const includeReasoningDetails = getReasoningEnabledForModel(modelId);
@@ -8704,7 +8905,18 @@ function buildOpenRouterMessagesFromHistory(modelId = selectedModel) {
     }
 
     const content = typeof entry?.content === "string" ? entry.content : "";
-    if (!content.trim()) {
+    const entryToolCalls = role === "assistant" && Array.isArray(entry?.toolCalls)
+      ? entry.toolCalls.filter((call) => call && typeof call === "object" && String(call?.function?.name || "").trim())
+      : [];
+    // Tool results and assistant tool-call turns must survive even when
+    // their content is empty, or the provider rejects the request with
+    // "insufficient tool messages following tool_calls message".
+    if (
+      !content.trim() &&
+      role !== "tool" &&
+      role !== "tool_result" &&
+      entryToolCalls.length === 0
+    ) {
       continue;
     }
 
@@ -8748,10 +8960,8 @@ function buildOpenRouterMessagesFromHistory(modelId = selectedModel) {
       if (includeReasoningDetails && details) {
         messagePayload.reasoning_details = details;
       }
-      const entryToolCalls = Array.isArray(entry?.toolCalls) ? entry.toolCalls : [];
       if (entryToolCalls.length > 0) {
         messagePayload.tool_calls = entryToolCalls
-          .filter((call) => call && typeof call === "object" && String(call?.function?.name || "").trim())
           .map((call) => ({
             id: String(call.id || createSessionUid()),
             type: String(call.type || "function"),
@@ -8773,7 +8983,7 @@ function buildOpenRouterMessagesFromHistory(modelId = selectedModel) {
     requestMessages.push({ role, content });
   }
 
-  return requestMessages;
+  return pairAssistantToolCallsWithResponses(requestMessages);
 }
 
 function extractAssistantText(content) {
@@ -9141,16 +9351,7 @@ function getOpenRouterErrorMessage(error) {
   return "Unknown error";
 }
 
-function shouldRetryWithoutReasoning(error) {
-  const msg = getOpenRouterErrorMessage(error).toLowerCase();
-  if (!msg) {
-    return false;
-  }
-
-  if (msg.includes("provider returned error")) {
-    return true;
-  }
-
+function errorMentionsUnsupportedReasoning(msg) {
   const mentionsReasoning = msg.includes("reasoning") || msg.includes("thinking");
   const unsupportedHint =
     msg.includes("unsupported") ||
@@ -9158,6 +9359,43 @@ function shouldRetryWithoutReasoning(error) {
     msg.includes("invalid parameter") ||
     msg.includes("unknown parameter");
   return mentionsReasoning && unsupportedHint;
+}
+
+function shouldRetryWithoutReasoning(error) {
+  const msg = getOpenRouterErrorMessage(error).toLowerCase();
+  if (!msg) {
+    return false;
+  }
+
+  // Generic provider errors (rate limits, transient upstream failures) may
+  // recover when retried without reasoning, but they are not evidence that
+  // the model rejects the reasoning parameter; callers must not permanently
+  // disable thinking for them (see shouldAutoDisableReasoning).
+  if (msg.includes("provider returned error")) {
+    return true;
+  }
+
+  return errorMentionsUnsupportedReasoning(msg);
+}
+
+// Only an error that explicitly blames the reasoning/thinking parameter
+// justifies auto-disabling thinking for the model for the rest of the session.
+function shouldAutoDisableReasoning(error) {
+  const msg = getOpenRouterErrorMessage(error).toLowerCase();
+  if (!msg) {
+    return false;
+  }
+  return errorMentionsUnsupportedReasoning(msg);
+}
+
+// A reasoning-off empty-retry normally carries no trace; keep the retried
+// trace when present, otherwise inherit the original response's trace so the
+// turn does not lose its reasoning block.
+function mergeReasoningDetailsAfterEmptyRetry(retriedDetails, originalDetails) {
+  if (Array.isArray(retriedDetails) && retriedDetails.length > 0) {
+    return retriedDetails;
+  }
+  return originalDetails || null;
 }
 
 function stripReasoningDetailsFromMessages(messagesForRequest) {
@@ -10598,14 +10836,20 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
       try {
         const retryMessages = stripReasoningDetailsFromMessages(messagesForRequest);
         const retryCompletion = await performRequest(retryMessages, false);
-        setReasoningEnabledForModel(resolvedModel, false);
-        appendAssistantMessage(
-          "Auto-disabled thinking for this model (provider rejected the reasoning parameter). Use /settings to re-enable it.",
-          { excludeFromRequest: true, persistHistory: false }
-        );
-        await rewriteSessionWithCurrentMessages().catch(() => {});
-        markDirty();
-        renderFrame(false);
+        // Only permanently disable thinking when the error explicitly blames
+        // the reasoning/thinking parameter. A generic provider error is
+        // transient; the reasoning-off retry recovers this turn but must not
+        // silently turn thinking off for the rest of the session.
+        if (shouldAutoDisableReasoning(error)) {
+          setReasoningEnabledForModel(resolvedModel, false);
+          appendAssistantMessage(
+            "Auto-disabled thinking for this model (provider rejected the reasoning parameter). Use /settings to re-enable it.",
+            { excludeFromRequest: true, persistHistory: false }
+          );
+          await rewriteSessionWithCurrentMessages().catch(() => {});
+          markDirty();
+          renderFrame(false);
+        }
         return retryCompletion;
       } catch {
         throw error;
@@ -10679,12 +10923,10 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
           completion = retried.completion;
           updateContextBudgetFromCompletion(completion, resolvedModel);
           assistantPayload = retried.payload;
-          if (
-            originalReasoningDetails &&
-            (!assistantPayload.reasoningDetails || assistantPayload.reasoningDetails.length === 0)
-          ) {
-            assistantPayload.reasoningDetails = originalReasoningDetails;
-          }
+          assistantPayload.reasoningDetails = mergeReasoningDetailsAfterEmptyRetry(
+            assistantPayload.reasoningDetails,
+            originalReasoningDetails
+          );
           // NOTE: do not auto-disable thinking here. DeepSeek reasoning models
           // legitimately return reasoning_content with an empty content field;
           // a reasoning-off retry keeps the loop alive but must not permanently
@@ -11050,7 +11292,13 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
             followUpCompletion = retried.completion;
             updateContextBudgetFromCompletion(followUpCompletion, resolvedModel);
             followUpContent = retried.payload.text;
-            followUpReasoningDetails = null;
+            // The reasoning-off retry usually carries no trace; preserve the
+            // trace from the original empty response (mirrors the first-turn
+            // path) so the follow-up turn does not lose its reasoning block.
+            followUpReasoningDetails = mergeReasoningDetailsAfterEmptyRetry(
+              retried.payload.reasoningDetails,
+              followUpReasoningDetails
+            );
             // NOTE: do not auto-disable thinking here (see the empty-content
             // path above); a reasoning-only response is normal for reasoning
             // models and must not silently clear the user's thinking toggle.
@@ -19331,8 +19579,18 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
         : "";
   const output = [];
 
+  // Python string-literal state threaded across logical code lines so a
+  // multi-line string ('...' or triple-quoted) stays colored on every line,
+  // not just the line where the opening quote appears.
+  const pythonState = { inString: null, triple: false };
+
   for (let i = 0; i < logicalLines.length; i += 1) {
     const lineMeta = logicalLineMeta[i] || { text: logicalLines[i], python: false, fence: false };
+    if (!lineMeta.python) {
+      // Leaving a code block: reset string state.
+      pythonState.inString = null;
+      pythonState.triple = false;
+    }
     const body = logicalLines[i];
     const isToolLine = isToolCall;
     const firstPrefix = isToolLine
@@ -19380,7 +19638,11 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
       if (isErrorMessage) {
         line = `${RED_COLOR}${visibleText}${RESET_COLOR}`;
       } else if (isToolCall && lineMeta.python) {
-        line = highlightPythonCodeLine(visibleText.padEnd(contentWidth, " "), lineMeta.fence);
+        line = highlightPythonCodeLine(
+          visibleText.padEnd(contentWidth, " "),
+          lineMeta.fence,
+          w === 0 ? pythonState : { inString: null, triple: false }
+        );
       } else if (isToolCall) {
         // Only color +/- lines as diff hunks when the whole output actually
         // looks like a unified diff; otherwise "- some text" from a tool
@@ -19435,7 +19697,11 @@ function buildTranscriptLinesForEntry(entry, cols = process.stdout.columns || 80
           ? `${visibleText.slice(0, pendingMarker)}${MARKDOWN_LIST_MARKER_COLOR}☐${RESET_COLOR}${visibleText.slice(pendingMarker + 1)}`
           : visibleText;
       } else if (displayRole === "assistant" && lineMeta.python) {
-        line = highlightPythonCodeLine(visibleText.padEnd(contentWidth, " "), lineMeta.fence);
+        line = highlightPythonCodeLine(
+          visibleText.padEnd(contentWidth, " "),
+          lineMeta.fence,
+          w === 0 ? pythonState : { inString: null, triple: false }
+        );
       } else if (displayRole === "assistant") {
         const styledMarkdown = highlightMarkdownTextRange(
           body,
@@ -20115,77 +20381,104 @@ function appendTranscriptNow(options = {}) {
   return wroteAppendedChat;
 }
 
-function highlightPythonCodeLine(line, isFenceLine = false) {
+function highlightPythonCodeLine(line, isFenceLine = false, state = null) {
   const raw = String(line ?? "");
   if (!raw.length) {
     return `${CODE_BLOCK_BG_COLOR}${RESET_COLOR}`;
   }
 
   if (isFenceLine) {
+    if (state) { state.inString = null; state.triple = false; }
     return `${CODE_BLOCK_BG_COLOR}${CODE_BLOCK_COMMENT_COLOR}${raw}${RESET_COLOR}`;
   }
 
   const isIdentStart = (ch) => /[A-Za-z_]/.test(ch);
   const isIdentChar = (ch) => /[A-Za-z0-9_]/.test(ch);
+  const DQ = String.fromCharCode(34);
+  const SQ = String.fromCharCode(39);
   let i = 0;
   let out = "";
+
+  if (state && state.inString) {
+    const quote = state.inString;
+    const triple = state.triple === true;
+    let closed = false;
+    let j = 0;
+    while (j < raw.length) {
+      if (raw[j] === "\\" && j + 1 < raw.length) { j += 2; continue; }
+      if (raw[j] === quote) {
+        if (!triple) { j += 1; closed = true; break; }
+        if (raw[j + 1] === quote && raw[j + 2] === quote) { j += 3; closed = true; break; }
+      }
+      j += 1;
+    }
+    out += stylePythonToken(raw.slice(0, j), CODE_BLOCK_STRING_COLOR);
+    if (closed) { state.inString = null; state.triple = false; i = j; }
+    else {
+      state.inString = quote; state.triple = triple;
+      return `${CODE_BLOCK_BG_COLOR}${CODE_BLOCK_FG_COLOR}${out}${RESET_COLOR}`;
+    }
+  }
 
   while (i < raw.length) {
     const ch = raw[i];
 
-    if (ch === "#") {
-      out += `${CODE_BLOCK_COMMENT_COLOR}${raw.slice(i)}${CODE_BLOCK_FG_COLOR}`;
-      break;
-    }
+    if (ch === "#") { out += `${CODE_BLOCK_COMMENT_COLOR}${raw.slice(i)}${CODE_BLOCK_FG_COLOR}`; break; }
 
-    if (
-      /[fFrRbBuU]/.test(ch) &&
-      i + 1 < raw.length &&
-      (raw[i + 1] === "\"" || raw[i + 1] === "'") &&
-      (i === 0 || !isIdentChar(raw[i - 1]))
-    ) {
-      const quote = raw[i + 1];
-      let j = i + 2;
+    let tripleQuote = "";
+    if (raw.slice(i, i + 3) === DQ + DQ + DQ) tripleQuote = DQ;
+    else if (raw.slice(i, i + 3) === SQ + SQ + SQ) tripleQuote = SQ;
+    if (!tripleQuote) {
+      const pm = raw.slice(i).match(/^[fFrRbBuU]{1,2}(["'])\1\1/);
+      if (pm) tripleQuote = pm[1];
+    }
+    if (tripleQuote) {
+      const om = raw.slice(i).match(/^[fFrRbBuU]{0,2}(["'])\1\1/);
+      const openLen = om ? om[0].length : 3;
+      let j = i + openLen;
       while (j < raw.length) {
-        if (raw[j] === "\\" && j + 1 < raw.length) {
-          j += 2;
-          continue;
-        }
-        if (raw[j] === quote) {
-          j += 1;
-          break;
-        }
+        if (raw[j] === "\\" && j + 1 < raw.length) { j += 2; continue; }
+        if (raw[j] === tripleQuote && raw[j + 1] === tripleQuote && raw[j + 2] === tripleQuote) { j += 3; break; }
         j += 1;
       }
       out += stylePythonToken(raw.slice(i, j), CODE_BLOCK_STRING_COLOR);
+      const closedOnThisLine = j <= raw.length && raw[j - 1] === tripleQuote && raw[j - 2] === tripleQuote && raw[j - 3] === tripleQuote;
+      if (!closedOnThisLine && state) { state.inString = tripleQuote; state.triple = true; }
       i = j;
       continue;
     }
 
-    if (ch === "\"" || ch === "'") {
-      const quote = ch;
-      let j = i + 1;
+    if (/[fFrRbBuU]/.test(ch) && i + 1 < raw.length && (raw[i + 1] === DQ || raw[i + 1] === SQ) && (i === 0 || !isIdentChar(raw[i - 1]))) {
+      const quote = raw[i + 1];
+      let j = i + 2;
       while (j < raw.length) {
-        if (raw[j] === "\\" && j + 1 < raw.length) {
-          j += 2;
-          continue;
-        }
-        if (raw[j] === quote) {
-          j += 1;
-          break;
-        }
+        if (raw[j] === "\\" && j + 1 < raw.length) { j += 2; continue; }
+        if (raw[j] === quote) { j += 1; break; }
         j += 1;
       }
       out += stylePythonToken(raw.slice(i, j), CODE_BLOCK_STRING_COLOR);
+      if (j >= raw.length && raw[j - 1] !== quote && state) { state.inString = quote; state.triple = false; }
+      i = j;
+      continue;
+    }
+
+    if (ch === DQ || ch === SQ) {
+      const quote = ch;
+      let j = i + 1;
+      while (j < raw.length) {
+        if (raw[j] === "\\" && j + 1 < raw.length) { j += 2; continue; }
+        if (raw[j] === quote) { j += 1; break; }
+        j += 1;
+      }
+      out += stylePythonToken(raw.slice(i, j), CODE_BLOCK_STRING_COLOR);
+      if (j >= raw.length && raw[j - 1] !== quote && state) { state.inString = quote; state.triple = false; }
       i = j;
       continue;
     }
 
     if (/[0-9]/.test(ch)) {
       let j = i + 1;
-      while (j < raw.length && /[0-9._]/.test(raw[j])) {
-        j += 1;
-      }
+      while (j < raw.length && /[0-9._]/.test(raw[j])) { j += 1; }
       out += stylePythonToken(raw.slice(i, j), CODE_BLOCK_NUMBER_COLOR);
       i = j;
       continue;
@@ -20193,17 +20486,11 @@ function highlightPythonCodeLine(line, isFenceLine = false) {
 
     if (isIdentStart(ch)) {
       let j = i + 1;
-      while (j < raw.length && isIdentChar(raw[j])) {
-        j += 1;
-      }
+      while (j < raw.length && isIdentChar(raw[j])) { j += 1; }
       const token = raw.slice(i, j);
-      if (PYTHON_KEYWORDS.has(token)) {
-        out += stylePythonToken(token, CODE_BLOCK_KEYWORD_COLOR);
-      } else if (PYTHON_BUILTINS.has(token)) {
-        out += stylePythonToken(token, CODE_BLOCK_BUILTIN_COLOR);
-      } else {
-        out += token;
-      }
+      if (PYTHON_KEYWORDS.has(token)) { out += stylePythonToken(token, CODE_BLOCK_KEYWORD_COLOR); }
+      else if (PYTHON_BUILTINS.has(token)) { out += stylePythonToken(token, CODE_BLOCK_BUILTIN_COLOR); }
+      else { out += token; }
       i = j;
       continue;
     }
@@ -20214,7 +20501,6 @@ function highlightPythonCodeLine(line, isFenceLine = false) {
 
   return `${CODE_BLOCK_BG_COLOR}${CODE_BLOCK_FG_COLOR}${out}${RESET_COLOR}`;
 }
-
 function highlightPythonInline(line) {
   return highlightPythonCodeLine(String(line ?? ""))
     .split(CODE_BLOCK_BG_COLOR).join("")
@@ -23666,6 +23952,7 @@ function runFormatSelfTest() {
     if (
       !externalThinkingPrompt.includes("deep_think(thought: str)") ||
       !externalThinkingPrompt.includes("EXTERNAL THINKING") ||
+      !externalThinkingPrompt.includes("every assistant turn") ||
       regularPrompt.includes("deep_think")
     ) {
       out("FORMAT_FAIL: external thinking prompt activation is incorrect\n");
@@ -23705,6 +23992,107 @@ function runFormatSelfTest() {
       reasoningOnlyLegacyPayload.text.trim() !== "model thought"
     ) {
       out("FORMAT_FAIL: reasoning-only response fallback contract is incorrect\n");
+      return 1;
+    }
+    // Reasoning retry classification: generic provider errors may recover via
+    // a reasoning-off retry but must never auto-disable thinking; only errors
+    // that explicitly blame the reasoning/thinking parameter may disable it.
+    const genericProviderError = new Error("Provider returned error: upstream rate limited");
+    const reasoningUnsupportedError = new Error("reasoning is unsupported for this model");
+    const thinkingInvalidError = new Error("thinking is not supported: invalid parameter");
+    const unrelatedError = new Error("network socket hang up");
+    if (
+      !shouldRetryWithoutReasoning(genericProviderError) ||
+      shouldAutoDisableReasoning(genericProviderError) ||
+      !shouldRetryWithoutReasoning(reasoningUnsupportedError) ||
+      !shouldAutoDisableReasoning(reasoningUnsupportedError) ||
+      !shouldRetryWithoutReasoning(thinkingInvalidError) ||
+      !shouldAutoDisableReasoning(thinkingInvalidError) ||
+      shouldRetryWithoutReasoning(unrelatedError) ||
+      shouldAutoDisableReasoning(unrelatedError)
+    ) {
+      out("FORMAT_FAIL: reasoning retry/auto-disable classification is incorrect\n");
+      return 1;
+    }
+    // Empty-retry reasoning merge: a reasoning-off retry keeps its own trace
+    // when present, otherwise inherits the original response's trace.
+    const originalTraceFixture = [{ type: "reasoning.text", text: "original thought", format: "unknown" }];
+    const retriedTraceFixture = [{ type: "reasoning.text", text: "retried thought", format: "unknown" }];
+    if (
+      mergeReasoningDetailsAfterEmptyRetry(retriedTraceFixture, originalTraceFixture) !== retriedTraceFixture ||
+      mergeReasoningDetailsAfterEmptyRetry(null, originalTraceFixture) !== originalTraceFixture ||
+      mergeReasoningDetailsAfterEmptyRetry([], originalTraceFixture) !== originalTraceFixture ||
+      mergeReasoningDetailsAfterEmptyRetry(null, null) !== null
+    ) {
+      out("FORMAT_FAIL: empty-retry reasoning merge contract is incorrect\n");
+      return 1;
+    }
+    // Tool-call pairing: providers reject requests whose assistant tool_calls
+    // message lacks a tool response for some tool_call_id (interrupted batch,
+    // excluded/empty result). Missing responses must be filled immediately
+    // after the batch, complete batches must pass through untouched, and
+    // orphan tool messages must not leak through as tool-role messages.
+    const pairedToolCallFixture = [
+      { id: "call_a", type: "function", function: { name: "code_execution", arguments: "{}" } },
+      { id: "call_b", type: "function", function: { name: "code_execution", arguments: "{}" } },
+    ];
+    const interruptedBatchRequest = pairAssistantToolCallsWithResponses([
+      { role: "user", content: "run two tools" },
+      { role: "assistant", content: "", tool_calls: pairedToolCallFixture },
+      { role: "tool", tool_call_id: "call_a", content: "first result" },
+      { role: "user", content: "next prompt" },
+    ]);
+    if (
+      interruptedBatchRequest.length !== 5 ||
+      interruptedBatchRequest[3]?.role !== "tool" ||
+      interruptedBatchRequest[3]?.tool_call_id !== "call_b" ||
+      !String(interruptedBatchRequest[3]?.content || "").includes("did not complete") ||
+      interruptedBatchRequest[4]?.role !== "user" ||
+      interruptedBatchRequest[4]?.content !== "next prompt"
+    ) {
+      out(`FORMAT_FAIL: interrupted tool batch was not repaired: ${JSON.stringify(interruptedBatchRequest)}\n`);
+      return 1;
+    }
+    const completeBatchRequest = pairAssistantToolCallsWithResponses([
+      { role: "assistant", content: "", tool_calls: pairedToolCallFixture },
+      { role: "tool", tool_call_id: "call_a", content: "first result" },
+      { role: "tool", tool_call_id: "call_b", content: "second result" },
+    ]);
+    if (
+      completeBatchRequest.length !== 3 ||
+      completeBatchRequest[1]?.tool_call_id !== "call_a" ||
+      completeBatchRequest[2]?.tool_call_id !== "call_b" ||
+      completeBatchRequest[2]?.content !== "second result"
+    ) {
+      out(`FORMAT_FAIL: complete tool batch was altered: ${JSON.stringify(completeBatchRequest)}\n`);
+      return 1;
+    }
+    const trailingBatchRequest = pairAssistantToolCallsWithResponses([
+      { role: "user", content: "go" },
+      { role: "assistant", content: "", tool_calls: pairedToolCallFixture },
+    ]);
+    if (
+      trailingBatchRequest.length !== 4 ||
+      trailingBatchRequest[2]?.tool_call_id !== "call_a" ||
+      trailingBatchRequest[3]?.tool_call_id !== "call_b"
+    ) {
+      out(`FORMAT_FAIL: trailing interrupted batch was not repaired: ${JSON.stringify(trailingBatchRequest)}\n`);
+      return 1;
+    }
+    const orphanToolRequest = pairAssistantToolCallsWithResponses([
+      { role: "tool", tool_call_id: "ghost", content: "stale result" },
+      { role: "user", content: "hi" },
+    ]);
+    if (
+      orphanToolRequest.length !== 2 ||
+      orphanToolRequest[0]?.role !== "user" ||
+      !String(orphanToolRequest[0]?.content || "").includes("stale result")
+    ) {
+      out(`FORMAT_FAIL: orphan tool message leaked as tool role: ${JSON.stringify(orphanToolRequest)}\n`);
+      return 1;
+    }
+    if (pairAssistantToolCallsWithResponses([]).length !== 0) {
+      out("FORMAT_FAIL: tool-call pairing must tolerate an empty request\n");
       return 1;
     }
     const sessionNow = Date.UTC(2026, 0, 1, 12, 0, 0);
@@ -24176,6 +24564,45 @@ function runFormatSelfTest() {
       out("FORMAT_FAIL: deferred discovery schemas were not compacted after their immediate use\n");
       return 1;
     }
+    // End-to-end pairing through the request builder: an empty-content tool
+    // result and an excluded tool result must both leave the assistant
+    // tool_calls batch fully answered (provider rejects otherwise).
+    const savedMessagesForPairing = [...messages];
+    messages.length = 0;
+    ensureSystemMessageAtTop();
+    messages.push(
+      { role: "user", content: "run two tools" },
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [
+          { id: "call_x", type: "function", function: { name: "code_execution", arguments: "{}" } },
+          { id: "call_y", type: "function", function: { name: "code_execution", arguments: "{}" } },
+        ],
+      },
+      { role: "tool", name: "code_execution", toolCallId: "call_x", content: "" },
+      { role: "tool", name: "code_execution", toolCallId: "call_y", content: "excluded result", excludeFromRequest: true },
+      { role: "user", content: "next prompt" }
+    );
+    const pairedRequest = buildOpenRouterMessagesFromHistory("self-test");
+    messages.length = 0;
+    messages.push(...savedMessagesForPairing);
+    const pairedAssistant = pairedRequest.find(
+      (entry) => entry.role === "assistant" && Array.isArray(entry.tool_calls)
+    );
+    const pairedToolResponses = pairedRequest.filter((entry) => entry.role === "tool");
+    if (
+      !pairedAssistant ||
+      pairedAssistant.tool_calls.length !== 2 ||
+      pairedToolResponses.length !== 2 ||
+      pairedToolResponses.some((entry) => !["call_x", "call_y"].includes(entry.tool_call_id)) ||
+      !pairedToolResponses.find((entry) => entry.tool_call_id === "call_x")?.content?.includes("(no output)") ||
+      !pairedToolResponses.find((entry) => entry.tool_call_id === "call_y")?.content?.includes("did not complete") ||
+      pairedRequest[pairedRequest.length - 1]?.content !== "next prompt"
+    ) {
+      out(`FORMAT_FAIL: request builder left a tool_calls batch partially answered: ${JSON.stringify(pairedRequest)}\n`);
+      return 1;
+    }
     const planModePrompt = buildSystemPromptFromDescriptions(
       {
         get_file_content: FALLBACK_TOOL_DESCRIPTIONS.get_file_content,
@@ -24609,6 +25036,35 @@ function runFormatSelfTest() {
       cachedChatLinesLastRef = savedCachedChatLinesLastRef;
       cachedChatLinesSpacing = savedCachedChatLinesSpacing;
       cachedTranscriptLinesByEntries.delete(messages);
+    }
+
+    // Multiline string highlighting: a string literal spanning multiple code
+    // lines must stay colored on every line (state threaded across lines), not
+    // only the line containing the opening quote.
+    const DQ = String.fromCharCode(34);
+    const multilineStringState = { inString: null, triple: false };
+    const openingLine = highlightPythonCodeLine("new = 'deep_think(thought: str) -> dict: Record a private deliberate reasoning step", false, multilineStringState);
+    const continuationLine = highlightPythonCodeLine("turned acknowledgement.'", false, multilineStringState);
+    if (
+      multilineStringState.inString !== null ||
+      !openingLine.includes(CODE_BLOCK_STRING_COLOR) ||
+      !continuationLine.includes(CODE_BLOCK_STRING_COLOR)
+    ) {
+      out("FORMAT_FAIL: multiline string highlighting lost state across lines");
+      return 1;
+    }
+    const tripleStringState = { inString: null, triple: false };
+    const tripleOpen = highlightPythonCodeLine("s = " + DQ + DQ + DQ + "line one", false, tripleStringState);
+    const tripleMid = highlightPythonCodeLine("line two", false, tripleStringState);
+    const tripleClose = highlightPythonCodeLine("line three" + DQ + DQ + DQ, false, tripleStringState);
+    if (
+      tripleStringState.inString !== null ||
+      !tripleMid.includes(CODE_BLOCK_STRING_COLOR) ||
+      !tripleOpen.includes(CODE_BLOCK_STRING_COLOR) ||
+      !tripleClose.includes(CODE_BLOCK_STRING_COLOR)
+    ) {
+      out("FORMAT_FAIL: triple-quoted string highlighting lost state across lines");
+      return 1;
     }
 
     out("FORMAT_OK\n");
