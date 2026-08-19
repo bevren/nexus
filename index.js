@@ -1504,6 +1504,10 @@ let mouseSequenceRemainder = "";
 let pasteParserBuffer = "";
 let imagePasteCounter = 0;
 const imageTokenPayloads = new Map();
+// Stash for the vision-describe feedback notice: appended AFTER the assistant
+// reply finalizes (so it renders below the answer, not above it), and excluded
+// from both the request and session history.
+let pendingVisionDescribeNotice = "";
 let openRouterClient = null;
 let openRouterClientKey = "";
 let assistantRequestChain = Promise.resolve();
@@ -6797,6 +6801,10 @@ function normalizeProviderEntry(raw) {
     base_url: base_url.trim(),
     api_key,
     model,
+    has_image_input: raw?.has_image_input !== false,
+    has_video_input: raw?.has_video_input !== false,
+    has_audio_input: raw?.has_audio_input !== false,
+    has_file_input: raw?.has_file_input !== false,
   };
 }
 
@@ -9340,6 +9348,166 @@ function pairAssistantToolCallsWithResponses(requestMessages) {
   return sanitized;
 }
 
+// Determine whether a provider/model combination supports image input.
+// The provider editor's "Has Image Input" flag is authoritative; when unset
+// (default true), fall back to the /models-reported input modalities.
+function modelSupportsImageInput(modelId = selectedModel) {
+  const provider = getProviderForActiveModel(modelId);
+  // Provider editor flag is authoritative when explicitly set.
+  if (provider && typeof provider?.has_image_input === "boolean") {
+    return provider.has_image_input;
+  }
+  const entry = getModelEntryForContext(modelId);
+  // When /models reports modalities, trust them.
+  if (entry && Array.isArray(entry.inputModalities) && entry.inputModalities.length > 0) {
+    return entry.inputModalities.includes("image");
+  }
+  // Unknown: prefer the vision-model fallback (text-only assumption). The
+  // user can set has_image_input=true in the provider editor to force image
+  // passthrough for a model the provider does not advertise modalities for.
+  return false;
+}
+
+function modelSupportsAudioInput(modelId = selectedModel) {
+  const provider = getProviderForActiveModel(modelId);
+  if (provider && typeof provider?.has_audio_input === "boolean") {
+    return provider.has_audio_input;
+  }
+  const entry = getModelEntryForContext(modelId);
+  if (entry && Array.isArray(entry.inputModalities) && entry.inputModalities.length > 0) {
+    return entry.inputModalities.includes("audio");
+  }
+  return true;
+}
+
+// The provider whose configured model is `modelId` (used for capability flags).
+function getProviderForActiveModel(modelId) {
+  const key = String(modelId || "").trim();
+  if (!key) return null;
+  const active = getActiveProvider();
+  if (active && normalizeProviderModel(active.model) === key) return active;
+  for (const provider of providers) {
+    if (normalizeProviderModel(provider?.model) === key) return provider;
+  }
+  return null;
+}
+
+// Describe an image via the configured vision model. Returns the description
+// text or null on failure. Synchronous wrapper around the async media path is
+// not possible; callers use describeImagesForMessage instead.
+async function describeImagePayloadForVision(imageUrl, prompt = "Describe this image in detail, including any text, code, UI elements, or layout. Be thorough and specific.") {
+  try {
+    const { provider, profileName, model } = resolveMediaProviderProfile(
+      {},
+      "vision_model",
+      "Vision model"
+    );
+    const mimeType = guessImageMimeFromBase64(String(imageUrl || ""));
+    const response = await postProviderJson(provider, "chat/completions", {
+      model,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: prompt },
+          { type: "image_url", image_url: { url: imageUrl } },
+        ],
+      }],
+    }, 60000);
+    return extractProviderMessageText(response?.choices?.[0]?.message?.content);
+  } catch {
+    return null;
+  }
+}
+
+// Cache of described images keyed by image payload hash so repeated turns
+// don't re-describe the same image.
+const describedImageCache = new Map();
+
+function describeImagesForMessage(text, modelId) {
+  const source = String(text ?? "");
+  if (!source.includes("[Image #") || modelSupportsImageInput(modelId)) {
+    return { ok: true, text: source, imagesDescribed: 0 };
+  }
+
+  const re = /\[Image #(\d+)\]/g;
+  const tokens = [];
+  let match = null;
+  while ((match = re.exec(source)) !== null) {
+    tokens.push({ tokenNumber: Number(match[1]) });
+  }
+  if (tokens.length === 0) {
+    return { ok: true, text: source, imagesDescribed: 0 };
+  }
+
+  const replacements = new Map();
+  let pending = tokens.filter((token) => {
+    const imageUrl = imageTokenPayloads.get(token.tokenNumber);
+    if (typeof imageUrl !== "string" || imageUrl.length === 0) return false;
+    const hash = createHash("sha256").update(imageUrl, "utf8").digest("hex").slice(0, 16);
+    token.hash = hash;
+    if (describedImageCache.has(hash)) {
+      replacements.set(token.tokenNumber, describedImageCache.get(hash));
+      return false;
+    }
+    return true;
+  });
+
+  return { ok: true, text: source, imagesDescribed: pending.length, pending, replacements };
+}
+
+async function resolveImageDescriptions(pending) {
+  const descriptions = new Map();
+  for (const token of pending) {
+    const imageUrl = imageTokenPayloads.get(token.tokenNumber);
+    const description = await describeImagePayloadForVision(imageUrl);
+    if (description) {
+      descriptions.set(token.tokenNumber, description);
+      describedImageCache.set(token.hash, description);
+    }
+  }
+  return descriptions;
+}
+
+// Substitute [Image #N] tokens in a user message with
+// <image#N>described text</image> when the model has no image input.
+function substituteImageDescriptions(text, descriptions) {
+  if (!descriptions || descriptions.size === 0) return text;
+  return String(text).replace(/\[Image #(\d+)\]/g, (tokenText, tokenNumberRaw) => {
+    const tokenNumber = Number(tokenNumberRaw);
+    const description = descriptions.get(tokenNumber);
+    if (typeof description === "string" && description.length > 0) {
+      return `<image#${tokenNumber}>${description}</image>`;
+    }
+    return tokenText;
+  });
+}
+
+// Shared async helper: describe pasted images via the vision model when the
+// target model has no image input, and return the substituted text.
+async function ensureImagesDescribedForText(text, modelId) {
+  const source = String(text ?? "");
+  if (!source.includes("[Image #") || modelSupportsImageInput(modelId)) {
+    return { text: source, described: 0 };
+  }
+  const describeResult = describeImagesForMessage(source, modelId);
+  if (!describeResult.pending || describeResult.pending.length === 0) {
+    if (describeResult.replacements && describeResult.replacements.size > 0) {
+      return {
+        text: substituteImageDescriptions(source, describeResult.replacements),
+        described: describeResult.replacements.size,
+      };
+    }
+    return { text: source, described: describeResult.imagesDescribed };
+  }
+  const descriptions = await resolveImageDescriptions(describeResult.pending);
+  // Merge cached descriptions with freshly-described ones.
+  const allDescriptions = new Map(describeResult.replacements || []);
+  for (const [tokenNumber, description] of descriptions) {
+    allDescriptions.set(tokenNumber, description);
+  }
+  return { text: substituteImageDescriptions(source, allDescriptions), described: allDescriptions.size };
+}
+
 function buildOpenRouterMessagesFromHistory(modelId = selectedModel) {
   ensureSystemMessageAtTop(modelId);
   const includeReasoningDetails = getReasoningEnabledForModel(modelId);
@@ -11179,6 +11347,70 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
     pendingHookContext = "";
   }
 
+  // If the active model has no image input and the user pasted images, ask the
+  // configured vision model to describe them and substitute
+  // <image#N>description</image> so the text-only model can still work with
+  // images. Runs before the request messages are built (the user message with
+  // [Image #N] tokens is resolved here).
+  if (!modelSupportsImageInput(resolvedModel)) {
+    const userImageEntry = [...messages].reverse().find((entry) =>
+      entry && entry.role === "user" &&
+      typeof entry?.content === "string" &&
+      entry.content.includes("[Image #")
+    );
+    if (userImageEntry) {
+      const visionModelName = normalizeRuntimeModelId(getActiveSessionRuntimeSettings().vision_model);
+      const imageTokenCount = (() => {
+        const re = /\[Image #(\d+)\]/g;
+        let count = 0;
+        let match = null;
+        while ((match = re.exec(userImageEntry.content)) !== null) {
+          if (imageTokenPayloads.get(Number(match[1]))) count += 1;
+        }
+        return count;
+      })();
+      // Starting feedback: shown immediately so the user knows the image is
+      // being described by a separate vision model (not the text-only model).
+      // Inserted BEFORE the pending placeholder so it renders between the
+      // user message and the answer, not after it.
+      if (visionModelName && imageTokenCount > 0) {
+        const startNotice = {
+          role: "assistant",
+          content: `Using the ${visionModelName} vision model to describe ${imageTokenCount} pasted image${imageTokenCount > 1 ? "s" : ""}...`,
+          excludeFromRequest: true,
+        };
+        const insertIndex = pendingIndex >= 0 && pendingIndex < messages.length
+          ? pendingIndex
+          : messages.length;
+        messages.splice(insertIndex, 0, startNotice);
+        if (pendingIndex >= insertIndex) {
+          pendingIndex += 1;
+        }
+        syncImagePasteCounter();
+        scrollChatToBottom();
+        markDirty();
+        renderFrame(false);
+      }
+      try {
+        const described = await ensureImagesDescribedForText(userImageEntry.content, resolvedModel);
+        if (described.text !== userImageEntry.content) {
+          userImageEntry.content = described.text;
+          // Visible feedback, but deferred: appended AFTER the assistant reply
+          // finalizes so it renders below the answer (not between the user
+          // message and the answer). Excluded from request + session history.
+          if (described.described > 0) {
+            pendingVisionDescribeNotice =
+              `Described ${described.described} pasted image${described.described > 1 ? "s" : ""} with the vision model (${visionModelName || "vision model"}) and included the description in the request.`;
+          }
+          markDirty();
+          renderFrame(false);
+        }
+      } catch {
+        // non-fatal: fall through with the original [Image #N] tokens
+      }
+    }
+  }
+
   const requestMessages = buildOpenRouterMessagesFromHistory(resolvedModel);
   if (requestMessages.length === 0) {
     finalizePendingAssistantMessage(pendingIndex, "(empty request)", generation, {
@@ -11639,7 +11871,13 @@ function queueAssistantReply(modelId, options = {}) {
         ) {
           const lastAssistant = messages
             .slice(turnStartMessageIndex)
-            .filter((entry) => entry && entry.role === "assistant" && String(entry.content || "").trim())
+            .filter(
+              (entry) =>
+                entry &&
+                entry.role === "assistant" &&
+                entry.excludeFromRequest !== true &&
+                String(entry.content || "").trim()
+            )
             .at(-1);
           if (lastAssistant) {
             const settings = getActiveSessionRuntimeSettings();
@@ -11666,6 +11904,17 @@ function queueAssistantReply(modelId, options = {}) {
               speakAssistantReply(lastAssistant.content, voice, speed, maxChars);
             }
           }
+        }
+        // Deferred vision-describe feedback: append AFTER the assistant reply
+        // is finalized and spoken, so it renders as the last transcript line
+        // and never interferes with TTS or the request.
+        if (pendingVisionDescribeNotice) {
+          const noticeText = pendingVisionDescribeNotice;
+          pendingVisionDescribeNotice = "";
+          appendAssistantMessage(noticeText, {
+            excludeFromRequest: true,
+            persistHistory: false,
+          });
         }
         // Turn completed: fire Notification then Stop hooks. Stop hooks run
         // with a block cap (8) and receive stop_hook_active after a prior
@@ -19275,12 +19524,23 @@ async function cancelProviderEditorChanges(options = {}) {
   }
 }
 
+const PROVIDER_BOOL_FIELDS = new Set([
+  "has_image_input",
+  "has_video_input",
+  "has_audio_input",
+  "has_file_input",
+]);
+
 function getProviderEditorFields() {
   return [
     { label: "Name", key: "name" },
     { label: "Base URL", key: "base_url" },
     { label: "Api Key", key: "api_key" },
     { label: "Model", key: "model" },
+    { label: "Has Image Input", key: "has_image_input", bool: true },
+    { label: "Has Video Input", key: "has_video_input", bool: true },
+    { label: "Has Audio Input", key: "has_audio_input", bool: true },
+    { label: "Has File Input", key: "has_file_input", bool: true },
   ];
 }
 
@@ -22518,7 +22778,13 @@ function renderProvidersBuffer() {
       const marker = i === providersSelected ? "\u25cf" : "\u25cb";
       const name = entry.name || "(unnamed provider)";
       const model = normalizeProviderModel(entry?.model) || "no model";
-      const text = `  ${marker} ${name}  model: ${model}`;
+      const badges = [];
+      if (entry?.has_image_input === true) badges.push("img");
+      if (entry?.has_video_input === true) badges.push("vid");
+      if (entry?.has_audio_input === true) badges.push("aud");
+      if (entry?.has_file_input === true) badges.push("file");
+      const badgeText = badges.length > 0 ? `  [${badges.join(",")}]` : "";
+      const text = `  ${marker} ${name}  model: ${model}${badgeText}`;
       const isActiveProvider = entry.name === selectedProviderName;
       if (isActiveProvider) {
         setPanelRow(row, text, GREEN_COLOR);
@@ -22607,7 +22873,10 @@ function renderProviderEditorBuffer() {
   for (let i = 0; i < fields.length; i += 1) {
     const field = fields[i];
     const selected = i === providerEditorFieldIndex;
-    const value = String(providerEditorDraft[field.key] || "");
+    const rawValue = providerEditorDraft[field.key];
+    const value = field.bool
+      ? (rawValue === true ? "true" : "false")
+      : String(rawValue || "");
     const prefix = selected ? "> " : "  ";
     setPanelRow(blockTop + 2 + i, `${prefix}${field.label}: ${value}`, selected ? BLUE_COLOR : null);
   }
@@ -24284,12 +24553,23 @@ function runFormatSelfTest() {
       })() ||
       runtimeProfileFixture?.profileName !== "Vision Remote" ||
       runtimeProfileModelFixture !== "hidden/vision-model" ||
+      substituteImageDescriptions("see [Image #1] now", new Map([[1, "a cat"]])) !==
+        "see <image#1>a cat</image> now" ||
+      substituteImageDescriptions("no images", new Map()) !== "no images" ||
+      modelSupportsImageInput("self-test") !== false ||
       formatMaxOutputTokens(16384) !== "16k" ||
       formatMaxOutputTokens(393216) !== "384k" ||
       normalizeLlmMaxOutputTokens(393216) !== 393216 ||
       capitalizeSettingLabel("external thinking") !== "External thinking" ||
       normalizeVoiceMode("hands-free") !== "hands-free" ||
       normalizeVoiceMode("bogus") !== "ptt" ||
+      !PROVIDER_BOOL_FIELDS.has("has_image_input") ||
+      !PROVIDER_BOOL_FIELDS.has("has_video_input") ||
+      !PROVIDER_BOOL_FIELDS.has("has_audio_input") ||
+      !PROVIDER_BOOL_FIELDS.has("has_file_input") ||
+      getProviderEditorFields().length !== 8 ||
+      normalizeProviderEntry({ name: "P", has_image_input: false }).has_image_input !== false ||
+      normalizeProviderEntry({ name: "P", has_audio_input: false }).has_audio_input !== false ||
       normalizeTtsVoice("af_bella") !== "af_bella" ||
       normalizeTtsVoice("bad voice") !== "af_bella" ||
       normalizeTtsSpeed(1.1) !== 1.1 ||
@@ -29111,6 +29391,24 @@ process.stdin.on("keypress", async (str, key) => {
       return;
     }
 
+    const currentField = getProviderEditorFields()[providerEditorFieldIndex] || getProviderEditorFields()[0];
+    const isBoolField = PROVIDER_BOOL_FIELDS.has(currentField.key);
+    if (isBoolField) {
+      const toggled =
+        key?.name === "left" ||
+        key?.name === "right" ||
+        key?.sequence === " " ||
+        key?.sequence === "\u0020";
+      if (toggled) {
+        providerEditorDraft[currentField.key] = providerEditorDraft[currentField.key] !== true;
+        markDirty();
+        renderFrame(true);
+        return;
+      }
+      // Ignore text typing on bool fields.
+      return;
+    }
+
     if (!key?.meta && str && !str.startsWith("\u001b")) {
       if (shouldBlockPastedInput(str)) {
         return;
@@ -29486,13 +29784,16 @@ process.stdin.on("keypress", async (str, key) => {
         renderFrame(true);
         return;
       }
-      const result = await dispatchNamedAgentTask(targetAgent, trimmedInput);
+      const agentTaskText = String(trimmedInput || "");
+      const agentModelId = getActiveSessionModel();
+      const agentDescribed = await ensureImagesDescribedForText(agentTaskText, agentModelId);
+      const result = await dispatchNamedAgentTask(targetAgent, agentDescribed.text);
       if (!result.ok) {
         agentsMessage = result.error || "Could not submit the agent task";
       } else if (result.queued) {
         agentsMessage = `Queued for ${targetAgent}`;
         // Main-style queued indicator above the input while the agent is busy.
-        addNamedAgentQueuedPrompt(targetAgent, trimmedInput);
+        addNamedAgentQueuedPrompt(targetAgent, agentDescribed.text);
       } else {
         agentsMessage = "";
       }
