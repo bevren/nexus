@@ -140,6 +140,27 @@ def _active_provider() -> dict:
     return providers[0] if providers else {}
 
 
+def _resolve_entry_provider(entry: dict) -> dict:
+    """Resolve the provider for a subagent record.
+
+    Prefers the record's ``provider_name`` (set by the TUI when the runtime
+    "model" setting names a saved provider profile) so per-agent requests go
+    to that provider. Falls back to the global active provider.
+    """
+    provider_name = str(entry.get("provider_name") or "").strip()
+    if provider_name:
+        try:
+            if _nexus_providers_path().exists():
+                providers = json.loads(_nexus_providers_path().read_text(encoding="utf-8"))
+                if isinstance(providers, list):
+                    for p in providers:
+                        if str(p.get("name") or "").strip() == provider_name:
+                            return p
+        except Exception:
+            pass
+    return _active_provider()
+
+
 def configure_agent_runtime(
     system_prompt: str,
     model: str = "",
@@ -888,7 +909,7 @@ def _subagent_worker(entry: dict, on_update=None, job_path=None) -> None:
     entry["pid"] = os.getpid()
     notify(entry)
     try:
-        provider = _active_provider()
+        provider = _resolve_entry_provider(entry)
         entry["url"] = (provider.get("base_url") or "").rstrip("/")
         entry["api_key"] = provider.get("api_key") or ""
         if os.environ.get("NEXUS_SUBAGENT_SELF_TEST") == "1":

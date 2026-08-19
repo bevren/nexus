@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import math
 import os
+import queue
+import struct
 from pathlib import Path
 import re
 import signal
@@ -47,22 +49,43 @@ def _emit_voice_capture_event(event: str, **payload) -> None:
     print(json.dumps({"event": event, **payload}, ensure_ascii=False), flush=True)
 
 
-def _run_voice_capture_helper(temp_directory: str, parent_pid: int) -> int:
-    """Hold-to-talk Alt dictation using the default Windows microphone.
+def _build_wav_pcm(data: bytes, sample_rate: int = 16000) -> bytes:
+    """Wrap raw 16-bit mono PCM into a RIFF/WAVE container."""
+    block_align = 2
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        36 + len(data),
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,  # WAVE_FORMAT_PCM
+        1,  # mono
+        sample_rate,
+        sample_rate * block_align,
+        block_align,
+        16,  # bits per sample
+        b"data",
+        len(data),
+    )
+    return header + data
 
-    While Alt is held, audio is captured through the waveform API and every
-    ~1.2s the partial recording is snapshotted to a WAV file. Each snapshot is
-    emitted as an ``interim_snapshot`` event so the parent TUI can stream live
-    transcripts into the input box. Releasing Alt saves the full WAV and emits
-    ``recording_stopped``; a non-modifier chord while holding Alt cancels.
+
+_WINMM_RECORDER_CLASS = None
+
+
+def _winmm_recorder_class():
+    """Lazily build the WinMM-based WaveRecorder class (Windows only).
+
+    Both the push-to-talk helper and the voice engine share one capture
+    implementation; ctypes structures are built once and cached.
     """
-    if os.name != "nt":
-        _emit_voice_capture_event("unavailable", error="push-to-talk is currently supported on Windows")
-        return 1
+    global _WINMM_RECORDER_CLASS
+    if _WINMM_RECORDER_CLASS is not None:
+        return _WINMM_RECORDER_CLASS
 
     import ctypes
-    import math
-    import struct
+    import math as _math
 
     WAVE_FORMAT_PCM = 1
     WAVE_MAPPER = 0xFFFFFFFF
@@ -74,27 +97,15 @@ def _run_voice_capture_helper(temp_directory: str, parent_pid: int) -> int:
     SAMPLE_RATE = 16000
     BUFFER_BYTES = 8192
     BUFFER_COUNT = 4
-    INTERIM_INTERVAL_S = 0.8
-    MAX_RECORDING_S = 300.0
-    SILENCE_RMS = 260
-    SILENCE_FINALIZE_S = 0.9
-    RMS_WINDOW_BYTES = 16000
 
-    target_dir = Path(temp_directory).resolve()
-    target_dir.mkdir(parents=True, exist_ok=True)
-    user32 = ctypes.WinDLL("user32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     winmm = ctypes.WinDLL("winmm", use_last_error=True)
-    user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
-    user32.GetAsyncKeyState.restype = ctypes.c_short
-    kernel32.OpenProcess.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_uint]
-    kernel32.OpenProcess.restype = ctypes.c_void_p
-    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-    kernel32.WaitForSingleObject.restype = ctypes.c_uint
-    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    kernel32.CloseHandle.restype = ctypes.c_int
     kernel32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p]
     kernel32.CreateEventW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint
 
     class WAVEFORMATEX(ctypes.Structure):
         _fields_ = [
@@ -120,12 +131,8 @@ def _run_voice_capture_helper(temp_directory: str, parent_pid: int) -> int:
         ]
 
     winmm.waveInOpen.argtypes = [
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.c_uint,
-        ctypes.POINTER(WAVEFORMATEX),
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_uint,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint,
+        ctypes.POINTER(WAVEFORMATEX), ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
     ]
     winmm.waveInOpen.restype = ctypes.c_uint
     winmm.waveInPrepareHeader.argtypes = [ctypes.c_void_p, ctypes.POINTER(WAVEHDR), ctypes.c_uint]
@@ -140,26 +147,6 @@ def _run_voice_capture_helper(temp_directory: str, parent_pid: int) -> int:
     winmm.waveInReset.restype = ctypes.c_uint
     winmm.waveInClose.argtypes = [ctypes.c_void_p]
     winmm.waveInClose.restype = ctypes.c_uint
-
-    def build_wav(data: bytes) -> bytes:
-        block_align = 2
-        header = struct.pack(
-            "<4sI4s4sIHHIIHH4sI",
-            b"RIFF",
-            36 + len(data),
-            b"WAVE",
-            b"fmt ",
-            16,
-            WAVE_FORMAT_PCM,
-            1,
-            SAMPLE_RATE,
-            SAMPLE_RATE * block_align,
-            block_align,
-            16,
-            b"data",
-            len(data),
-        )
-        return header + data
 
     class WaveRecorder:
         def __init__(self) -> None:
@@ -183,12 +170,8 @@ def _run_voice_capture_helper(temp_directory: str, parent_pid: int) -> int:
             if not self.event_handle:
                 raise RuntimeError("CreateEventW failed")
             error_code = winmm.waveInOpen(
-                ctypes.byref(self.handle),
-                WAVE_MAPPER,
-                ctypes.byref(format_ex),
-                self.event_handle,
-                0,
-                CALLBACK_EVENT,
+                ctypes.byref(self.handle), WAVE_MAPPER, ctypes.byref(format_ex),
+                self.event_handle, 0, CALLBACK_EVENT,
             )
             if error_code != MMSYSERR_NOERROR:
                 raise RuntimeError(f"waveInOpen failed (0x{error_code:x})")
@@ -197,14 +180,10 @@ def _run_voice_capture_helper(temp_directory: str, parent_pid: int) -> int:
                 header = WAVEHDR()
                 header.lpData = ctypes.cast(raw, ctypes.POINTER(ctypes.c_char))
                 header.dwBufferLength = BUFFER_BYTES
-                error_code = winmm.waveInPrepareHeader(
-                    self.handle, ctypes.byref(header), ctypes.sizeof(WAVEHDR)
-                )
+                error_code = winmm.waveInPrepareHeader(self.handle, ctypes.byref(header), ctypes.sizeof(WAVEHDR))
                 if error_code != MMSYSERR_NOERROR:
                     raise RuntimeError(f"waveInPrepareHeader failed (0x{error_code:x})")
-                error_code = winmm.waveInAddBuffer(
-                    self.handle, ctypes.byref(header), ctypes.sizeof(WAVEHDR)
-                )
+                error_code = winmm.waveInAddBuffer(self.handle, ctypes.byref(header), ctypes.sizeof(WAVEHDR))
                 if error_code != MMSYSERR_NOERROR:
                     raise RuntimeError(f"waveInAddBuffer failed (0x{error_code:x})")
                 self.buffers.append((raw, header))
@@ -240,21 +219,15 @@ def _run_voice_capture_helper(temp_directory: str, parent_pid: int) -> int:
                     winmm.waveInPrepareHeader(self.handle, ctypes.byref(header), ctypes.sizeof(WAVEHDR))
                     winmm.waveInAddBuffer(self.handle, ctypes.byref(header), ctypes.sizeof(WAVEHDR))
                 except Exception:
-                    # A transient winmm/ctypes error on one buffer must not
-                    # kill the capture thread; the next drain retries.
                     pass
 
-        def write_snapshot(self, path, start_byte: int = 0) -> int:
+        def write_snapshot(self, path, start_byte: int = 0, end_byte: int = -1) -> int:
             with self.data_lock:
                 data = bytes(self.data[start_byte:])
                 total = len(self.data)
-            path = Path(path)
-            if data:
-                path.write_bytes(build_wav(data))
-            else:
-                # Emit empty WAV so the parent can validate path + plumbing
-                # even when no audio arrived yet.
-                path.write_bytes(build_wav(b""))
+            if end_byte is not None and end_byte >= 0:
+                data = data[: max(0, end_byte - start_byte)]
+            Path(path).write_bytes(_build_wav_pcm(data))
             return total
 
         def full_data(self) -> bytes:
@@ -274,11 +247,9 @@ def _run_voice_capture_helper(temp_directory: str, parent_pid: int) -> int:
                 return 0.0
             count = len(data) // block_align
             samples = struct.unpack(f"<{count}h", data)
-            return math.sqrt(sum(sample * sample for sample in samples) / count)
+            return _math.sqrt(sum(sample * sample for sample in samples) / count)
 
         def stop(self, path) -> int:
-            # Never raise: even if winmm teardown misbehaves, the recording
-            # must be written so the parent can transcribe it.
             self.stop_event.set()
             if self.thread:
                 self.thread.join(timeout=1.0)
@@ -291,7 +262,7 @@ def _run_voice_capture_helper(temp_directory: str, parent_pid: int) -> int:
                 data = bytes(self.data)
             if path is not None:
                 try:
-                    Path(path).write_bytes(build_wav(data))
+                    Path(path).write_bytes(_build_wav_pcm(data))
                 except Exception:
                     pass
             try:
@@ -313,6 +284,1052 @@ def _run_voice_capture_helper(temp_directory: str, parent_pid: int) -> int:
                 except Exception:
                     pass
             return total
+
+    _WINMM_RECORDER_CLASS = WaveRecorder
+    return WaveRecorder
+
+
+# ---------------------------------------------------------------------------
+# Voice engine: continuous capture with an optional VAD / wake-word / TTS
+# pipeline. Pure state-machine + audio helpers live at module level so the
+# self-test can exercise them without a microphone or model files; the
+# Windows-only capture loop (--voice-engine) drives them.
+# ---------------------------------------------------------------------------
+
+_VOICE_SAMPLE_RATE = 16000
+_VOICE_FRAME_BYTES = 640  # 20ms of 16 kHz 16-bit mono
+_VOICE_PRE_ROLL_MS = 300  # keep 300ms of audio before speech onset
+_VOICE_SILENCE_FINALIZE_MS = 900
+_VOICE_WAKE_DEBOUNCE_MS = 1500
+
+
+_VOICE_SYMBOL_WORDS = [
+    # Ordered longest-first so arrow/link operators win over single symbols.
+    ("->", " to "),
+    ("=>", " to "),
+    ("\u2192", " to "),   # →
+    ("\u2014", " "),      # em dash
+    ("\u2013", " "),      # en dash
+    ("&", " and "),
+    ("%", " percent "),
+    ("+", " plus "),
+    ("#", " number "),
+    ("@", " at "),
+    ("\u00d7", " times "),   # ×
+    ("\u00b7", " "),         # ·
+    ("\u2026", " ..."),      # …
+]
+
+
+def _voice_clean_for_speech(text: str) -> str:
+    """Convert assistant text into speaker-friendly prose.
+
+    Reads text the way people speak it instead of the way espeak-ng would read
+    raw syntax: expands symbols to words, drops code/URLs/email/paths, reads
+    dotted identifiers as "dot", expands units and currency, strips bullets,
+    quotes, emoji, and collapses whitespace. Parenthesized *content* is kept.
+    """
+    import re as _re
+
+    source = str(text or "").strip()
+    if not source:
+        return ""
+    # Remove fenced + inline code so we never read code aloud.
+    source = _re.sub(r"```.*?```", " ", source, flags=_re.S)
+    source = _re.sub(r"`[^`]*`", " ", source)
+    # Markdown links: keep the label, drop the URL.
+    source = _re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", source)
+    # Bare URLs, emails, and www tokens.
+    source = _re.sub(r"https?://\S+", " ", source, flags=_re.I)
+    source = _re.sub(r"www\.\S+", " ", source, flags=_re.I)
+    source = _re.sub(r"[\w.+-]+@[\w-]+\.[\w.-]+", " ", source)
+    # Symbol -> word expansions (arrows first).
+    for symbol, word in _VOICE_SYMBOL_WORDS:
+        source = source.replace(symbol, word)
+    # Comparison operators. Longest-first so "!=" is consumed before "=="
+    # matches its "=", and ">=" before ">".
+    source = source.replace("!=", " not equal to ")
+    source = source.replace(">=", " greater than or equal to ")
+    source = source.replace("<=", " less than or equal to ")
+    source = source.replace("==", " equals ")
+    source = source.replace(">", " greater than ")
+    source = source.replace("<", " less than ")
+    # Ranges read as "to": 3-4 -> "3 to 4".
+    source = _re.sub(r"(\d)\s*-\s*(\d)", r"\1 to \2", source)
+    # Currency: $5 / euro / pound -> "5 dollars/euros/pounds" (unit after
+    # the number; the decimal is expanded later).
+    source = _re.sub(r"[$]\s*(\d+(?:[.,]\d+)?)", r"\1 dollars ", source)
+    source = _re.sub(r"[\u20ac]\s*(\d+(?:[.,]\d+)?)", r"\1 euros ", source)
+    source = _re.sub(r"[\u00a3]\s*(\d+(?:[.,]\d+)?)", r"\1 pounds ", source)
+    # Data-size units -> words.
+    source = _re.sub(
+    r"(?i)\b(\d+)\s*(MB|GB|KB|TB)\b",
+    lambda m: f"{m.group(1)} "
+              f"{ {'MB': 'megabytes', 'GB': 'gigabytes', 'KB': 'kilobytes', 'TB': 'terabytes'}[m.group(2).upper()] }",
+        source,
+    )
+    source = _re.sub(r"(\d+)\s*ms\b", r"\1 milliseconds ", source, flags=_re.I)
+    _FREQ_UNIT_WORDS = {"GHZ": "gigahertz", "MHZ": "megahertz"}
+    source = _re.sub(
+        r"(\d+(?:\.\d+)?)\s*(GHz|MHz)\b",
+        lambda m: f"{m.group(1)} {_FREQ_UNIT_WORDS.get(m.group(2).upper(), m.group(2).lower())} ",
+        source,
+        flags=_re.I,
+    )
+    source = _re.sub(r"(\d+)\s*[\u00b0C]\b", r"\1 degrees celsius ", source)
+    # Versions and decimals: 3.14 -> "3 point 1 4"; v1.2.3 -> "v 1 point 2 point 3".
+    source = _re.sub(
+        r"\b(\d+)\.(\d+)(?:\.(\d+))?\b",
+        lambda m: f"{m.group(1)} point {m.group(2)}" + (f" point {m.group(3)}" if m.group(3) else ""),
+        source,
+    )
+    # Dotted identifiers / file names: index.js -> "index dot js".
+    source = _re.sub(r"\b([A-Za-z]\w*)\.([A-Za-z]\w*)\b", r"\1 dot \2", source)
+    # Paths: C:\Users\x and C:/Users/x -> separators read as "slash".
+    source = _re.sub(r"\b([A-Za-z]):(?=[\\/])", r"\1", source)  # drive letter colon
+    source = source.replace("\\", " slash ")
+    source = _re.sub(r"(?<=[A-Za-z0-9])/(?=[A-Za-z0-9])", " slash ", source)
+    # Strip paren/bracket/brace markers (keep inner text), quotes.
+    source = _re.sub(r"[()\[\]{}]", " ", source)
+    source = _re.sub(
+        r'["\'`\u2018\u2019\u201c\u201d]',
+        " ",
+        source,
+    )
+    # Markdown decorators and separators.
+    source = _re.sub(r"[#>*_~|^]", " ", source)
+    # Bullets and numbered-list markers at start of lines.
+    source = _re.sub(r"(^|\n)\s*(?:[-*\u2022]|\d+[.)])\s+", r"\1", source)
+    # Thousands separators: 1,000 -> 1000 (read as "one thousand").
+    source = _re.sub(r"(?<=\d),(?=\d)", "", source)
+    # Emoji and misc symbols.
+    source = _re.sub(
+        "[\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F\u2190-\u21FF\u2000-\u206F]",
+        " ",
+        source,
+    )
+    # Collapse whitespace.
+    source = _re.sub(r"\s+", " ", source).strip()
+    return source
+def _compact_speech_text(text: str, max_chars: int) -> str:
+    """Truncate spoken text at a sentence boundary.
+
+    Keeps the reply short and natural ("no wall of text"): when the cleaned
+    text exceeds ``max_chars`` it is cut at the last sentence ending before
+    the limit and an ellipsis is appended. ``max_chars <= 0`` disables the cap.
+    """
+    source = str(text or "").strip()
+    if not source or max_chars <= 0 or len(source) <= max_chars:
+        return source
+    head = source[:max_chars]
+    boundary = max(head.rfind(". "), head.rfind("! "), head.rfind("? "))
+    if boundary >= max_chars * 0.4:
+        return head[: boundary + 1].rstrip() + " ..."
+    return head.rstrip() + " ..."
+
+
+def _split_voice_sentences(text: str, max_chars: int = 400, total_max_chars: int = 0) -> list[str]:
+    """Split prose into sentence-sized chunks for streaming TTS.
+
+    Cleans the text for speech (``_voice_clean_for_speech``), optionally
+    compacts it to ``total_max_chars``, and keeps chunks under ``max_chars``.
+    Used by both the Kokoro path and the provider fallback so chunking is
+    tested once.
+    """
+    import re as _re
+
+    source = _voice_clean_for_speech(text)
+    if not source:
+        return []
+    if total_max_chars > 0:
+        source = _compact_speech_text(source, total_max_chars)
+    if not source:
+        return []
+
+    # Split on sentence boundaries, keeping short sentences grouped.
+    parts = _re.split(r"(?<=[.!?])\s+", source)
+    chunks: list[str] = []
+    current = ""
+    for part in parts:
+        candidate = f"{current} {part}".strip() if current else part
+        if len(candidate) > max_chars and current:
+            chunks.append(current)
+            current = part
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return [chunk for chunk in chunks if chunk]
+
+
+def _frame_rms(frame: bytes) -> float:
+    """RMS (linear) of one 16-bit mono PCM frame."""
+    import math as _math
+
+    if len(frame) < 2:
+        return 0.0
+    count = len(frame) // 2
+    samples = struct.unpack(f"<{count}h", frame[: count * 2])
+    return _math.sqrt(sum(sample * sample for sample in samples) / count) if count else 0.0
+
+
+class _AdaptiveBargeDetector:
+    """Adaptive speech detector used ONLY while TTS is playing.
+
+    Fixed amplitude thresholds cannot work here: TTS playback through speakers
+    reaches the mic at a level that varies with volume, distance, and room. So
+    this detector tracks a rolling ambient floor (the TTS echo) and triggers a
+    barge-in only when the incoming audio is sustained well above that floor -
+    a person talking into the mic is typically 6-20dB louder than the echo.
+
+    ``margin_ratio`` (default 2.2 ~ 7dB) and ``confirm_frames`` (default 8 =
+    160ms of continuous speech) make it robust: brief TTS syllables near the
+    floor cannot confirm, but real speech does.
+    """
+
+    def __init__(
+        self,
+        margin_ratio: float = 2.2,
+        confirm_frames: int = 8,
+        ambient_alpha: float = 0.05,
+        min_ambient: float = 40.0,
+    ) -> None:
+        self.margin_ratio = max(1.2, margin_ratio)
+        self.confirm_frames = max(2, confirm_frames)
+        self.ambient_alpha = max(0.01, min(0.2, ambient_alpha))
+        self.min_ambient = max(10.0, min_ambient)
+        self.ambient = None
+        self.loud_run = 0
+
+    def reset(self) -> None:
+        self.ambient = None
+        self.loud_run = 0
+
+    def feed(self, frame: bytes, ms: float) -> bool:
+        rms = _frame_rms(frame)
+        if self.ambient is None:
+            self.ambient = max(rms, self.min_ambient)
+        else:
+            # Track the floor with a slow EMA. Cap each sample at 1.5x ambient
+            # so a loud burst (user speech) cannot inflate the floor before it
+            # triggers; the floor mostly follows the steady TTS echo.
+            self.ambient = self.ambient * (1 - self.ambient_alpha) + (
+                min(rms, self.ambient * 1.5) if rms > self.ambient else rms
+            ) * self.ambient_alpha
+        threshold = max(self.min_ambient * self.margin_ratio, self.ambient * self.margin_ratio)
+        if rms >= threshold:
+            self.loud_run += 1
+            if self.loud_run >= self.confirm_frames:
+                self.loud_run = 0
+                return True
+        else:
+            # Tolerate brief dips inside a loud run.
+            self.loud_run = max(0, self.loud_run - 1)
+        return False
+
+
+class _FrameVadGate:
+    """RMS-based speech gate used by the voice engine.
+
+    Silero (onnxruntime) is the preferred detector; when the model file is
+    missing the engine falls back to this gate so hands-free capture still
+    works. A ring buffer keeps the pre-roll audio before speech onset.
+    """
+
+    def __init__(
+        self,
+        rms_threshold: float = 200.0,
+        silence_finalize_ms: int = _VOICE_SILENCE_FINALIZE_MS,
+        onset_confirmation_frames: int = 2,
+    ) -> None:
+        self.rms_threshold = rms_threshold
+        self.silence_finalize_ms = silence_finalize_ms
+        self.onset_confirmation_frames = max(1, onset_confirmation_frames)
+        self.speaking = False
+        self.last_speech_ms = 0.0
+        self.loud_frames = 0
+        self.pre_roll_bytes = int(_VOICE_SAMPLE_RATE * 2 * (_VOICE_PRE_ROLL_MS / 1000))
+        self._pre_roll = bytearray()
+
+    def feed(self, frame: bytes, ms: float) -> tuple[bool, bool]:
+        """Feed one 20ms audio frame; returns (speech_started, speech_ended).
+
+        Speech onset requires a few consecutive loud frames (20ms each) so a
+        single noise spike cannot false-start an utterance.
+        """
+        import math as _math
+
+        self._pre_roll.extend(frame)
+        if len(self._pre_roll) > self.pre_roll_bytes:
+            del self._pre_roll[: len(self._pre_roll) - self.pre_roll_bytes]
+        if len(frame) < 2:
+            return False, False
+        count = len(frame) // 2
+        samples = struct.unpack(f"<{count}h", frame[: count * 2])
+        rms = _math.sqrt(sum(sample * sample for sample in samples) / count) if count else 0.0
+        is_speech = rms >= self.rms_threshold
+        started = False
+        ended = False
+        if is_speech:
+            self.last_speech_ms = ms
+            self.loud_frames += 1
+            if not self.speaking and self.loud_frames >= self.onset_confirmation_frames:
+                self.speaking = True
+                started = True
+        else:
+            # A brief dip is tolerated while speaking; long silence ends it.
+            self.loud_frames = 0
+            if self.speaking and (ms - self.last_speech_ms) >= self.silence_finalize_ms:
+                self.speaking = False
+                ended = True
+        return started, ended
+
+    def pre_roll(self) -> bytes:
+        return bytes(self._pre_roll)
+
+
+class _SileroVadGate(_FrameVadGate):
+    """Optional Silero VAD over onnxruntime; falls back to RMS when unavailable."""
+
+    def __init__(self, model_path=None, rms_threshold: float = 260.0):
+        super().__init__(rms_threshold=rms_threshold)
+        self.model = None
+        self.session = None
+        if model_path:
+            try:
+                import onnxruntime as ort
+
+                self.session = ort.InferenceSession(
+                    str(model_path), providers=["CPUExecutionProvider"]
+                )
+                self.model = True
+            except Exception:
+                self.model = None
+
+    def feed(self, frame: bytes, ms: float) -> tuple[bool, bool]:
+        if self.session is None:
+            return super().feed(frame, ms)
+        try:
+            import numpy as np
+
+            samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32768.0
+            # Silero expects a single 16 kHz frame; model.onnx output is
+            # [batch,1] probability.
+            result = self.session.run(None, {self.session.get_inputs()[0].name: samples[None, :]})
+            prob = float(result[0].flat[0]) if len(result) and result[0] is not None else 0.0
+            is_speech = prob >= 0.5
+            started = False
+            ended = False
+            if is_speech:
+                self.last_speech_ms = ms
+                if not self.speaking:
+                    self.speaking = True
+                    started = True
+            elif self.speaking and (ms - self.last_speech_ms) >= self.silence_finalize_ms:
+                self.speaking = False
+                ended = True
+            self._pre_roll.extend(frame)
+            if len(self._pre_roll) > self.pre_roll_bytes:
+                del self._pre_roll[: len(self._pre_roll) - self.pre_roll_bytes]
+            return started, ended
+        except Exception:
+            return super().feed(frame, ms)
+
+
+def _chunk_audio_for_vad(audio: bytes, frame_bytes: int = _VOICE_FRAME_BYTES):
+    """Yield 20ms frames from raw PCM (test helper)."""
+    frame_bytes = frame_bytes - (frame_bytes % 2)
+    for i in range(0, len(audio) - frame_bytes + 1, frame_bytes):
+        yield audio[i : i + frame_bytes]
+
+
+_TTS_PLAY_LOCK = threading.Lock()
+_TTS_PLAY_HANDLE = None  # winsound PlaySound handle; None when idle
+
+
+# Global flag the play loop polls; set by _tts_stop_playback so a chunked
+# play exits within ~50ms instead of finishing the whole file.
+_TTS_STOP_FLAG = threading.Event()
+_TTS_PLAY_HANDLE = None
+
+
+def _tts_stop_playback() -> None:
+    """Immediately stop any currently playing TTS audio.
+
+    Sets the chunked-play stop flag and calls SND_PURGE (which reliably stops
+    SND_ASYNC playback). The chunked player checks the flag between ~50ms
+    chunks, so a barge-in stops the current sentence almost instantly.
+    """
+    _TTS_STOP_FLAG.set()
+    try:
+        import winsound
+
+        winsound.PlaySound(None, winsound.SND_PURGE)
+    except Exception:
+        pass
+
+
+def _tts_play_wav(path: str, timeout: float = 60.0) -> bool:
+    """Play a WAV file on Windows via winsound, stopping promptly on demand.
+
+    Plays the WHOLE file asynchronously with SND_FILENAME|SND_ASYNC (a complete
+    WAV, so audio is always correct) and then waits its real duration while
+    polling the stop flag every 30ms. On barge-in, _tts_stop_playback sets the
+    flag and SND_PURGE stops the async playback immediately, so the current
+    sentence cuts off within ~30ms instead of running to its end.
+    """
+    if os.name != "nt" or not path or not os.path.exists(path):
+        return False
+    try:
+        import winsound
+        import wave as _wave
+
+        with _wave.open(path, "rb") as wav:
+            duration_s = wav.getnframes() / max(1, wav.getframerate())
+        _TTS_STOP_FLAG.clear()
+        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        deadline = time.monotonic() + max(0.1, min(float(timeout), duration_s + 1.0))
+        while time.monotonic() < deadline:
+            if _TTS_STOP_FLAG.is_set():
+                winsound.PlaySound(None, winsound.SND_PURGE)
+                _TTS_STOP_FLAG.clear()
+                break
+            time.sleep(0.03)
+        return True
+    except Exception:
+        _TTS_STOP_FLAG.clear()
+        return False
+
+
+_TURKISH_VOICE = "tf_nisan"
+
+
+def _voice_profile(voice: str) -> dict:
+    """Resolve a voice id to (model, voices, vocab, espeak lang, voice id).
+
+    tf_nisan is the Turkish Kokoro-82M fine-tune (duxx/kikiri_turkish_nisanONNX)
+    stored under ~/.nexus/voice/kikiri/; it needs its own ONNX model, voicepack,
+    character vocab (base 114 + '$'), and espeak-ng Turkish phonemization.
+    Everything else uses the default English Kokoro model.
+    """
+    voice = str(voice or "af_heart").strip()
+    if voice == _TURKISH_VOICE:
+        kikiri = NEXUS_DIR / "voice" / "kikiri"
+        return {
+            "model": str(kikiri / "model.onnx"),
+            # kokoro-onnx np.load expects an .npz dict of {voice: (510,1,256)};
+            # the repo ships a raw float32 blob, so we convert it once.
+            "voices": str(kikiri / "voices.npz"),
+            "tokenizer": str(kikiri / "tokenizer.json"),
+            "lang": "tr",
+            "voice": "tf_nisan",
+        }
+    return {
+        "model": str(NEXUS_DIR / "voice" / "kokoro-v1.0.onnx"),
+        "voices": str(NEXUS_DIR / "voice" / "voices-v1.0.bin"),
+        "tokenizer": "",
+        "lang": "en-us",
+        "voice": voice,
+    }
+
+
+def _load_kokoro(voice: str):
+    """Load the Kokoro instance for a voice, applying the custom vocab + espeak
+    lang when the voice needs them (Turkish fine-tune)."""
+    from kokoro_onnx import Kokoro
+
+    profile = _voice_profile(voice)
+    if not os.path.exists(profile["model"]):
+        raise FileNotFoundError(
+            f"model files for voice {voice} missing. Run /voice-setup or download them into ~/.nexus/voice/."
+        )
+    if voice == _TURKISH_VOICE:
+        # The Turkish repo ships the voice as a raw float32 blob (510*256);
+        # convert it to the .npz dict kokoro-onnx expects, once.
+        voices_npz = os.path.join(NEXUS_DIR, "voice", "kikiri", "voices.npz")
+        raw_bin = os.path.join(NEXUS_DIR, "voice", "kikiri", "tf_nisan.bin")
+        if not os.path.exists(voices_npz):
+            if not os.path.exists(raw_bin):
+                raise FileNotFoundError("Turkish voice tf_nisan.bin is missing")
+            import numpy as _np
+
+            arr = _np.frombuffer(open(raw_bin, "rb").read(), dtype=_np.float32)
+            total = arr.size
+            if total != 510 * 256:
+                raise ValueError(f"tf_nisan.bin has {total} floats, expected 510*256")
+            _np.savez(voices_npz, tf_nisan=arr.reshape(510, 1, 256))
+        profile["voices"] = voices_npz
+    if not os.path.exists(profile["voices"]):
+        raise FileNotFoundError(
+            f"voicepack for {voice} missing. Run /voice-setup or download it into ~/.nexus/voice/."
+        )
+    vocab_config = None
+    if profile["tokenizer"] and os.path.exists(profile["tokenizer"]):
+        import json as _json
+
+        with open(profile["tokenizer"], encoding="utf-8") as fp:
+            vocab_config = {"vocab": _json.load(fp)["model"]["vocab"]}
+    return Kokoro(
+        profile["model"],
+        profile["voices"],
+        vocab_config=vocab_config,
+    )
+
+
+def _tts_synthesize_kikiri(text: str, voice: str = "tf_nisan", speed: float = 1.0, out_path: str = "") -> dict:
+    """Synthesize Turkish text with the fine-tuned Kokoro model.
+
+    The Turkish ONNX export (duxx/kikiri_turkish_nisanONNX) uses an
+    ``input_ids``/``style``/``speed`` signature and a custom character
+    tokenizer, which kokoro-onnx's standard create() does not feed correctly
+    (it passes int32 speed and expects its own layout). Run the session
+    directly here.
+    """
+    if not text or not text.strip():
+        return {"ok": False, "error": "empty text"}
+    import tempfile as _tempfile
+    import json as _json
+
+    out_path = out_path or os.path.join(_tempfile.gettempdir(), f"nexus-tts-{int(time.time() * 1000)}.wav")
+    try:
+        import numpy as np
+        import onnxruntime as ort
+
+        kikiri = NEXUS_DIR / "voice" / "kikiri"
+        model_path = kikiri / "model.onnx"
+        tokenizer_path = kikiri / "tokenizer.json"
+        raw_voice = kikiri / "tf_nisan.bin"
+        if not (model_path.exists() and tokenizer_path.exists() and raw_voice.exists()):
+            return {"ok": False, "error": "Turkish voice files missing under ~/.nexus/voice/kikiri/"}
+        session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+
+        vocab = _json.load(open(tokenizer_path, encoding="utf-8"))["model"]["vocab"]
+
+        # Defensive: strip markdown/emoji/symbols before phonemizing so raw
+        # assistant text (e.g. **bold**, emoji, code) can never reach the
+        # model as literal characters (espeak-ng would spell them out).
+        text = _voice_clean_for_speech(text)
+
+        # Phonemize Turkish text with espeak-ng to IPA, exactly like the
+        # reference (node_kokoro_turkish_transformers): the model's vocab is
+        # IPA phonemes, NOT raw Turkish characters - so ö/ü/ı must become
+        # their IPA equivalents (ø/y/ɯ) or they are silently dropped.
+        def _phonemize_turkish(text_in: str) -> str:
+            # Force UTF-8 I/O: the engine can run under a non-UTF-8 locale
+            # (e.g. cp1254 on Windows), and phonemizer/espeak's IPA output
+            # (ɪ, ʊ, ø, ...) would otherwise fail to encode or get mangled.
+            try:
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+                sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+                os.environ["PYTHONIOENCODING"] = "utf-8"
+            except Exception:
+                pass
+            # Wire the bundled espeak-ng (shipped with kokoro-onnx) into
+            # phonemizer so "tr" works without a system-wide install.
+            try:
+                import espeakng_loader
+
+                from phonemizer.backend.espeak.wrapper import EspeakWrapper
+
+                data_path = espeakng_loader.get_data_path()
+                lib_path = espeakng_loader.get_library_path()
+                os.environ.setdefault("PHONEMIZER_ESPEAK_LIBRARY", lib_path)
+                os.environ.setdefault("PHONEMIZER_ESPEAK_PATH", data_path)
+                EspeakWrapper.set_data_path(data_path)
+                EspeakWrapper.set_library(lib_path)
+            except Exception:
+                pass
+            from phonemizer import phonemize
+
+            ipa = phonemize(
+                str(text_in),
+                "tr",
+                preserve_punctuation=True,
+                with_stress=False,
+            )
+            # Reference post-processing (node_kokoro_turkish_transformers):
+            # drop espeak's '_', map dark-l and palatal-j, collapse spaces.
+            ipa = ipa.replace("_", "").replace("\u026b", "l").replace("\u02b2", "j")
+            ipa = "".join(ch for ch in ipa if ch in vocab)
+            return " ".join(ipa.split()).strip()
+
+        phonemes = _phonemize_turkish(text)
+        if not phonemes:
+            return {"ok": False, "error": "phonemization produced no tokens"}
+        ids = [int(vocab[ch]) for ch in phonemes]
+        tokens = np.array([[0, *ids, 0]], dtype=np.int64)
+
+        # Voice: the fine-tune ships a raw float32 blob of 510*256 = the
+        # per-token style table; pick the row for the token count (reference:
+        # voiceRow = min(tokenCount, 509)).
+        voice_arr = np.frombuffer(raw_voice.read_bytes(), dtype=np.float32)
+        if voice_arr.size != 510 * 256:
+            return {"ok": False, "error": f"tf_nisan.bin size {voice_arr.size} != 510*256"}
+        voice_table = voice_arr.reshape(510, 256)
+        token_count = len(ids)
+        row = min(token_count, 509)
+        style = np.array(voice_table[row], dtype=np.float32).reshape(1, 256)
+
+        outputs = session.run(
+            None,
+            {
+                "input_ids": tokens,
+                "style": style,
+                "speed": np.array([float(speed)], dtype=np.float32),
+            },
+        )
+        audio = np.asarray(outputs[0], dtype=np.float32).flatten()
+        sample_rate = 24000
+        pcm = (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+        Path(out_path).write_bytes(_build_wav_pcm(pcm, sample_rate))
+        return {"ok": True, "path": out_path, "sample_rate": sample_rate}
+    except ImportError:
+        return {"ok": False, "error": "onnxruntime is not installed"}
+    except Exception as exc:
+        return {"ok": False, "error": f"kikiri tts failed: {exc}"}
+
+
+def _tts_synthesize_kokoro(
+    text: str,
+    voice: str = "af_heart",
+    speed: float = 1.0,
+    out_path: str = "",
+    kokoro=None,
+) -> dict:
+    """Synthesize text with kokoro-onnx into a WAV file.
+
+    Accepts an optional prebuilt ``Kokoro`` instance so the voice engine can
+    cache the 325MB model instead of re-loading it per sentence.
+
+    Returns {"ok": True, "path": ...} or {"ok": False, "error": ...}.
+    """
+    if not text or not text.strip():
+        return {"ok": False, "error": "empty text"}
+    import tempfile as _tempfile
+
+    out_path = out_path or os.path.join(_tempfile.gettempdir(), f"nexus-tts-{int(time.time() * 1000)}.wav")
+    try:
+        if voice == _TURKISH_VOICE:
+            # Turkish fine-tune has a different ONNX signature; use the
+            # dedicated inference path (ignores any preloaded English kokoro).
+            return _tts_synthesize_kikiri(text, voice=voice, speed=speed, out_path=out_path)
+        if kokoro is None:
+            kokoro = _load_kokoro(voice)
+        profile = _voice_profile(voice)
+        samples, sample_rate = kokoro.create(text, voice=profile["voice"], speed=speed, lang=profile["lang"])
+        try:
+            import numpy as np
+
+            pcm = (np.asarray(samples) * 32767.0).astype("<i2").tobytes()
+        except Exception:
+            import array as _array
+
+            pcm = _array.array("h", [int(max(-1, min(1, s)) * 32767) for s in samples]).tobytes()
+        Path(out_path).write_bytes(_build_wav_pcm(pcm, int(sample_rate)))
+        return {"ok": True, "path": out_path, "sample_rate": int(sample_rate)}
+    except ImportError:
+        return {"ok": False, "error": "kokoro-onnx is not installed. pip install kokoro-onnx"}
+    except Exception as exc:
+        return {"ok": False, "error": f"kokoro tts failed: {exc}"}
+
+
+def _tts_synthesize(text: str, voice: str = "", out_path: str = "") -> dict:
+    """TTS entry point: Kokoro first, then the provider fallback (provider is
+    invoked by the TUI via the media bridge when the helper reports no local
+    model). This function only implements the local path + chunking so the
+    engine can stream sentence-by-sentence."""
+    result = _tts_synthesize_kokoro(text, voice=voice, out_path=out_path)
+    if result.get("ok"):
+        return result
+    # Local model missing: return the actionable error; the TUI decides
+    # whether to fall back to a provider TTS model.
+    return result
+
+
+def _run_voice_engine_self_test() -> int:
+    """Offline checks for the voice engine's pure logic (no mic, no models)."""
+    out = print
+    try:
+        # Sentence splitting strips markdown and groups short sentences.
+        chunks = _split_voice_sentences(
+            "Hello **world**. Check ```python\nprint(1)\n``` now. [link](https://x) and done."
+        )
+        if not chunks or any("```" in c or "**" in c or "http" in c for c in chunks):
+            out("VOICE_FAIL: sentence splitter kept markdown")
+            return 1
+        if any(len(c) > 400 for c in chunks):
+            out("VOICE_FAIL: sentence chunk exceeded max_chars")
+            return 1
+        if _split_voice_sentences("```python\ncode only\n```") != []:
+            out("VOICE_FAIL: code-only text should produce no speech chunks")
+            return 1
+
+        # Speaker-friendly cleaning: symbols become words, parens/brackets/
+        # quotes/emoji are stripped, code and links are removed.
+        cleaned = _voice_clean_for_speech(
+            "Open (file) 1,000 times: 3-4 & 5% -> done! Path C:\\x \u2192 ok, "
+            "\u201cquoted\u201d #2 @ 3pm \u2705 use `os.path.join` 100%"
+        )
+        if any(symbol in cleaned for symbol in "()[]{}%&@#\u2192\u2705`"):
+            out(f"VOICE_FAIL: cleaner kept special characters: {cleaned!r}")
+            return 1
+        if "1000" not in cleaned or "3 to 4" not in cleaned or "and 5 percent" not in cleaned:
+            out(f"VOICE_FAIL: cleaner did not expand symbols: {cleaned!r}")
+            return 1
+        if "quoted" not in cleaned or "number 2" not in cleaned:
+            out(f"VOICE_FAIL: cleaner lost quoted content: {cleaned!r}")
+            return 1
+        # Units, currency, decimals, dotted identifiers, comparisons.
+        unit_clean = _voice_clean_for_speech(
+            "1.5GB and 200ms and 3.5GHz and 22C. Costs $5.99. "
+            "x != y and a >= b. index.js and C:/Users/x."
+        )
+        for expected in (
+            "gigabytes", "milliseconds", "gigahertz", "degrees celsius",
+            "5 point 99 dollars", "not equal to", "greater than or equal to",
+            "index dot js", "slash Users",
+        ):
+            if expected not in unit_clean:
+                out(f"VOICE_FAIL: cleaner unit/currency handling missing {expected!r}: {unit_clean!r}")
+                return 1
+        if "ghzhertz" in unit_clean or "ghz" in unit_clean:
+            out(f"VOICE_FAIL: cleaner produced a double unit: {unit_clean!r}")
+            return 1
+        # Barge-in: _tts_stop_playback must be callable without crashing.
+        _tts_stop_playback()
+        # Compaction: long text truncates at a sentence boundary with "...".
+        long_text = (
+            "This is a very long first sentence that keeps going and going "
+            "and going and going and going and going and going. Short second."
+        )
+        compacted = _compact_speech_text(long_text, 60)
+        if len(compacted) > 66 or not compacted.endswith("..."):
+            out(f"VOICE_FAIL: compaction did not cap at a sentence boundary: {compacted!r}")
+            return 1
+        if "Short second" in compacted:
+            out(f"VOICE_FAIL: compaction kept text past the cap: {compacted!r}")
+            return 1
+        if _compact_speech_text("Short text.", 0) != "Short text.":
+            out("VOICE_FAIL: max_chars=0 should disable compaction")
+            return 1
+
+        # VAD gate: silence frames stay silent, loud frames start speech,
+        # then a trailing silence window finalizes the utterance.
+        gate = _FrameVadGate(rms_threshold=260.0, silence_finalize_ms=900)
+        import math as _math
+
+        loud = struct.pack("<320h", *([3000] * 320))
+        quiet = struct.pack("<320h", *([0] * 320))
+        started = False
+        ended = False
+        for ms in range(0, 2000, 20):
+            s1, e1 = gate.feed(loud, float(ms))
+            started = started or s1
+            ended = ended or e1
+        if not started:
+            out("VOICE_FAIL: VAD gate did not detect speech onset")
+            return 1
+        for ms in range(2000, 3200, 20):
+            s2, e2 = gate.feed(quiet, float(ms))
+            ended = ended or e2
+        if not ended:
+            out("VOICE_FAIL: VAD gate did not finalize the utterance")
+            return 1
+        if not gate.speaking:
+            pass  # speaking flag resets after finalize; acceptable
+        # Onset confirmation: one loud frame must not false-start (noise
+        # spike), two consecutive loud frames must start speech.
+        confirm_gate = _FrameVadGate(rms_threshold=200.0, silence_finalize_ms=900, onset_confirmation_frames=2)
+        single_loud = confirm_gate.feed(loud, 10.0)
+        if single_loud[0]:
+            out("VOICE_FAIL: a single loud frame must not start speech")
+            return 1
+        second_loud = confirm_gate.feed(loud, 30.0)
+        if not second_loud[0]:
+            out("VOICE_FAIL: two loud frames should confirm speech onset")
+            return 1
+        # Adaptive barge detector (used while TTS plays): steady TTS echo at
+        # the mic must never trigger, but speech well above that floor
+        # (6-20dB louder, sustained 160ms) must.
+        echo = struct.pack("<320h", *([300] * 320))      # TTS echo at mic
+        speech = struct.pack("<320h", *([1000] * 320))   # ~10dB above echo
+        faint_speech = struct.pack("<320h", *([450] * 320))  # ~3.5dB above echo
+        barge = _AdaptiveBargeDetector()
+        barge_started = False
+        for ms in range(0, 3000, 20):
+            if barge.feed(echo, float(ms)):
+                barge_started = True
+                break
+        if barge_started:
+            out("VOICE_FAIL: steady TTS echo should never trigger the barge detector")
+            return 1
+        # A brief faint burst (a TTS syllable) must not confirm either.
+        barge2 = _AdaptiveBargeDetector()
+        barge_started2 = False
+        for ms in range(0, 300, 20):  # 300ms of faint burst
+            if barge2.feed(faint_speech, float(ms)):
+                barge_started2 = True
+                break
+        if barge_started2:
+            out("VOICE_FAIL: a faint brief burst should not trigger the barge detector")
+            return 1
+        # Real speech sustained above the echo triggers.
+        barge3 = _AdaptiveBargeDetector()
+        barge_started3 = False
+        for ms in range(0, 3000, 20):
+            frame = echo if ms < 600 else speech  # echo floor, then real speech
+            if barge3.feed(frame, float(ms)):
+                barge_started3 = True
+                break
+        if not barge_started3:
+            out("VOICE_FAIL: sustained speech above the echo should trigger the barge detector")
+            return 1
+        # Adaptivity: after the floor rises (louder TTS), the old speech level
+        # no longer triggers until speech exceeds the new floor.
+        barge4 = _AdaptiveBargeDetector()
+        for ms in range(0, 2000, 20):
+            barge4.feed(echo, float(ms))
+        barge_started4 = False
+        for ms in range(0, 1000, 20):
+            if barge4.feed(faint_speech, float(ms)):
+                barge_started4 = True
+                break
+        if barge_started4:
+            out("VOICE_FAIL: barge detector must adapt to a louder ambient floor")
+            return 1
+        pre_roll = gate.pre_roll()
+        if len(pre_roll) > _VOICE_SAMPLE_RATE * 2 * 2:
+            out("VOICE_FAIL: pre-roll ring buffer exceeded its cap")
+            return 1
+
+        # Wake-word scoring degrades to disabled without the lib.
+        if _wake_word_score(b"\x00" * 640, None) != 0.0:
+            out("VOICE_FAIL: wake-word scoring should be disabled without the lib")
+            return 1
+
+        # Frame chunker yields 20ms frames exactly.
+        frames = list(_chunk_audio_for_vad(b"\x00" * 6400))
+        if len(frames) != 10 or any(len(f) != 640 for f in frames):
+            out("VOICE_FAIL: VAD frame chunking is incorrect")
+            return 1
+
+        # Kokoro result contract: with models present a valid voice synthesizes
+        # a WAV; without them (or with a bad voice) the call returns an
+        # actionable error dict and never crashes.
+        model_present = (
+            (NEXUS_DIR / "voice" / "kokoro-v1.0.onnx").exists()
+            and (NEXUS_DIR / "voice" / "voices-v1.0.bin").exists()
+        )
+        if model_present:
+            good = _tts_synthesize("hello from the voice test", voice="af_heart")
+            if not good.get("ok") or not good.get("path") or not os.path.exists(good.get("path")):
+                out(f"VOICE_FAIL: kokoro synthesis failed with models present: {good}")
+                return 1
+            bad = _tts_synthesize("hello", voice="nope_none")
+            if bad.get("ok") or "error" not in bad:
+                out("VOICE_FAIL: invalid voice should return an error")
+                return 1
+        else:
+            result = _tts_synthesize("hello")
+            if result.get("ok"):
+                out("VOICE_FAIL: TTS should fail without model files")
+                return 1
+            if "error" not in result:
+                out("VOICE_FAIL: TTS missing-model result lacks an error")
+                return 1
+
+        # Voice-setup URL resolution: the fallback tag produces the expected
+        # model-files-v1.0 URLs without any network access.
+        urls = _voice_setup_download_urls()
+        if not urls.get("kokoro-v1.0.onnx") or "model-files-v1.0" not in urls["kokoro-v1.0.onnx"]:
+            out("VOICE_FAIL: voice-setup URL resolution is incorrect")
+            return 1
+        if not urls.get("voices-v1.0.bin"):
+            out("VOICE_FAIL: voice-setup missing voices URL")
+            return 1
+
+        out("VOICE_OK")
+        return 0
+    except Exception as exc:
+        out(f"VOICE_FAIL: {exc}")
+        return 1
+
+
+_VOICE_SETUP_MANIFEST = [
+    {
+        "name": "kokoro-v1.0.onnx",
+        "file": "kokoro-v1.0.onnx",
+        "size": 325_000_000,
+        "required": False,
+    },
+    {
+        "name": "voices-v1.0.bin",
+        "file": "voices-v1.0.bin",
+        "size": 2_100_000,
+        "required": False,
+    },
+]
+
+
+def _voice_setup_download_urls() -> dict:
+    """Resolve the latest Kokoro model-file release URLs from the GitHub API.
+
+    Falls back to the pinned ``model-files-v1.0`` tag when the API is
+    unreachable so the downloader never hard-fails on a transient network
+    error.
+    """
+    import urllib.error as _url_err
+    import urllib.request as _url_req
+
+    fallback_tag = "model-files-v1.0"
+    try:
+        req = _url_req.Request(
+            "https://api.github.com/repos/thewh1teagle/kokoro-onnx/releases/latest",
+            headers={"User-Agent": "nexus-voice-setup/1.0"},
+        )
+        with _url_req.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        tag = str(data.get("tag_name") or fallback_tag)
+        urls = {
+            str(asset.get("name")): str(asset.get("browser_download_url"))
+            for asset in data.get("assets", [])
+            if asset.get("name") and asset.get("browser_download_url")
+        }
+        if urls:
+            return urls
+        tag = fallback_tag
+    except Exception:
+        tag = fallback_tag
+    return {
+        "kokoro-v1.0.onnx": (
+            f"https://github.com/thewh1teagle/kokoro-onnx/releases/download/{tag}/kokoro-v1.0.onnx"
+        ),
+        "voices-v1.0.bin": (
+            f"https://github.com/thewh1teagle/kokoro-onnx/releases/download/{tag}/voices-v1.0.bin"
+        ),
+    }
+
+
+def _download_voice_file(url: str, dest: Path, expected_bytes: int = 0, timeout: float = 600.0) -> dict:
+    """Download one model file to ~/.nexus/voice with a streaming write."""
+    import urllib.request as _urlreq
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    temporary = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
+    try:
+        req = _urlreq.Request(url, headers={"User-Agent": "nexus-voice-setup/1.0"})
+        with _urlreq.urlopen(req, timeout=timeout) as resp:
+            with open(temporary, "wb") as handle:
+                total = 0
+                while True:
+                    chunk = resp.read(1 << 16)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    total += len(chunk)
+        if expected_bytes and total < expected_bytes * 0.95:
+            temporary.unlink(missing_ok=True)
+            return {"ok": False, "name": dest.name, "error": f"download too small: {total} bytes"}
+        os.replace(temporary, dest)
+        return {"ok": True, "name": dest.name, "bytes": total}
+    except Exception as exc:
+        try:
+            temporary.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return {"ok": False, "name": dest.name, "error": str(exc)}
+
+
+def _run_voice_setup(force: bool = False, progress: bool = True) -> int:
+    """Download optional voice models (Kokoro TTS) into ~/.nexus/voice.
+
+    This step is optional: without it the voice engine still runs with RMS VAD
+    and no local TTS. Returns 0 when all downloads succeeded (or were skipped
+    because present), 1 when at least one required download failed.
+    """
+    def log(message: str) -> None:
+        if progress:
+            print(message, flush=True)
+
+    voice_dir = NEXUS_DIR / "voice"
+    voice_dir.mkdir(parents=True, exist_ok=True)
+    urls = _voice_setup_download_urls()
+    failed = False
+    for entry in _VOICE_SETUP_MANIFEST:
+        dest = voice_dir / entry["name"]
+        if dest.exists() and dest.stat().st_size > 1000 and not force:
+            log(f"present: {entry['name']}")
+            continue
+        url = urls.get(entry["file"]) or urls.get(entry["name"])
+        if not url:
+            log(f"failed: {entry['name']}: release asset not found")
+            if entry["required"]:
+                failed = True
+            continue
+        log(f"downloading {entry['name']} ...")
+        result = _download_voice_file(url, dest, entry["size"])
+        if result.get("ok"):
+            log(f"ok: {entry['name']} ({result.get('bytes')} bytes)")
+        else:
+            log(f"failed: {entry['name']}: {result.get('error')}")
+            if entry["required"]:
+                failed = True
+    if not failed:
+        log("voice models ready")
+    return 1 if failed else 0
+
+
+def _wake_word_score(frame: bytes, porcupine=None) -> float:
+    """Score one 20ms frame with Porcupine; returns 0..1 keyword likelihood.
+
+    ``porcupine`` is the pvporcupine.create() instance; when None (lib or
+    keyword file missing) the function returns 0.0 so wake gating degrades to
+    disabled rather than crashing.
+    """
+    if porcupine is None:
+        return 0.0
+    try:
+        import numpy as np
+
+        samples = np.frombuffer(frame, dtype=np.int16)
+        index = porcupine.process(samples)
+        return 1.0 if index >= 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _run_voice_capture_helper(temp_directory: str, parent_pid: int) -> int:
+    """Hold-to-talk Alt dictation using the default Windows microphone.
+
+    While Alt is held, audio is captured through the waveform API and every
+    ~1.2s the partial recording is snapshotted to a WAV file. Each snapshot is
+    emitted as an ``interim_snapshot`` event so the parent TUI can stream live"""
+    import ctypes
+    import math
+
+    WAVE_MAPPER = 0xFFFFFFFF
+    SYNCHRONIZE = 0x00100000
+    WAIT_TIMEOUT = 0x00000102
+    SAMPLE_RATE = 16000
+    INTERIM_INTERVAL_S = 0.8
+    MAX_RECORDING_S = 300.0
+    SILENCE_RMS = 260
+    SILENCE_FINALIZE_S = 0.9
+    RMS_WINDOW_BYTES = 16000
+    WaveRecorder = _winmm_recorder_class()
+
+    target_dir = Path(temp_directory).resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    user32.GetAsyncKeyState.restype = ctypes.c_short
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_uint]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
 
     parent_handle = kernel32.OpenProcess(SYNCHRONIZE, False, int(parent_pid))
     control = {"enabled": False, "stop": False}
@@ -579,8 +1596,502 @@ def _run_voice_capture_helper(temp_directory: str, parent_pid: int) -> int:
     return 0
 
 
+def _run_voice_engine_helper(temp_directory: str, parent_pid: int) -> int:
+    """Persistent voice engine: continuous capture with mode switching.
 
+    Unlike the push-to-talk helper, this process captures audio the whole time
+    and applies a mode gate:
+      - "ptt"       : Alt held = recording (same as the dictation helper)
+      - "hands-free": VAD starts/ends utterances automatically
+      - "wake-word" : a keyword arms VAD; the following utterance is captured
+    Utterances are written to WAV files and emitted as ``vad_utterance``
+    events (path + start/end offsets) so the TUI can transcribe and insert
+    them exactly like dictation recordings. A ``synthesize`` command renders
+    text with the local Kokoro model when available.
 
+    Commands arrive on stdin as JSON lines:
+      {"cmd": "mode", "mode": "hands-free"}
+      {"cmd": "synthesize", "text": "...", "voice": "af_heart", "speed": 1.0}
+      {"cmd": "stop"}
+    """
+    if os.name != "nt":
+        _emit_voice_capture_event("unavailable", error="voice engine is currently supported on Windows")
+        return 1
+
+    import ctypes
+    import math
+
+    SYNCHRONIZE = 0x00100000
+    WAIT_TIMEOUT = 0x00000102
+    SAMPLE_RATE = 16000
+    FRAME_MS = 20
+    WaveRecorder = _winmm_recorder_class()
+
+    target_dir = Path(temp_directory).resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_uint]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    parent_handle = kernel32.OpenProcess(SYNCHRONIZE, False, int(parent_pid))
+
+    state = {
+        "mode": "hands-free",
+        "enabled": True,
+        "stop": False,
+        "wake_phrase": "",
+        "wake_armed": False,   # wake-word heard, listening for the utterance
+        "recording": False,
+        "recording_path": "",
+        "started_at": 0.0,
+        "last_speech_at": 0.0,
+        "last_wake_at": 0.0,
+        "tts_busy": False,
+        # Texts waiting to be spoken. Appends merge into the active pipeline so
+        # the next sentence is synthesized WHILE the current one plays (no
+        # dead air between sentences). tts_gen identifies the active worker so
+        # a replace can retire the old worker without it clobbering state.
+        "tts_pending_texts": [],
+        "tts_gen": 0,
+    }
+    state_lock = threading.Lock()
+    porcupine = None
+    kokoro = None
+    models_ready = threading.Event()
+
+    def load_optional_models() -> None:
+        nonlocal porcupine, kokoro
+        voice_dir = NEXUS_DIR / "voice"
+        try:
+            porcupine_path = voice_dir / "porcupine_params.pv"
+            keyword_path = voice_dir / "hey-nexus.ppn"
+            if porcupine_path.exists() and keyword_path.exists():
+                import pvporcupine
+
+                porcupine = pvporcupine.create(
+                    access_key="",
+                    library_path=None,
+                    model_path=str(porcupine_path),
+                    keyword_paths=[str(keyword_path)],
+                )
+        except Exception:
+            porcupine = None
+        try:
+            from kokoro_onnx import Kokoro
+
+            model_path = voice_dir / "kokoro-v1.0.onnx"
+            voices_path = voice_dir / "voices-v1.0.bin"
+            if model_path.exists() and voices_path.exists():
+                kokoro = Kokoro(str(model_path), str(voices_path))
+        except Exception:
+            kokoro = None
+        finally:
+            models_ready.set()
+            _emit_voice_capture_event("models_loaded")
+
+    def read_commands() -> None:
+        try:
+            for line in sys.stdin:
+                try:
+                    message = json.loads(line)
+                except Exception:
+                    continue
+                cmd = str(message.get("cmd") or "")
+                if cmd == "mode":
+                    with state_lock:
+                        mode = str(message.get("mode") or "hands-free")
+                        if mode in {"ptt", "hands-free", "wake-word"}:
+                            state["mode"] = mode
+                            state["wake_armed"] = False
+                    _emit_voice_capture_event("mode_changed", mode=mode)
+                elif cmd == "synthesize":
+                    text = str(message.get("text") or "")
+                    voice = str(message.get("voice") or "af_heart")
+                    speed = float(message.get("speed") or 1.0)
+                    try:
+                        max_chars = max(0, int(message.get("max_chars") or 0))
+                    except (TypeError, ValueError):
+                        max_chars = 0
+                    append = bool(message.get("append"))
+                    if text.strip():
+                        with state_lock:
+                            was_busy = bool(state.get("tts_busy"))
+                            start_new = not was_busy or not append
+                            if was_busy and not append:
+                                # Replace: retire the old worker, drop pending
+                                # speech, and start over with this reply.
+                                state["tts_cancel"] = True
+                                _tts_stop_playback()
+                                state["tts_pending_texts"].clear()
+                                state["tts_gen"] += 1
+                                state["tts_cancel"] = False
+                            state["tts_pending_texts"].append(
+                                {"text": text, "voice": voice, "speed": speed, "max_chars": max_chars}
+                            )
+                            state["tts_busy"] = True
+                            state["tts_started_at"] = time.monotonic() * 1000.0
+                        if start_new:
+                            _emit_voice_capture_event("tts_started")
+                            threading.Thread(
+                                target=_tts_worker,
+                                args=(state["tts_gen"],),
+                                name="nexus-tts-worker",
+                                daemon=True,
+                            ).start()
+                elif cmd == "warmup":
+                    # Force the model to finish loading and warm onnxruntime
+                    # without audible output. Used by the TUI at startup so
+                    # the first real reply speaks instantly.
+                    if not models_ready.wait(timeout=20.0):
+                        _emit_voice_capture_event("tts_error", error="Kokoro model failed to load")
+                        continue
+                    if kokoro is not None:
+                        try:
+                            _tts_synthesize_kokoro(" ", voice="af_bella", speed=1.0, kokoro=kokoro)
+                        except Exception:
+                            pass
+                    _emit_voice_capture_event("warmup_done")
+                elif cmd == "barge_in":
+                    with state_lock:
+                        # User pressed push-to-talk while TTS was playing:
+                        # cancel the current sentence, drop pending speech, and
+                        # stop playback. Only act when busy so a stale cancel
+                        # can never kill the NEXT speak.
+                        if state.get("tts_busy"):
+                            state["tts_cancel"] = True
+                            state["tts_pending_texts"].clear()
+                            state["tts_gen"] += 1
+                            _tts_stop_playback()
+                            _emit_voice_capture_event("tts_cancelled")
+                elif cmd == "stop":
+                    with state_lock:
+                        state["stop"] = True
+                    return
+        finally:
+            with state_lock:
+                state["stop"] = True
+
+    def _tts_worker(gen: int) -> None:
+        """Pipelined speech worker.
+
+        A producer thread synthesizes sentences AHEAD of playback into a small
+        buffer while the main loop plays them, so consecutive sentences (and
+        appended compacted text) flow with no dead air. Appends merge into the
+        active pipeline; barge_in/replace bump ``gen`` which retires this
+        worker without it clobbering a newer worker's state.
+        """
+        if not models_ready.wait(timeout=20.0):
+            _emit_voice_capture_event("tts_error", error="Kokoro model failed to load")
+            return
+        if kokoro is None:
+            _emit_voice_capture_event("tts_error", error="Kokoro model is unavailable")
+            return
+        synth_buffer: queue.Queue = queue.Queue(maxsize=3)
+        producer_active = [True]
+        last_activity = [time.monotonic()]
+
+        def _current() -> bool:
+            """True while this worker is still the active generation."""
+            with state_lock:
+                return (
+                    not state["stop"]
+                    and not state.get("tts_cancel")
+                    and state.get("tts_gen") == gen
+                )
+
+        def producer() -> None:
+            try:
+                while True:
+                    if not _current():
+                        return
+                    with state_lock:
+                        job = state["tts_pending_texts"][0] if state["tts_pending_texts"] else None
+                    if job is None:
+                        time.sleep(0.05)
+                        continue
+                    producer_active[0] = True
+                    last_activity[0] = time.monotonic()
+                    # Small chunks (~60 chars, sentence-aligned) so each
+                    # synthesizes in ~1s and pipelines behind the previous
+                    # playback; a single large chunk costs ~25ms/char of dead
+                    # air before the first word of the rest plays.
+                    chunks = _split_voice_sentences(
+                        job["text"],
+                        max_chars=60,
+                        total_max_chars=job.get("max_chars", 0),
+                    )
+                    with state_lock:
+                        if state["tts_pending_texts"] and state["tts_pending_texts"][0] is job:
+                            state["tts_pending_texts"].pop(0)
+                    for chunk in chunks:
+                        if not _current():
+                            return
+                        # Turkish voice uses the dedicated inference path; the
+                        # English model is irrelevant (and unloaded) for it.
+                        if job["voice"] == _TURKISH_VOICE:
+                            result = _tts_synthesize_kokoro(
+                                chunk, voice=job["voice"], speed=job["speed"]
+                            )
+                        else:
+                            result = _tts_synthesize_kokoro(
+                                chunk, voice=job["voice"], speed=job["speed"], kokoro=kokoro
+                            )
+                        if not _current():
+                            return
+                        if result.get("ok") and result.get("path"):
+                            last_activity[0] = time.monotonic()
+                            with state_lock:
+                                state["tts_started_at"] = time.monotonic() * 1000.0
+                            _emit_voice_capture_event("tts_chunk", path=result["path"])
+                            synth_buffer.put(result["path"])
+                        elif not result.get("ok"):
+                            _emit_voice_capture_event(
+                                "tts_error",
+                                error=result.get("error") or "synth failed",
+                                voice=job["voice"],
+                            )
+                    with state_lock:
+                        no_more = not state["tts_pending_texts"]
+                    if no_more:
+                        producer_active[0] = False
+                        last_activity[0] = time.monotonic()
+            finally:
+                producer_active[0] = False
+                synth_buffer.put(None)
+
+        threading.Thread(target=producer, name="nexus-tts-producer", daemon=True).start()
+        try:
+            while True:
+                if not _current():
+                    with state_lock:
+                        is_active = state.get("tts_gen") == gen
+                    if is_active:
+                        _emit_voice_capture_event("tts_cancelled")
+                    break
+                try:
+                    path = synth_buffer.get(timeout=0.05)
+                except queue.Empty:
+                    with state_lock:
+                        pending = bool(state["tts_pending_texts"])
+                        gen_ok = state.get("tts_gen") == gen
+                    idle_for = time.monotonic() - last_activity[0]
+                    # Stay alive while the producer is working OR while a
+                    # possible append (the TUI streams first-sentence then the
+                    # rest) may still land. The app can take >0.5s between the
+                    # first speak and the append (JS async), so use a 4s grace
+                    # window after the last audio before going idle.
+                    if not pending and gen_ok and not producer_active[0] and idle_for > 4.0:
+                        break
+                    continue
+                if path is None:
+                    break
+                _tts_play_wav(path)
+                time.sleep(0.15)
+        finally:
+            while True:
+                try:
+                    synth_buffer.get_nowait()
+                except queue.Empty:
+                    break
+            with state_lock:
+                still_active = state.get("tts_gen") == gen
+                if still_active:
+                    state["tts_cancel"] = False
+                    state["tts_busy"] = False
+            # Only the ACTIVE generation reports completion; a replaced
+            # worker's tts_done would tell the TUI speech finished while the
+            # new worker is still playing.
+            if still_active:
+                _emit_voice_capture_event("tts_done")
+
+    # Emit ready immediately (the TUI keeps the engine alive), then LOAD the
+    # Kokoro model SYNCHRONOUSLY in this thread before starting the capture
+    # loop. This is a one-time ~2s startup cost but guarantees the first
+    # synthesize never blocks on the model - the 2s delay we were seeing was
+    # the background load racing the first reply. Commands still work during
+    # the load (they queue); only VAD capture starts after it.
+    _emit_voice_capture_event("ready", engine=True, mode=state["mode"])
+    # Start the model load on its own thread FIRST so it runs before the
+    # command reader contends; then the main thread waits on it before the
+    # capture loop, guaranteeing TTS is instant once capture starts.
+    load_thread = threading.Thread(target=load_optional_models, name="nexus-voice-models", daemon=True)
+    load_thread.start()
+    threading.Thread(target=read_commands, daemon=True).start()
+    models_ready.wait(timeout=20.0)
+
+    recorder = None
+    vad = _SileroVadGate()
+    frame_ms = FRAME_MS
+    utterance_index = 0
+
+    # The engine keeps ONE continuous capture recorder alive for the whole
+    # session in hands-free / wake-word modes so the VAD always has audio to
+    # inspect. "recording" is a logical utterance state: speech onset sets it
+    # and snapshots from the pre-roll; silence finalization closes the
+    # utterance. Byte accounting is monotonic: last_processed never resets so
+    # each frame is fed to the VAD exactly once.
+    continuous_recorder = None
+    utterance_start_byte = 0  # recorder byte offset where the utterance begins
+    utterance_start_ms = 0.0
+
+    def ensure_continuous_capture() -> None:
+        nonlocal continuous_recorder
+        if continuous_recorder is not None:
+            return
+        try:
+            continuous_recorder = WaveRecorder()
+            _emit_voice_capture_event("capture_ready")
+        except Exception as exc:
+            _emit_voice_capture_event("error", error=f"voice engine capture: {exc}")
+            continuous_recorder = None
+
+    def begin_utterance() -> None:
+        nonlocal utterance_start_byte, utterance_start_ms, utterance_index
+        if state["recording"]:
+            return
+        try:
+            utterance_index += 1
+            path_value = target_dir / f"vad-{int(time.time() * 1000)}-{utterance_index}.wav"
+            with state_lock:
+                state["recording"] = True
+                state["recording_path"] = str(path_value)
+                state["started_at"] = time.monotonic()
+            # Snapshot starts a short pre-roll before speech onset. Do NOT
+            # reset processed_bytes: the VAD keeps consuming the live stream.
+            if continuous_recorder is not None:
+                utterance_start_byte = max(
+                    0, continuous_recorder.length() - vad.pre_roll_bytes
+                )
+            else:
+                utterance_start_byte = 0
+            utterance_start_ms = time.monotonic() * 1000.0
+            _emit_voice_capture_event("recording_started", path=str(path_value), source="vad")
+        except Exception as exc:
+            _emit_voice_capture_event("error", error=f"voice engine begin: {exc}")
+
+    def finish_utterance(save: bool) -> None:
+        nonlocal utterance_start_byte
+        with state_lock:
+            if not state["recording"]:
+                return
+            state["recording"] = False
+            path_value = state["recording_path"]
+            state["recording_path"] = ""
+            duration_ms = max(0, int((time.monotonic() - state["started_at"]) * 1000))
+        if save and path_value and continuous_recorder is not None:
+            try:
+                continuous_recorder.write_snapshot(path_value, utterance_start_byte)
+            except Exception:
+                pass
+            try:
+                ok_size = Path(path_value).stat().st_size > 44
+            except Exception:
+                ok_size = False
+            if ok_size:
+                _emit_voice_capture_event(
+                    "vad_utterance",
+                    path=path_value,
+                    duration_ms=duration_ms,
+                    mode=state["mode"],
+                )
+            else:
+                try:
+                    Path(path_value).unlink(missing_ok=True)
+                except Exception:
+                    pass
+        elif path_value:
+            try:
+                Path(path_value).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    try:
+        while True:
+            with state_lock:
+                if state["stop"]:
+                    break
+                mode = state["mode"]
+            if parent_handle and kernel32.WaitForSingleObject(parent_handle, 0) != WAIT_TIMEOUT:
+                break
+
+            now_ms = time.monotonic() * 1000.0
+            if mode in {"hands-free", "wake-word"}:
+                ensure_continuous_capture()
+            elif continuous_recorder is not None:
+                # ptt mode: the dictation helper owns the mic; stop capturing.
+                try:
+                    continuous_recorder.stop(None)
+                except Exception:
+                    pass
+                continuous_recorder = None
+                if state["recording"]:
+                    finish_utterance(False)
+
+            # While TTS is synthesizing/playing, skip mic frame processing
+            # entirely: the Python-heavy VAD loop would contend for the GIL
+            # and slow Kokoro ~5x (observed 0.6s -> 3.9s). Barge-in is
+            # explicit (Alt press -> barge_in command), so the mic is not
+            # needed during speech output.
+            tts_busy_now = bool(state.get("tts_busy"))
+            if continuous_recorder is not None and not tts_busy_now:
+                total = continuous_recorder.length()
+                with state_lock:
+                    last_processed = state.get("processed_bytes", 0)
+                new_bytes = total - last_processed
+                if new_bytes > 0:
+                    audio = continuous_recorder.full_data()[last_processed:total]
+                    with state_lock:
+                        state["processed_bytes"] = total
+                    frame_ms_now = now_ms
+                    for frame in _chunk_audio_for_vad(audio, _VOICE_FRAME_BYTES):
+                        frame_ms_now += FRAME_MS
+                        started, ended = vad.feed(frame, frame_ms_now)
+                        if started and mode in {"hands-free", "wake-word"}:
+                            if mode == "wake-word" and not state["wake_armed"]:
+                                continue
+                            if state["wake_armed"]:
+                                state["wake_armed"] = False
+                            # Skip the TTS tail right after a barge-in cancel
+                            # (speaker feedback winds down for ~400ms), then
+                            # the user's continued speech starts an utterance.
+                            if (now_ms - state.get("tts_last_cancel_at", 0)) < 400:
+                                continue
+                            begin_utterance()
+                        if ended and state["recording"]:
+                            finish_utterance(True)
+
+            # Wake-word detection when armed in wake-word mode and idle.
+            if mode == "wake-word" and not state["recording"] and porcupine is not None and continuous_recorder is not None:
+                if (now_ms - state["last_wake_at"]) >= _VOICE_WAKE_DEBOUNCE_MS:
+                    audio = continuous_recorder.full_data()
+                    hit = False
+                    for frame in _chunk_audio_for_vad(audio[-_VOICE_FRAME_BYTES * 50:], _VOICE_FRAME_BYTES):
+                        if _wake_word_score(frame, porcupine) >= 1.0:
+                            hit = True
+                            break
+                    if hit:
+                        state["last_wake_at"] = now_ms
+                        state["wake_armed"] = True
+                        _emit_voice_capture_event("wake_detected")
+
+            time.sleep(0.005)
+    finally:
+        if state["recording"]:
+            try:
+                finish_utterance(False)
+            except Exception:
+                pass
+        if continuous_recorder is not None:
+            try:
+                continuous_recorder.stop(None)
+            except Exception:
+                pass
+        if parent_handle:
+            kernel32.CloseHandle(parent_handle)
+    return 0
 
 
 def set_shell_stream_writer(writer) -> None:
@@ -3837,6 +5348,21 @@ def main() -> int:
         except ValueError:
             return 2
         return _run_voice_capture_helper(args[index + 1], parent_pid)
+    if "--voice-engine" in args:
+        index = args.index("--voice-engine")
+        if index + 2 >= len(args):
+            return 2
+        try:
+            parent_pid = int(args[index + 2])
+        except ValueError:
+            return 2
+        return _run_voice_engine_helper(args[index + 1], parent_pid)
+    if "--voice-engine-self-test" in args:
+        return _run_voice_engine_self_test()
+    if "--voice-setup" in args:
+        force = any(token == "--force" for token in args)
+        silent = any(token == "--quiet" for token in args)
+        return _run_voice_setup(force=force, progress=not silent)
     if "--run-subagent" in args:
         index = args.index("--run-subagent")
         if index + 1 >= len(args):

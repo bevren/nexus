@@ -125,6 +125,10 @@ function getPythonRuntimeEnvironment() {
   return {
     ...process.env,
     PYTHONPATH: [PACKAGE_ROOT, existingPythonPath].filter(Boolean).join(path.delimiter),
+    // Force UTF-8 for spawned Python (engine/helpers): without it, IPA
+    // phonemes like ɪ/ʊ/ø fail to encode under non-UTF-8 Windows locales.
+    PYTHONUTF8: "1",
+    PYTHONIOENCODING: "utf-8",
   };
 }
 
@@ -1140,6 +1144,7 @@ const COMMANDS = [
   { name: "/hooks", description: "show configured lifecycle hooks (read-only)" },
   { name: "/solve", description: "run an autonomous solve loop in an isolated workspace: /solve <directory>" },
   { name: "/kernels", description: "view, resume, restart, or delete sessions created by /solve" },
+  { name: "/voice-setup", description: "download optional voice models (Kokoro TTS) into ~/.nexus/voice" },
 ];
 const PLAN_MODE_ALLOWED_TOOL_NAMES = new Set([
   "tool_search",
@@ -1487,6 +1492,7 @@ let suppressAgentMentionEscapeKeypressUntil = 0;
 let suppressRemoteControlEscapeKeypressUntil = 0;
 let suppressUpdateEscapeKeypressUntil = 0;
 let suppressModelEscapeKeypressUntil = 0;
+let suppressSettingsEscapeKeypressUntil = 0;
 let suppressMouseNoiseUntil = 0;
 let ignoreNextProvidersEscape = false;
 let bracketedPasteModeEnabled = false;
@@ -1574,6 +1580,9 @@ let altScreenActive = false;
 let forceTranscriptReplay = true;
 let appendReservedBottomRows = 0;
 let cachedChatLines = null;
+// Row range of the streaming live tool entry inside cachedChatLines, used for
+// incremental live-output repaints (avoids full-chat rebuilds every 100ms).
+let pendingCodeEntryRows = { start: -1, height: 0 };
 let lastEntryVisualStartIndex = -1;
 let cachedChatLinesCols = 0;
 let cachedChatLinesLen = -1;
@@ -1581,6 +1590,9 @@ let cachedChatLinesLastRef = null;
 let cachedChatLinesSpacing = -1;
 let cachedChatLinesShowThinkingBlocks = true;
 const cachedTranscriptLinesByEntries = new WeakMap();
+// Per-entry visual-line cache: skips buildTranscriptLinesForEntry +
+// reasoning extraction for unchanged entries on every render frame.
+let cachedEntryLines = new WeakMap();
 
 function createSessionUid() {
   if (typeof randomUUID === "function") {
@@ -2187,13 +2199,19 @@ function setVoiceCaptureStatus(state, text = "", clearAfterMs = 0) {
 }
 
 function getVoiceCaptureFooterSegment() {
-  if (voiceCaptureState === "recording") return { text: "Recording", color: RED_COLOR };
+  // Speaking takes precedence over the ambient engine mode.
+  if (voiceEngineTtsSpeaking) return { text: "Speaking…", color: GOLDENROD_COLOR };
+  if (voiceCaptureState === "recording") {
+    return { text: voiceCaptureStatusText || "Listening…", color: RED_COLOR };
+  }
   if (voiceCaptureState === "transcribing") {
     return { text: voiceCaptureStatusText || "Transcribing", color: GOLDENROD_COLOR };
   }
   if (voiceCaptureState === "error" && voiceCaptureStatusText) {
     return { text: voiceCaptureStatusText, color: RED_COLOR };
   }
+  const engine = getVoiceEngineFooterSegment();
+  if (engine) return engine;
   return null;
 }
 
@@ -2241,6 +2259,249 @@ function stopVoiceCaptureHelper() {
     try { child.kill(); } catch {}
   }
   try { fsSync.rmSync(VOICE_CAPTURE_TEMP_DIR, { recursive: true, force: true }); } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// Voice engine (VAD / wake-word / Kokoro TTS) integration. A second persistent
+// helper runs the continuous-capture pipeline; the TUI sends mode/synthesize
+// commands and renders wake/tts status. Optional: when the engine helper is
+// unavailable, push-to-talk dictation still works exactly as before.
+// ---------------------------------------------------------------------------
+let voiceEngineProcess = null;
+let voiceEngineEnabledState = null;
+let voiceEngineMode = "ptt";
+let voiceEngineStatusText = "";
+let voiceEngineTtsSpeaking = false;
+
+function sendVoiceEngineCommand(payload) {
+  if (!voiceEngineProcess?.stdin?.writable) return false;
+  try {
+    voiceEngineProcess.stdin.write(`${JSON.stringify(payload)}
+`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function setVoiceEngineMode(mode) {
+  const normalized = ["ptt", "hands-free", "wake-word"].includes(mode) ? mode : "ptt";
+  if (normalized === voiceEngineMode) return;
+  voiceEngineMode = normalized;
+  sendVoiceEngineCommand({ cmd: "mode", mode: normalized });
+}
+
+const VOICE_COMPACT_MAX_CHARS = 600; // speaker-friendly cap when voice_compact is on
+
+// LLM-based speech compaction: convert an assistant reply into short, natural
+// spoken prose before TTS. The engine still applies symbol-cleaning + a hard
+// sentence-boundary cap as a deterministic fallback; this rewrite happens
+// first so long replies are summarized instead of truncated.
+async function compactTextForSpeech(text, maxChars = VOICE_COMPACT_MAX_CHARS, timeoutMs = 2000) {
+  const source = String(text || "").trim();
+  if (!source) return source;
+  if (!Number.isFinite(Number(maxChars)) || Number(maxChars) <= 0) return source; // compaction off
+  const budget = Math.max(80, Math.floor(Number(maxChars) || VOICE_COMPACT_MAX_CHARS));
+  // Fast path: already short enough to speak in one breath.
+  if (source.length <= budget * 0.6) return source;
+
+  const client = getOpenRouterClient();
+  const model = selectedModel;
+  if (!client || !model) return source; // fall back to engine truncation
+
+  const systemText =
+    "You rewrite text for text-to-speech so it sounds like a friend talking " +
+    "casually. Rewrite the user's text into short, warm, conversational spoken " +
+    "English - the kind of thing you would say out loud to someone. Rules:\n" +
+    `- Keep it under ${budget} characters - one or two short sentences.\n` +
+    "- Use contractions (it's, don't, we're), natural word order, and a relaxed " +
+    "tone. Avoid bullet points, lists, headers, or any written-form structure.\n" +
+    "- Expand symbols to words and drop code, paths, URLs, markdown, parenthetical " +
+    "asides, and repeated detail.\n" +
+    "- Preserve the key facts, numbers, and the overall meaning.\n" +
+    "- Output ONLY the spoken words - no quotes, no preamble, no labels.";
+  // Cap how long we wait: the first sentence is already speaking by now, so a
+  // slow LLM must not stall the rest of the reply. The timer resolves `null`
+  // and the caller speaks the raw remainder (engine cleans + truncates).
+  const capMs = Math.max(500, Math.min(4000, Number(timeoutMs) || 2000));
+  const controller = new AbortController();
+  const abortTimer = setTimeout(() => controller.abort(), capMs);
+  const llmPromise = (async () => {
+    try {
+      const completion = await client.chat.completions.create(
+        {
+          model,
+          messages: [
+            { role: "system", content: systemText },
+            { role: "user", content: source.slice(0, 12000) },
+          ],
+          max_tokens: Math.max(160, Math.ceil(budget / 3)),
+          temperature: 0,
+        },
+        { signal: controller.signal }
+      );
+      const content = String(completion?.choices?.[0]?.message?.content || "").trim();
+      if (!content) return source;
+      return content.length > budget * 1.5 ? content.slice(0, budget) : content;
+    } catch {
+      return source; // engine truncation is the fallback
+    }
+  })();
+  const raced = await Promise.race([
+    llmPromise,
+    new Promise((resolve) => setTimeout(() => resolve(null), capMs)),
+  ]);
+  clearTimeout(abortTimer);
+  return raced === null ? source : raced;
+}
+
+// Split a reply so the FIRST sentence can start speaking immediately while
+// the rest is compacted and streamed after it. Never cuts mid-word; prefers
+// a sentence boundary within maxLen, else falls back to a word-ish cut.
+function splitFirstSpeechSentence(text, maxLen = 240) {
+  const src = String(text || "").trim();
+  if (!src) return { first: "", rest: "" };
+  let cut = -1;
+  const boundary = src.search(/[.!?](?:\s|$)/);
+  if (boundary >= 0 && boundary + 1 <= maxLen) cut = boundary + 1;
+  if (cut < 0) {
+    // No early boundary: cut at a space near maxLen to avoid mid-word breaks.
+    const hard = Math.min(maxLen, src.length);
+    const space = src.lastIndexOf(" ", hard);
+    cut = space > maxLen * 0.5 ? space + 1 : hard;
+  }
+  return { first: src.slice(0, cut).trim(), rest: src.slice(cut).trim() };
+}
+
+function speakAssistantReply(text, voice = "af_bella", speed = 1.05, maxChars = 0, append = false) {
+  if (!voiceEngineProcess?.stdin?.writable) return false;
+  const clean = String(text || "").trim();
+  if (!clean) return false;
+  const payload = { cmd: "synthesize", text: clean, voice, speed: normalizeTtsSpeed(speed) };
+  if (append) payload.append = true;
+  if (Number.isFinite(Number(maxChars)) && Number(maxChars) > 0) {
+    payload.max_chars = Math.max(80, Math.floor(Number(maxChars)));
+  }
+  return sendVoiceEngineCommand(payload);
+}
+
+function stopVoiceEngineHelper() {
+  const child = voiceEngineProcess;
+  voiceEngineProcess = null;
+  voiceEngineEnabledState = null;
+  if (child) {
+    try { child.stdin?.write(`${JSON.stringify({ cmd: "stop" })}
+`); } catch {}
+    try { child.kill(); } catch {}
+  }
+}
+
+function getVoiceEngineFooterSegment() {
+  if (!voiceEngineProcess) return null;
+  if (voiceEngineMode === "wake-word") return { text: "Wake armed", color: BLUE_COLOR };
+  if (voiceEngineMode === "hands-free") return { text: "Hands-free", color: GREEN_COLOR };
+  return null;
+}
+
+function handleVoiceEngineEvent(event) {
+  const eventName = String(event?.event || "");
+  if (eventName === "ready") {
+    voiceEngineMode = String(event?.mode || "ptt");
+    // Sync the engine to the user's configured voice mode.
+    const configured = normalizeVoiceMode(getActiveSessionRuntimeSettings().voice_mode);
+    if (configured !== voiceEngineMode) {
+      voiceEngineMode = configured;
+      sendVoiceEngineCommand({ cmd: "mode", mode: configured });
+    }
+    return;
+  }
+  if (eventName === "mode_changed") {
+    voiceEngineMode = String(event?.mode || voiceEngineMode);
+    markDirty();
+    renderFrame(false);
+    return;
+  }
+  if (eventName === "wake_detected") {
+    voiceEngineStatusText = "Listening…";
+    setVoiceCaptureStatus("recording", "Listening…", 0);
+    return;
+  }
+  if (eventName === "recording_started" && event?.source === "vad") {
+    if (isSafeVoiceCapturePath(event.path)) {
+      voiceCaptureRecordingPath = event.path;
+      voiceCaptureContext = {
+        agentName: activeAgentName,
+        sessionId: getAgentSessionUid(activeAgentName),
+        profile: normalizeRuntimeModelId(getActiveSessionRuntimeSettings().speech_to_text_model),
+        timeoutMs: getActiveSessionRuntimeSettings().request_timeout_ms,
+      };
+      voiceCaptureInterimInsertion = { input: String(input || ""), position: inputCursorIndex };
+      voiceCaptureInterimGeneration += 1;
+      voiceCaptureInterimInFlight = false;
+      voiceCaptureInterimResult = null;
+      setVoiceCaptureStatus("recording", "Listening…");
+    }
+    return;
+  }
+  if (eventName === "vad_utterance") {
+    // Reuse the dictation "recording_stopped" pipeline: commit preview and
+    // transcribe the tail region, then insert the final text.
+    const recordingPath = String(event.path || "");
+    voiceCaptureRecordingPath = "";
+    const context = voiceCaptureContext || {};
+    voiceCaptureContext = null;
+    const anchor = voiceCaptureInterimInsertion
+      ? { input: voiceCaptureInterimInsertion.input, position: voiceCaptureInterimInsertion.position }
+      : null;
+    voiceCaptureInterimInsertion = null;
+    if (voiceCaptureInterimController) {
+      try { voiceCaptureInterimController.abort(); } catch {}
+      voiceCaptureInterimController = null;
+    }
+    voiceCaptureInterimInFlight = false;
+    voiceCaptureInterimResult = null;
+    voiceCaptureCommittedText = "";
+    voiceCaptureUtteranceCommitPending = false;
+    voiceCaptureInterimGeneration += 1;
+    suppressVoiceEscapeKeypressUntil = Date.now() + 1500;
+    if (!isSafeVoiceCapturePath(recordingPath)) {
+      setVoiceCaptureStatus("error", "Recording path rejected", VOICE_CAPTURE_STATUS_CLEAR_MS);
+      return;
+    }
+    const replacementBase = anchor
+      ? composeUtterancePreview(anchor.input, anchor.position, "", "").input
+      : "";
+    setVoiceCaptureStatus("transcribing", "Transcribing…");
+    requestVoiceTranscription(recordingPath, context)
+      .then((transcript) => {
+        setVoiceCaptureStatus("idle");
+        if (!anchor) return;
+        applyUtterancePreview(anchor.input, anchor.position, transcript);
+        maybeCommitUtterance(anchor.input, anchor.position);
+      })
+      .catch(() => {
+        setVoiceCaptureStatus("error", "Voice: transcription failed", VOICE_CAPTURE_STATUS_CLEAR_MS);
+      })
+      .finally(() => {
+        fs.rm(recordingPath, { force: true }).catch(() => {});
+      });
+    return;
+  }
+  if (eventName === "tts_started") {
+    voiceEngineTtsSpeaking = true;
+    voiceEngineStatusText = "Speaking…";
+    setVoiceCaptureStatus("idle");
+    markDirty();
+    renderFrame(false);
+    return;
+  }
+  if (eventName === "tts_done" || eventName === "tts_cancelled") {
+    voiceEngineTtsSpeaking = false;
+    voiceEngineStatusText = "";
+    markDirty();
+    renderFrame(false);
+    return;
+  }
 }
 
 function mergeTranscribedText(currentInput, cursorIndex, text) {
@@ -2567,6 +2828,12 @@ async function handleVoiceCaptureEvent(event) {
   }
   if (eventName === "recording_started") {
     if (!isSafeVoiceCapturePath(event.path)) return;
+    // Push-to-talk: Alt held means the user is about to speak. Stop any TTS
+    // that is still playing so the dictation is not drowned out. Sent
+    // unconditionally: the engine no-ops when nothing is playing.
+    if (voiceEngineProcess) {
+      sendVoiceEngineCommand({ cmd: "barge_in" });
+    }
     voiceCaptureRecordingPath = event.path;
     const settings = getActiveSessionRuntimeSettings();
     voiceCaptureContext = {
@@ -2998,7 +3265,75 @@ async function startVoiceCaptureHelper() {
     syncVoiceCaptureHelperState();
     return true;
   };
-  return launch(0);
+  launch(0);
+
+  // Optional voice engine: continuous VAD / wake-word / Kokoro TTS helper.
+  // Push-to-talk dictation is independent; a failed engine spawn is ignored.
+  if (!voiceEngineProcess && process.platform === "win32" && process.stdin.isTTY) {
+    try {
+      const engineArgs = [TOOLS_SCRIPT_PATH, "--voice-engine", VOICE_CAPTURE_TEMP_DIR, String(process.pid)];
+      const engineCandidates = workerExe
+        ? [{ file: workerExe, args: engineArgs }]
+        : [
+            { file: "python", args: engineArgs },
+            { file: "py", args: ["-3", ...engineArgs] },
+          ];
+      for (const candidate of engineCandidates) {
+        try {
+          const child = spawn(candidate.file, candidate.args, {
+            cwd: process.cwd(),
+            windowsHide: true,
+            env: getPythonRuntimeEnvironment(),
+            stdio: ["pipe", "pipe", "pipe"],
+          });
+          let becameReady = false;
+          voiceEngineProcess = child;
+          child.stdout.setEncoding("utf8");
+          let engineBuffer = "";
+          child.stdout.on("data", (chunk) => {
+            engineBuffer += String(chunk || "");
+            for (;;) {
+              const newline = engineBuffer.indexOf("\n");
+              if (newline < 0) break;
+              const line = engineBuffer.slice(0, newline).replace(/\r$/, "");
+              engineBuffer = engineBuffer.slice(newline + 1);
+              try {
+                const event = JSON.parse(line);
+                if (event?.event === "ready") {
+                  becameReady = true;
+                  // Warm the Kokoro model at startup so the first reply
+                  // speaks instantly (the load is slow on cold disk).
+                  sendVoiceEngineCommand({ cmd: "warmup" });
+                }
+                handleVoiceEngineEvent(event);
+              } catch {}
+            }
+          });
+          child.on("error", () => {
+            if (voiceEngineProcess === child) voiceEngineProcess = null;
+          });
+          child.on("close", () => {
+            if (voiceEngineProcess === child) voiceEngineProcess = null;
+          });
+          // Give the engine a moment to report ready; if it never does, drop it.
+          // The engine now emits ready before loading optional models, so this
+          // is a generous backstop, not a startup gate.
+          setTimeout(() => {
+            if (voiceEngineProcess === child && !becameReady) {
+              if (voiceEngineProcess === child) voiceEngineProcess = null;
+              try { child.kill(); } catch {}
+            }
+          }, 10000);
+          break;
+        } catch {
+          voiceEngineProcess = null;
+        }
+      }
+    } catch {
+      voiceEngineProcess = null;
+    }
+  }
+  return true;
 }
 
 async function runPythonCommand(args, options = {}) {
@@ -4471,7 +4806,7 @@ async function appendBackgroundShellCompletion(job, result) {
       job.generation
     );
     if (shouldResumeMainAgentAfterBackgroundCompletion(job)) {
-      queueAssistantReply(selectedModel || job.model);
+      queueAssistantReply(getActiveSessionModel() || job.model);
     }
     return;
   }
@@ -5584,6 +5919,7 @@ function cleanupTerminal(options = {}) {
     answerRevealTimer = null;
   }
   stopVoiceCaptureHelper();
+  stopVoiceEngineHelper();
   if (agentsRefreshTimer) {
     clearTimeout(agentsRefreshTimer);
     agentsRefreshTimer = null;
@@ -5791,6 +6127,7 @@ function attachWorkedSummaryForTurn(startIndex, durationMs) {
     }
     entry.workedDurationMs = Math.max(0, Number(durationMs) || 0);
     cachedChatLines = null;
+    cachedEntryLines = new WeakMap();
     forceChatRefreshFlag = true;
     return true;
   }
@@ -5954,6 +6291,7 @@ function getDefaultSessionRuntimeSettings() {
     thinking_blocks: nexusConfig?.show_thinking_blocks !== false,
     external_thinking: nexusConfig?.external_thinking === true,
     thinking_effort: normalizeThinkingEffort(nexusConfig?.thinking_effort),
+    model: normalizeRuntimeModelId(nexusConfig?.model),
     text_to_speech_model: normalizeRuntimeModelId(nexusConfig?.text_to_speech_model),
     speech_to_text_model: normalizeRuntimeModelId(nexusConfig?.speech_to_text_model),
     vision_model: normalizeRuntimeModelId(nexusConfig?.vision_model),
@@ -5961,7 +6299,43 @@ function getDefaultSessionRuntimeSettings() {
     request_timeout_ms: normalizeLlmRequestTimeoutMs(nexusConfig?.llm_request_timeout_ms),
     max_output_tokens: normalizeLlmMaxOutputTokens(nexusConfig?.max_output_tokens),
     mcp_disabled_servers: [],
+    voice_mode: normalizeVoiceMode(nexusConfig?.voice_mode),
+    tts_voice: normalizeTtsVoice(nexusConfig?.tts_voice),
+    tts_speed: normalizeTtsSpeed(nexusConfig?.tts_speed),
+    voice_output: nexusConfig?.voice_output !== false,
+    voice_compact: nexusConfig?.voice_compact !== false,
+    voice_llm_rewrite: nexusConfig?.voice_llm_rewrite === true,
   };
+}
+
+function normalizeVoiceMode(raw) {
+  const value = String(raw || "ptt").toLowerCase();
+  return ["ptt", "hands-free", "wake-word"].includes(value) ? value : "ptt";
+}
+
+// Kokoro-82M voice list (conversational/natural voices first). Used by the
+// /settings picker and to validate tts_voice.
+const KOKORO_VOICES = [
+  "af_bella", "af_sky", "af_nicole", "af_nova", "af_river", "af_sarah",
+  "af_jessica", "af_heart", "af_alloy", "af_aoede", "af_kore",
+  "am_michael", "am_liam", "am_adam", "am_eric", "am_onyx", "am_echo",
+  "bf_emma", "bf_isabella", "bf_lily", "bm_george", "bm_lewis", "bm_daniel",
+  "ef_dora", "em_alex", "ff_siwis", "hf_alpha", "hf_beta", "hm_omega",
+  "hm_psi", "if_sara", "im_nicola", "jf_alpha", "jm_kumo", "pf_dora",
+  "pm_alex", "zf_xiaobei", "zf_xiaoni", "zf_xiaoxiao", "zf_xiaoyi",
+  "zm_yunjian", "zm_yunxi", "zm_yunxia", "zm_yunyang",
+  "tf_nisan", // Turkish Kokoro-82M fine-tune (duxx/kikiri_turkish_nisanONNX)
+];
+
+function normalizeTtsVoice(raw) {
+  const value = String(raw || "af_bella").trim();
+  return /^[a-z]{2}_[a-z0-9]+$/i.test(value) ? value : "af_bella";
+}
+
+function normalizeTtsSpeed(raw) {
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return 1.05;
+  return Math.min(1.4, Math.max(0.75, value));
 }
 
 function copyRuntimeMediaModelsToConfig(settings = getMainSessionRuntimeSettings()) {
@@ -5989,6 +6363,7 @@ function normalizeSessionRuntimeSettings(raw, defaults = getDefaultSessionRuntim
       ? source.external_thinking === true
       : defaults.external_thinking === true,
     thinking_effort: normalizeThinkingEffort(source.thinking_effort ?? defaults.thinking_effort),
+    model: normalizeRuntimeModelId(source.model ?? defaults.model),
     text_to_speech_model: normalizeRuntimeModelId(
       source.text_to_speech_model ?? defaults.text_to_speech_model
     ),
@@ -6006,6 +6381,18 @@ function normalizeSessionRuntimeSettings(raw, defaults = getDefaultSessionRuntim
     mcp_disabled_servers: normalizeMcpDisabledServers(
       source.mcp_disabled_servers ?? defaults.mcp_disabled_servers
     ),
+    voice_mode: normalizeVoiceMode(source.voice_mode ?? defaults.voice_mode),
+    tts_voice: normalizeTtsVoice(source.tts_voice ?? defaults.tts_voice),
+    tts_speed: normalizeTtsSpeed(source.tts_speed ?? defaults.tts_speed),
+    voice_output: Object.prototype.hasOwnProperty.call(source, "voice_output")
+      ? source.voice_output !== false
+      : defaults.voice_output !== false,
+    voice_compact: Object.prototype.hasOwnProperty.call(source, "voice_compact")
+      ? source.voice_compact !== false
+      : defaults.voice_compact !== false,
+    voice_llm_rewrite: Object.prototype.hasOwnProperty.call(source, "voice_llm_rewrite")
+      ? source.voice_llm_rewrite === true
+      : defaults.voice_llm_rewrite === true,
   };
 }
 
@@ -6108,8 +6495,39 @@ function getActiveNamedAgentRuntime() {
   return agent ? normalizeNamedAgentSessionRuntime(agent) : null;
 }
 
+// Resolve the runtime "model" setting to a provider profile when it names a
+// saved provider (e.g. "deepseek" or "openrouter-luna"). Returns the profile
+// and the provider's configured model id; null when unset or not a profile.
+function getRuntimeModelSettingProfile() {
+  const settings = getActiveSessionRuntimeSettings();
+  const profileName = normalizeRuntimeModelId(settings?.model);
+  if (!profileName) return null;
+  const provider = getSavedProviderProfile(profileName);
+  if (!provider) return null;
+  const modelId = normalizeProviderModel(provider.model);
+  if (!modelId) return null;
+  return { provider, profileName, modelId };
+}
+
 function getActiveSessionModel() {
-  return getActiveNamedAgentRuntime()?.model || selectedModel;
+  const runtime = getActiveNamedAgentRuntime();
+  if (runtime) {
+    // Per-agent model override from runtime settings wins over the agent's
+    // recorded model and the global selection.
+    const settingsModel = normalizeRuntimeModelId(runtime?.settings?.model);
+    if (settingsModel) {
+      // If the setting names a saved provider profile, use its model id.
+      const profile = getRuntimeModelSettingProfile();
+      return profile ? profile.modelId : settingsModel;
+    }
+    return runtime?.model || selectedModel;
+  }
+  const mainSettingsModel = normalizeRuntimeModelId(getMainSessionRuntimeSettings().model);
+  if (mainSettingsModel) {
+    const profile = getRuntimeModelSettingProfile();
+    return profile ? profile.modelId : mainSettingsModel;
+  }
+  return selectedModel;
 }
 
 function getActiveCollaborationMode() {
@@ -6598,6 +7016,39 @@ function getOpenRouterClient() {
   return openRouterClient;
 }
 
+// Build (and cache) an OpenAI client for an explicit provider profile. Used
+// when the runtime "model" setting names a saved provider so the request goes
+// to that provider's base_url/api_key instead of the active provider.
+const providerClientsByKey = new Map();
+
+function getClientForProvider(provider) {
+  if (!OpenAI || !provider) return null;
+  const baseURL =
+    (typeof provider?.base_url === "string" && provider.base_url.trim()) ||
+    OPENROUTER_BASE_URL;
+  const apiKey = String(provider?.api_key || "").trim();
+  if (!apiKey) return null;
+  const clientKey = `${baseURL}|${apiKey}`;
+  const cached = providerClientsByKey.get(clientKey);
+  if (cached) return cached;
+  const defaultHeaders = {};
+  if (typeof baseURL === "string" && baseURL.toLowerCase().includes("openrouter.ai")) {
+    if (process.env.OPENROUTER_HTTP_REFERER) {
+      defaultHeaders["HTTP-Referer"] = process.env.OPENROUTER_HTTP_REFERER;
+    }
+    if (process.env.OPENROUTER_TITLE) {
+      defaultHeaders["X-OpenRouter-Title"] = process.env.OPENROUTER_TITLE;
+    }
+  }
+  const client = new OpenAI({
+    baseURL,
+    apiKey,
+    ...(Object.keys(defaultHeaders).length > 0 ? { defaultHeaders } : {}),
+  });
+  providerClientsByKey.set(clientKey, client);
+  return client;
+}
+
 // Rough token estimate: ~4 chars per token is the common heuristic. Used only
 // for compaction thresholds, not exact billing.
 function estimateTokensForText(text) {
@@ -6625,8 +7076,20 @@ function estimateRequestTokens(messagesForRequest) {
   return messagesForRequest.reduce((sum, message) => sum + estimateMessageTokens(message), 0);
 }
 
+// Cached token estimate: only recomputes when the message count or last
+// message content changes, avoiding the full O(n) walk on every render.
+let _cachedMsgTokens = { count: -1, lastContent: "", tokens: 0 };
+
 function estimateMessagesInChatTokens(entries) {
-  return entries.reduce((sum, entry) => sum + estimateMessageTokens(entry), 0);
+  const entryCount = entries.length;
+  const lastMsg = entryCount > 0 ? entries[entryCount - 1] : null;
+  const lastContent = lastMsg && typeof lastMsg.content === "string" ? lastMsg.content : "";
+  if (_cachedMsgTokens.count === entryCount && _cachedMsgTokens.lastContent === lastContent) {
+    return _cachedMsgTokens.tokens;
+  }
+  const tokens = entries.reduce((sum, entry) => sum + estimateMessageTokens(entry), 0);
+  _cachedMsgTokens = { count: entryCount, lastContent, tokens };
+  return tokens;
 }
 
 function isCompactionSummaryEntry(entry) {
@@ -6642,7 +7105,7 @@ function getCompactionThreshold() {
   // Fall back to a sane default (128k) when the model's context length is
   // unknown, so a missing entry can never collapse the threshold to ~1 token
   // and force compaction on every single request.
-  const rawWindow = getModelContextLength(selectedModel);
+  const rawWindow = getModelContextLength(getActiveSessionModel());
   const windowLength = Number.isFinite(rawWindow) && rawWindow > 0 ? rawWindow : 128000;
   const hardCap = Math.max(1, Math.floor(windowLength * COMPACTION_DEFAULT_FRACTION));
   if (Number.isFinite(configLimit) && configLimit > 0) {
@@ -9655,13 +10118,45 @@ async function executeNativeToolCall(toolCall, generation) {
     }
     pendingCodeEntry.content = visibleOutput;
     pendingCodeEntry.uiContent = visibleOutput;
-    // The live entry object is updated in place. The transcript cache
-    // keys on its object identity, so explicitly invalidate it or the
-    // first streamed frame will remain frozen for the rest of the run.
+
+    // Incremental repaint: rebuild only the live entry's visual lines and
+    // splice them into the cached chat, then repaint just those rows. This
+    // avoids the full-chat rebuild + full repaint every 100ms that lagged
+    // and flickered on large transcripts.
+    const cols = process.stdout.columns || 80;
+    const contentWidth = Math.max(1, cols - CHAT_LEFT_PADDING.length);
+    const newLines = [...buildTranscriptLinesForEntry(pendingCodeEntry, contentWidth)].map(
+      (line) => {
+        const plain = stripAnsiSgr(line);
+        return { text: `${CHAT_LEFT_PADDING}${plain}`, styledText: `${CHAT_LEFT_PADDING}${line}`, color: null, assistantBulletMuted: false };
+      }
+    );
+    const oldHeight = pendingCodeEntryRows.height;
+    if (Array.isArray(cachedChatLines) && pendingCodeEntryRows.start >= 0) {
+      const spliceEnd = Math.min(cachedChatLines.length, pendingCodeEntryRows.start + oldHeight);
+      cachedChatLines.splice(pendingCodeEntryRows.start, spliceEnd - pendingCodeEntryRows.start, ...newLines);
+      pendingCodeEntryRows.height = newLines.length;
+      // Repaint only the changed rows: clear the old range, paint the new.
+      const rows = process.stdout.rows || 24;
+      const visibleStart = Math.max(0, pendingCodeEntryRows.start);
+      const visibleEnd = Math.min(rows, pendingCodeEntryRows.start + Math.max(oldHeight, newLines.length));
+      for (let y = visibleStart; y < visibleEnd; y += 1) {
+        const idx = y;
+        if (idx >= cachedChatLines.length) {
+          writeLine(y, "", cols);
+          continue;
+        }
+        const line = cachedChatLines[idx];
+        if (line?.styledText) writeStyledLine(y, line.text, line.styledText, cols);
+        else if (line?.color) writeColoredLine(y, line.text, cols, line.color);
+        else writeLine(y, line.text, cols);
+      }
+      markDirty();
+      renderFrame(false);
+      return;
+    }
+    // Fallback: no cache or unknown row range - do the full path.
     cachedChatLines = null;
-    // The render scheduler normally repaints chat only when its layout
-    // or entry count changes. Streaming mutates one entry in place, so
-    // request an explicit in-place repaint for every throttled frame.
     forceChatRefreshFlag = true;
     scrollChatToBottom();
     markDirty();
@@ -10640,7 +11135,17 @@ async function requestAssistantReply(modelId, pendingIndex, generation) {
     }
   }
 
-  const client = getOpenRouterClient();
+  // When the runtime "model" setting names a saved provider profile, build
+  // the client from THAT provider so the request goes to the profile's
+  // base_url/api_key with its configured model. Otherwise use the active
+  // provider as usual.
+  const runtimeProfile = getRuntimeModelSettingProfile();
+  let client = null;
+  if (runtimeProfile) {
+    client = getClientForProvider(runtimeProfile.provider);
+  } else {
+    client = getOpenRouterClient();
+  }
   if (!client) {
     const message = OpenAI
       ? "LLM provider is not configured. Set Base URL and API key in /models."
@@ -11124,6 +11629,44 @@ function queueAssistantReply(modelId, options = {}) {
         markDirty();
         renderFrame(false);
         ringBellForCompletedTurn(turnStartMessageIndex);
+        // Optional spoken output: when voice output is enabled and the voice
+        // engine is running, speak the final assistant reply (main session
+        // only, so agent chatter stays silent unless you're watching it).
+        if (
+          activeAgentName === "main" &&
+          getActiveSessionRuntimeSettings().voice_output !== false &&
+          voiceEngineProcess
+        ) {
+          const lastAssistant = messages
+            .slice(turnStartMessageIndex)
+            .filter((entry) => entry && entry.role === "assistant" && String(entry.content || "").trim())
+            .at(-1);
+          if (lastAssistant) {
+            const settings = getActiveSessionRuntimeSettings();
+            let voice = normalizeTtsVoice(settings.tts_voice);
+            const speed = normalizeTtsSpeed(settings.tts_speed);
+            const maxChars = settings.voice_compact !== false ? VOICE_COMPACT_MAX_CHARS : 0;
+            // Auto-switch to the Turkish voice when the reply is Turkish and
+            // the user has not explicitly chosen a different voice. Reading
+            // Turkish with the English model sounds like gibberish.
+            if (/[ıİğĞşŞöÖüÜçÇ]/.test(lastAssistant.content)) {
+              voice = "tf_nisan";
+            }
+            if (settings.voice_llm_rewrite === true && lastAssistant.content.length > 120) {
+              // Opt-in LLM rewrite: rewrite the whole reply to tighter prose,
+              // then speak it in one shot.
+              compactTextForSpeech(lastAssistant.content, maxChars, 2500).then((compacted) => {
+                speakAssistantReply(compacted || lastAssistant.content, voice, speed, maxChars);
+              });
+            } else {
+              // Default: speak the WHOLE reply as a single synthesize. The
+              // engine chunks at ~60 chars and pipelines, so the first words
+              // still start in ~1s and the rest streams - no first/rest split
+              // means no append race that could drop the rest.
+              speakAssistantReply(lastAssistant.content, voice, speed, maxChars);
+            }
+          }
+        }
         // Turn completed: fire Notification then Stop hooks. Stop hooks run
         // with a block cap (8) and receive stop_hook_active after a prior
         // block so they don't loop forever.
@@ -11154,8 +11697,8 @@ function queueAssistantReply(modelId, options = {}) {
                   `Continuing: ${stopRun.blockReason}`,
                   { excludeFromRequest: true, persistHistory: true }
                 );
-                if (selectedModel) {
-                  queueAssistantReply(selectedModel);
+                if (getActiveSessionModel()) {
+                  queueAssistantReply(getActiveSessionModel());
                 }
               }
             } else {
@@ -12566,7 +13109,13 @@ function moveCommandBufferSelection(delta) {
 }
 
 function getModelPickerSource() {
+  if (modelPickerContext?.voicePicker) {
+    return KOKORO_VOICES.map((voice) => ({ id: voice, voice: true }));
+  }
   if (!modelPickerContext) return availableModels;
+  // The "model" runtime setting (like the media-model settings) picks from
+  // saved provider profiles: selecting a profile routes the agent's requests
+  // through that provider's base_url/api_key/model.
   return providers
     .filter((provider) => normalizeRuntimeModelId(provider?.name))
     .map((provider) => ({ id: normalizeRuntimeModelId(provider.name), savedProvider: true }));
@@ -12580,6 +13129,7 @@ function getFilteredModels() {
   }
 
   return models.filter((model) => {
+    if (model.voice) return model.id.toLowerCase().includes(query);
     if (model.savedProvider) return model.id.toLowerCase().includes(query);
     const inModes = model.inputModalities.join(", ");
     const outModes = model.outputModalities.join(", ");
@@ -13745,7 +14295,17 @@ function applyNamedAgentSessionRuntime(record, runtimeInput) {
     ...record,
     session_runtime: runtimeInput,
   });
-  const modelId = runtime.model;
+  // Per-agent model override from runtime settings wins over the recorded model.
+  // When the override names a saved provider profile, resolve it to the
+  // profile's configured model id so the subagent requests the right model.
+  const settingsModel = normalizeRuntimeModelId(runtime?.settings?.model);
+  let modelId = settingsModel || runtime.model;
+  if (settingsModel) {
+    const profile = getSavedProviderProfile(settingsModel);
+    if (profile && normalizeProviderModel(profile.model)) {
+      modelId = normalizeProviderModel(profile.model);
+    }
+  }
   const systemPrompt = buildNamedAgentSystemPrompt(record, runtime);
   const sessionUid = String(record?.session_uid || "current");
   record.session_runtime = runtime;
@@ -13932,6 +14492,10 @@ async function launchNamedAgentRecord(recordPath, record, task, options = {}) {
   next.task_started_at = Number(options.taskStartedAt) || Date.now() / 1000;
   next.active_loop_id = String(options.sourceLoopId || "");
   next.main_handoff_id = String(options.mainHandoffId || "");
+  // When the runtime "model" setting names a saved provider profile, record
+  // the provider so the subagent sends requests through that provider.
+  const runtimeSettingsModel = normalizeRuntimeModelId(runtime?.settings?.model);
+  next.provider_name = runtimeSettingsModel || "";
   await writeJsonAtomic(recordPath, next);
   refreshNamedAgents().catch(() => {});
   runPythonCommand([TOOLS_SCRIPT_PATH, "--launch-subagent", recordPath], { timeout: 10000 })
@@ -14180,7 +14744,7 @@ async function runMainTargetForAgentHandoff(state) {
   const submission = { submittedInput: delegatedPrompt, resolvedContent: delegatedPrompt };
   appendSubmittedUserMessage(submission);
   const turnStartIndex = messages.length;
-  await queueAssistantReply(selectedModel);
+  await queueAssistantReply(getActiveSessionModel());
   const response = messages
     .slice(turnStartIndex)
     .filter((entry) =>
@@ -15278,7 +15842,7 @@ async function runInitCommand() {
   };
   appendSubmittedUserMessage(submission);
   if (APPEND_CHAT_TO_SCROLLBACK) appendTranscriptNow();
-  queueAssistantReply(selectedModel);
+  queueAssistantReply(getActiveSessionModel());
   markDirty();
   renderFrame(false);
   return true;
@@ -15347,6 +15911,44 @@ async function runSlashCommand(commandName, commandArgs = "") {
   }
   if (commandName === "/init") {
     return runInitCommand();
+  }
+
+  if (commandName === "/voice-setup") {
+    if (activeAgentName !== "main") {
+      showAgentCommandNotice("/voice-setup is only available in the main session.", true);
+      return true;
+    }
+    const force = /--force/.test(String(commandArgs ?? ""));
+    showAgentCommandNotice("Downloading voice models (Kokoro TTS) into ~/.nexus/voice...", false, {
+      persist: false,
+    });
+    markDirty();
+    renderFrame(false);
+    try {
+      const setupResult = await runPythonCommand(
+        [TOOLS_SCRIPT_PATH, "--voice-setup", ...(force ? ["--force"] : [])],
+        { timeout: 600000 }
+      );
+      const output = String(setupResult?.stdout || "");
+      const okLines = output.split("\n").filter((line) => line.startsWith("ok:"));
+      showAgentCommandNotice(
+        okLines.length > 0
+          ? `Voice models ready.\n${okLines.join("\n")}`
+          : "Voice models are already present in ~/.nexus/voice (use /voice-setup --force to re-download).",
+        false,
+        { persist: false }
+      );
+    } catch (error) {
+      const stderr = String(error?.stderr || error?.message || "unknown error")
+        .split("\n")
+        .filter((line) => line.trim())
+        .slice(-6)
+        .join("\n");
+      showAgentCommandNotice(`Voice setup failed:\n${stderr}`, true);
+    }
+    markDirty();
+    renderFrame(true);
+    return true;
   }
 
   if (commandName === "/plan") {
@@ -16069,6 +16671,7 @@ function openModelBuffer(options = {}) {
         settingKey,
         label: String(options.label || "model").trim() || "model",
         currentValue: normalizeRuntimeModelId(options.selectedModel),
+        voicePicker: options.voicePicker === true,
       }
     : null;
   commandBufferQuery = "";
@@ -16411,6 +17014,18 @@ function getRuntimeSettings() {
       options: THINKING_EFFORT_OPTIONS,
     },
     {
+      key: "model",
+      label: "model",
+      value: runtimeSettings.model || selectedModel,
+      picker: "model",
+      format: (value) => {
+        if (normalizeRuntimeModelId(runtimeSettings.model)) {
+          return normalizeRuntimeModelId(value) || "not set";
+        }
+        return `global: ${normalizeRuntimeModelId(selectedModel) || "not set"}`;
+      },
+    },
+    {
       key: "text_to_speech_model",
       label: "text to speech",
       value: runtimeSettings.text_to_speech_model,
@@ -16451,6 +17066,46 @@ function getRuntimeSettings() {
       value: runtimeSettings.max_output_tokens,
       options: uniqueSettingOptions([16384, 32768, 65536, 131072, 262144, 393216], runtimeSettings.max_output_tokens),
       format: formatMaxOutputTokens,
+    },
+    {
+      key: "voice_mode",
+      label: "voice mode",
+      value: runtimeSettings.voice_mode,
+      options: ["ptt", "hands-free", "wake-word"],
+      format: (value) => String(value || "ptt"),
+    },
+    {
+      key: "tts_voice",
+      label: "tts voice",
+      value: runtimeSettings.tts_voice,
+      options: KOKORO_VOICES,
+      picker: "voice",
+      format: (value) => String(value || "af_bella"),
+    },
+    {
+      key: "tts_speed",
+      label: "tts speed",
+      value: runtimeSettings.tts_speed,
+      options: [0.8, 0.9, 1.0, 1.05, 1.1, 1.2, 1.3],
+      format: (value) => `${String(value || 1.05)}x`,
+    },
+    {
+      key: "voice_output",
+      label: "voice output",
+      value: runtimeSettings.voice_output,
+      options: [true, false],
+    },
+    {
+      key: "voice_compact",
+      label: "compact voice output",
+      value: runtimeSettings.voice_compact,
+      options: [true, false],
+    },
+    {
+      key: "voice_llm_rewrite",
+      label: "LLM rewrite speech",
+      value: runtimeSettings.voice_llm_rewrite,
+      options: [true, false],
     },
   ];
 }
@@ -16669,6 +17324,21 @@ async function cycleSelectedRuntimeSetting(direction = 1) {
           runtime.settings.request_timeout_ms = normalizeLlmRequestTimeoutMs(nextValue);
         } else if (setting.key === "max_output_tokens") {
           runtime.settings.max_output_tokens = normalizeLlmMaxOutputTokens(nextValue);
+        } else if (setting.key === "voice_mode") {
+          runtime.settings.voice_mode = normalizeVoiceMode(nextValue);
+          if (activeAgentName === "main") setVoiceEngineMode(normalizeVoiceMode(nextValue));
+        } else if (setting.key === "tts_voice") {
+          runtime.settings.tts_voice = normalizeTtsVoice(nextValue);
+        } else if (setting.key === "voice_output") {
+          runtime.settings.voice_output = nextValue === true;
+        } else if (setting.key === "voice_compact") {
+          runtime.settings.voice_compact = nextValue === true;
+        } else if (setting.key === "voice_llm_rewrite") {
+          runtime.settings.voice_llm_rewrite = nextValue === true;
+        } else if (setting.key === "tts_voice") {
+          runtime.settings.tts_voice = normalizeTtsVoice(nextValue);
+        } else if (setting.key === "tts_speed") {
+          runtime.settings.tts_speed = normalizeTtsSpeed(nextValue);
         }
       });
       cachedChatLines = null;
@@ -16701,6 +17371,35 @@ async function cycleSelectedRuntimeSetting(direction = 1) {
       await saveNexusConfig().catch(() => {});
     } else if (setting.key === "max_output_tokens") {
       getMainSessionRuntimeSettings().max_output_tokens = normalizeLlmMaxOutputTokens(nextValue);
+      await rewriteSessionWithCurrentMessages();
+      await saveNexusConfig().catch(() => {});
+    } else if (setting.key === "voice_mode") {
+      getMainSessionRuntimeSettings().voice_mode = normalizeVoiceMode(nextValue);
+      setVoiceEngineMode(normalizeVoiceMode(nextValue));
+      await rewriteSessionWithCurrentMessages();
+      await saveNexusConfig().catch(() => {});
+    } else if (setting.key === "tts_voice") {
+      getMainSessionRuntimeSettings().tts_voice = normalizeTtsVoice(nextValue);
+      await rewriteSessionWithCurrentMessages();
+      await saveNexusConfig().catch(() => {});
+    } else if (setting.key === "voice_output") {
+      getMainSessionRuntimeSettings().voice_output = nextValue === true;
+      await rewriteSessionWithCurrentMessages();
+      await saveNexusConfig().catch(() => {});
+    } else if (setting.key === "voice_compact") {
+      getMainSessionRuntimeSettings().voice_compact = nextValue === true;
+      await rewriteSessionWithCurrentMessages();
+      await saveNexusConfig().catch(() => {});
+    } else if (setting.key === "voice_llm_rewrite") {
+      getMainSessionRuntimeSettings().voice_llm_rewrite = nextValue === true;
+      await rewriteSessionWithCurrentMessages();
+      await saveNexusConfig().catch(() => {});
+    } else if (setting.key === "tts_voice") {
+      getMainSessionRuntimeSettings().tts_voice = normalizeTtsVoice(nextValue);
+      await rewriteSessionWithCurrentMessages();
+      await saveNexusConfig().catch(() => {});
+    } else if (setting.key === "tts_speed") {
+      getMainSessionRuntimeSettings().tts_speed = normalizeTtsSpeed(nextValue);
       await rewriteSessionWithCurrentMessages();
       await saveNexusConfig().catch(() => {});
     }
@@ -17179,7 +17878,8 @@ async function submitRemoteControlPrompt(rawText) {
     return result;
   }
 
-  const queueBehindActiveTurn = isAssistantThinking();
+  const compactionBarrier = getActiveSessionCompactionPromise("main");
+  const queueBehindActiveTurn = isAssistantThinking() || Boolean(compactionBarrier);
   const agentMention = queueBehindActiveTurn ? null : parseAgentDelegationInput(trimmedInput);
   const promptHookRun = await runHooks({
     eventName: "UserPromptSubmit",
@@ -17219,10 +17919,11 @@ async function submitRemoteControlPrompt(rawText) {
       });
     }
   } else {
-    queueAssistantReply(selectedModel, {
+    queueAssistantReply(getActiveSessionModel(), {
       queuedPrompt: queueBehindActiveTurn ? trimmedInput : "",
       deferredUserMessage: queueBehindActiveTurn ? submission : null,
       deferredHookContext: queueBehindActiveTurn ? promptHookRun.additionalContext || "" : "",
+      deferredUntil: compactionBarrier,
     });
   }
   markDirty();
@@ -17631,6 +18332,33 @@ function renderSettingsBuffer() {
 }
 
 async function setActiveRuntimeModelSetting(settingKey, modelId) {
+  if (settingKey === "model") {
+    const normalizedModel = normalizeRuntimeModelId(modelId);
+    if (!normalizedModel) throw new Error("model is not set");
+    if (activeAgentName === "main") {
+      getMainSessionRuntimeSettings().model = normalizedModel;
+      await saveNexusConfig().catch(() => {});
+      await rewriteSessionWithCurrentMessages();
+    } else {
+      await updateActiveNamedAgentSessionRuntime((runtime) => {
+        runtime.settings.model = normalizedModel;
+      });
+    }
+    return normalizedModel;
+  }
+  if (settingKey === "tts_voice") {
+    const normalizedVoice = normalizeTtsVoice(modelId);
+    if (activeAgentName === "main") {
+      getMainSessionRuntimeSettings().tts_voice = normalizedVoice;
+      await saveNexusConfig().catch(() => {});
+      await rewriteSessionWithCurrentMessages();
+    } else {
+      await updateActiveNamedAgentSessionRuntime((runtime) => {
+        runtime.settings.tts_voice = normalizedVoice;
+      });
+    }
+    return normalizedVoice;
+  }
   const supportedKeys = new Set([
     "text_to_speech_model",
     "speech_to_text_model",
@@ -20458,6 +21186,32 @@ function buildChatVisualLines(cols, sourceEntries = messages) {
     }
 
     const role = typeof entry?.role === "string" ? entry.role : "";
+    // Per-entry cache: unchanged entries reuse their pre-built visual lines,
+    // skipping the expensive buildTranscriptLinesForEntry + reasoning
+    // extraction on every frame (the full rebuild is O(n) per render).
+    // Live entries (streaming tool output) change per-frame and must not
+    // reuse a stale cache entry - the incremental live-repaint handles them.
+    const cachedEntry = !entry?.live && cachedEntryLines.get(entry);
+    if (cachedEntry && cachedEntry.cols === contentWidth && cachedEntry.showThinkingBlocks === showThinkingBlocks) {
+      const spacingRows = previousRole === null ? 0 : getMessageSpacingRows(previousRole, role);
+      if (spacingRows > 0) {
+        for (let i = 0; i < spacingRows; i += 1) {
+          visualLines.push({ text: "", styledText: "", color: null, assistantBulletMuted: false });
+        }
+      }
+      entryStartIndex = visualLines.length;
+      if (entry?.live === true && entry?.role === "tool") {
+        pendingCodeEntryRows.start = entryStartIndex;
+      }
+      for (const line of cachedEntry.lines) {
+        visualLines.push(line);
+      }
+      if (entry?.live === true && entry?.role === "tool") {
+        pendingCodeEntryRows.height = visualLines.length - entryStartIndex;
+      }
+      previousRole = role;
+      continue;
+    }
     const entryLines = [...buildTranscriptLinesForEntry(entry, contentWidth)];
     const reasoningText =
       role === "assistant" && showThinkingBlocks
@@ -20494,6 +21248,12 @@ function buildChatVisualLines(cols, sourceEntries = messages) {
     }
 
     entryStartIndex = visualLines.length;
+
+    // Track the streaming live tool entry so renderLiveToolOutput can repaint
+    // just its rows incrementally instead of rebuilding the whole chat.
+    if (entry?.live === true && entry?.role === "tool") {
+      pendingCodeEntryRows.start = entryStartIndex;
+    }
 
     for (const styledLine of reasoningLines) {
       const plainLine = stripAnsiSgr(styledLine);
@@ -20532,6 +21292,20 @@ function buildChatVisualLines(cols, sourceEntries = messages) {
         styledText: `${CHAT_LEFT_PADDING}${lineStyled}`,
         color: null,
         assistantBulletMuted: false,
+      });
+    }
+
+    if (entry?.live === true && entry?.role === "tool") {
+      pendingCodeEntryRows.height = visualLines.length - entryStartIndex;
+    }
+
+    // Cache the entry's visual lines for reuse on the next render frame
+    // (skipped when reveal animation is active since it changes per frame).
+    if (revealElapsed === null && entryLines.length > 0) {
+      cachedEntryLines.set(entry, {
+        cols: contentWidth,
+        showThinkingBlocks,
+        lines: visualLines.slice(entryStartIndex),
       });
     }
 
@@ -21260,8 +22034,13 @@ function renderRuntimeModelPickerBuffer() {
     modelSearch ? "" : `${PLACEHOLDER_COLOR}${searchPlaceholder.padEnd(panelWidth, " ")}${RESET_COLOR}`
   );
   setRow(1, "");
+  const isVoicePicker = modelPickerContext?.voicePicker === true;
   if (entries.length === 0) {
-    const emptyText = modelSearch ? "No matching models" : "No saved models";
+    const emptyText = modelSearch
+      ? "No matching models"
+      : isVoicePicker
+        ? "No voices available"
+        : "No saved models";
     setRow(2, emptyText, `${PLACEHOLDER_COLOR}${emptyText}${RESET_COLOR}`);
   }
   const end = Math.min(entries.length, modelScroll + visibleCount);
@@ -21282,7 +22061,9 @@ function renderRuntimeModelPickerBuffer() {
     const rowPadding = " ".repeat(Math.max(0, panelWidth - stripAnsiSgr(styled).length));
     setRow(2 + index - modelScroll, plain, `${styled}${background}${rowPadding}${RESET_COLOR}`);
   }
-  const footer = "Enter: select model  Esc: return";
+  const footer = isVoicePicker
+    ? "Enter: select voice  Esc: return"
+    : "Enter: select model  Esc: return";
   setRow(rows - 1, footer, `${PLACEHOLDER_COLOR}${footer}${RESET_COLOR}`);
 
   for (let y = 0; y < rows; y += 1) {
@@ -23451,6 +24232,12 @@ function runFormatSelfTest() {
     ];
     modelPickerContext = { returnBuffer: "settings", settingKey: "vision_model", label: "vision model" };
     const savedModelPickerFixture = getModelPickerSource();
+    // Runtime "model" setting resolves a saved provider profile to its model id.
+    const savedMainRuntimeFixture = sessionRuntimeSettings;
+    sessionRuntimeSettings = normalizeSessionRuntimeSettings({ model: "Vision Remote" });
+    const runtimeProfileFixture = getRuntimeModelSettingProfile();
+    const runtimeProfileModelFixture = getActiveSessionModel();
+    sessionRuntimeSettings = savedMainRuntimeFixture;
     providers = savedProvidersFixture;
     modelPickerContext = savedModelPickerContextFixture;
     if (
@@ -23464,14 +24251,17 @@ function runFormatSelfTest() {
       !COMMANDS.some((command) => command.name === "/init") ||
       !COMMANDS.some((command) => command.name === "/agent") ||
       !COMMANDS.some((command) => command.name === "/list-agents") ||
+      !COMMANDS.some((command) => command.name === "/voice-setup") ||
       COMMANDS.some((command) => command.name === "/set") ||
       !INIT_CONTRIBUTOR_GUIDE_PROMPT.includes("Generate a file named AGENTS.md") ||
       !INIT_CONTRIBUTOR_GUIDE_PROMPT.includes('Title the document "Repository Guidelines"') ||
       !INIT_CONTRIBUTOR_GUIDE_PROMPT.includes("200-400 words") ||
-      runtimeSettingKeys.join(",") !== "thinking,thinking_blocks,external_thinking,thinking_effort,text_to_speech_model,speech_to_text_model,vision_model,context_window,request_timeout,max_output_tokens" ||
+      runtimeSettingKeys.join(",") !== "thinking,thinking_blocks,external_thinking,thinking_effort,model,text_to_speech_model,speech_to_text_model,vision_model,context_window,request_timeout,max_output_tokens,voice_mode,tts_voice,tts_speed,voice_output,voice_compact,voice_llm_rewrite" ||
       typeof getRuntimeSettings().find((setting) => setting.key === "thinking")?.value !== "boolean" ||
       typeof getRuntimeSettings().find((setting) => setting.key === "thinking_blocks")?.value !== "boolean" ||
       typeof getRuntimeSettings().find((setting) => setting.key === "external_thinking")?.value !== "boolean" ||
+      getRuntimeSettings().find((setting) => setting.key === "model")?.picker !== "model" ||
+      getRuntimeSettings().find((setting) => setting.key === "model")?.format("") === "global: " ||
       getRuntimeSettings().find((setting) => setting.key === "text_to_speech_model")?.picker !== "model" ||
       getRuntimeSettings().find((setting) => setting.key === "speech_to_text_model")?.picker !== "model" ||
       getRuntimeSettings().find((setting) => setting.key === "vision_model")?.picker !== "model" ||
@@ -23492,10 +24282,28 @@ function runFormatSelfTest() {
         const opts = getRuntimeSettings().find((setting) => setting.key === "max_output_tokens")?.options || [];
         return [16384, 32768, 65536, 131072, 262144, 393216].every((o) => opts.includes(o));
       })() ||
+      runtimeProfileFixture?.profileName !== "Vision Remote" ||
+      runtimeProfileModelFixture !== "hidden/vision-model" ||
       formatMaxOutputTokens(16384) !== "16k" ||
       formatMaxOutputTokens(393216) !== "384k" ||
       normalizeLlmMaxOutputTokens(393216) !== 393216 ||
-      capitalizeSettingLabel("external thinking") !== "External thinking"
+      capitalizeSettingLabel("external thinking") !== "External thinking" ||
+      normalizeVoiceMode("hands-free") !== "hands-free" ||
+      normalizeVoiceMode("bogus") !== "ptt" ||
+      normalizeTtsVoice("af_bella") !== "af_bella" ||
+      normalizeTtsVoice("bad voice") !== "af_bella" ||
+      normalizeTtsSpeed(1.1) !== 1.1 ||
+      normalizeTtsSpeed("bogus") !== 1.05 ||
+      !KOKORO_VOICES.includes("af_heart") ||
+      !KOKORO_VOICES.includes("af_bella") ||
+      !KOKORO_VOICES.includes("tf_nisan") ||
+      !/[ıİğĞşŞöÖüÜçÇ]/.test("Benim adım Nexus") ||
+      /[ıİğĞşŞöÖüÜçÇ]/.test("Hello, how are you?") ||
+      getRuntimeSettings().find((setting) => setting.key === "voice_mode")?.options.join(",") !==
+        "ptt,hands-free,wake-word" ||
+      getRuntimeSettings().find((setting) => setting.key === "voice_output")?.value !== true ||
+      getRuntimeSettings().find((setting) => setting.key === "voice_compact")?.value !== true ||
+      getRuntimeSettings().find((setting) => setting.key === "voice_llm_rewrite")?.value !== false
     ) {
       out(`FORMAT_FAIL: runtime settings buffer is incomplete: ${JSON.stringify(runtimeSettingKeys)}\n`);
       return 1;
@@ -27103,6 +27911,48 @@ async function runNamedAgentSelfTest() {
     } finally {
       namedAgents = savedHandoffAgents;
     }
+
+    // Voice compaction: fast path skips the LLM; the LLM path rewrites the
+    // text; a missing client falls back to the original text.
+    const savedCompactClientFn = getOpenRouterClient;
+    const savedCompactModel = selectedModel;
+    let compactCalled = false;
+    try {
+      const compactFast = await compactTextForSpeech("Short reply.", 600);
+      if (compactFast !== "Short reply." || compactCalled) {
+        throw new Error(`voice compaction fast path should skip the LLM: ${JSON.stringify(compactFast)}`);
+      }
+      // Mock the client: restore getOpenRouterClient to a stub.
+      getOpenRouterClient = () => ({
+        chat: {
+          completions: {
+            create: async () => {
+              compactCalled = true;
+              return { choices: [{ message: { content: "short spoken summary" } }] };
+            },
+          },
+        },
+      });
+      selectedModel = "compact-model";
+      const compactLong = await compactTextForSpeech(
+        "A very long reply that goes on and on with lots of detail and numbers like 1,000 and symbols like 50% plus (parentheticals) and code `x = 1`. Another sentence with even more facts that would exceed the budget.",
+        100
+      );
+      if (compactLong !== "short spoken summary" || !compactCalled) {
+        throw new Error(`voice compaction LLM path failed: ${JSON.stringify(compactLong)}`);
+      }
+      getOpenRouterClient = () => null;
+      const compactFallback = await compactTextForSpeech(
+        "No client configured so this long text must fall back unchanged to the engine truncation path.",
+        100
+      );
+      if (!compactFallback.includes("fall back unchanged")) {
+        throw new Error(`voice compaction should fall back without a client: ${JSON.stringify(compactFallback)}`);
+      }
+    } finally {
+      getOpenRouterClient = savedCompactClientFn;
+      selectedModel = savedCompactModel;
+    }
     out("AGENTS_OK\n");
     return 0;
   } catch (error) {
@@ -27207,6 +28057,10 @@ process.stdin.on("data", (rawChunk) => {
   } else if (activeBuffer === "providers" && chunk === "\u001b") {
     closeProvidersBuffer();
   } else if (activeBuffer === "settings" && chunk === "\u001b") {
+    // Suppress the follow-up readline keypress: after closeSettingsBuffer
+    // flips activeBuffer to "main", a stray Escape would otherwise be seen
+    // as a main-buffer stop and kill a running agent loop.
+    suppressSettingsEscapeKeypressUntil = Date.now() + 1500;
     closeSettingsBuffer();
   } else if (activeBuffer === "remote_control" && chunk === "\u001b") {
     suppressRemoteControlEscapeKeypressUntil = Date.now() + 1500;
@@ -27301,6 +28155,10 @@ process.stdin.on("keypress", async (str, key) => {
   }
   if (isEscapeKey && Date.now() < suppressModelEscapeKeypressUntil) {
     suppressModelEscapeKeypressUntil = 0;
+    return;
+  }
+  if (isEscapeKey && Date.now() < suppressSettingsEscapeKeypressUntil) {
+    suppressSettingsEscapeKeypressUntil = 0;
     return;
   }
   if (isEscapeKey && Date.now() < suppressVoiceEscapeKeypressUntil) {
@@ -28083,6 +28941,17 @@ process.stdin.on("keypress", async (str, key) => {
         });
         return;
       }
+      if (isEnter && setting?.picker === "voice") {
+        settingsMessage = "";
+        openModelBuffer({
+          returnBuffer: "settings",
+          settingKey: setting.key,
+          label: setting.label,
+          selectedModel: setting.value,
+          voicePicker: true,
+        });
+        return;
+      }
       await cycleSelectedRuntimeSetting(key?.name === "left" ? -1 : 1);
       updateSettingsSelectionState();
       markDirty();
@@ -28664,7 +29533,7 @@ process.stdin.on("keypress", async (str, key) => {
 
     // Reminders go through the model via the set_reminder tool, which the
     // agent calls when the user asks to be reminded ("remind me in 5 min").
-    const modelAtSubmit = selectedModel;
+    const modelAtSubmit = getActiveSessionModel();
     // The user's message always enters the transcript; notify defers nothing
     // (runAgentNotification appends the executed notify_agent tool result).
     const submission = submit({
