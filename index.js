@@ -153,6 +153,7 @@ const WHITE_COLOR = "\u001b[97m";
 const BOLD_WHITE = "\u001b[1m\u001b[97m";
 const VSCODE_BLUE_COLOR = "\u001b[38;2;86;156;214m";
 const GOLDENROD_COLOR = "\u001b[38;2;218;165;32m";
+const PASTEL_YELLOW_COLOR = "\u001b[38;2;250;240;180m";
 const AGENT_MENTION_NAME_COLOR = "\u001b[35m";
 const CODE_BLOCK_BG_COLOR = "\u001b[48;5;236m";
 const SESSION_EVEN_BG_COLOR = "\u001b[48;2;24;24;24m";
@@ -1141,6 +1142,7 @@ const COMMANDS = [
   { name: "/cache", description: "show prompt fingerprint and provider cache-token telemetry" },
   { name: "/loop", description: "usage: /loop <interval> <prompt>" },
   { name: "/loops", description: "list or cancel scheduled loops: /loops | /loops cancel <id>" },
+  { name: "/goal", description: "set a persistent autonomous goal: /goal <objective> | /goal pause|resume|clear|status" },
   { name: "/hooks", description: "show configured lifecycle hooks (read-only)" },
   { name: "/solve", description: "run an autonomous solve loop in an isolated workspace: /solve <directory>" },
   { name: "/kernels", description: "view, resume, restart, or delete sessions created by /solve" },
@@ -5743,23 +5745,25 @@ async function ensureSystemPromptReady(forceReload = false) {
 }
 
 function ensureSystemMessageAtTop() {
+  const goalSection = buildGoalSystemSection();
   systemPromptText = buildSystemPromptFromDescriptions(toolDescriptions, {
     collaborationMode,
     workspaceGuideText,
     workspaceGuideFileName,
   });
+  const fullPrompt = goalSection ? `${systemPromptText}${goalSection}` : systemPromptText;
 
   if (messages.length === 0) {
-    messages.push({ role: "system", content: systemPromptText, hidden: true });
+    messages.push({ role: "system", content: fullPrompt, hidden: true });
     return;
   }
 
   if (messages[0]?.role !== "system") {
-    messages.unshift({ role: "system", content: systemPromptText, hidden: true });
+    messages.unshift({ role: "system", content: fullPrompt, hidden: true });
     return;
   }
 
-  messages[0] = { ...messages[0], role: "system", content: systemPromptText, hidden: true };
+  messages[0] = { ...messages[0], role: "system", content: fullPrompt, hidden: true };
 }
 
 function resetMessagesToSystemPrompt() {
@@ -5811,6 +5815,7 @@ async function rewriteSessionWithCurrentMessages() {
       payload.sessionRuntimeSettings = getMainSessionRuntimeSettings();
       payload.sessionContextLeftByModel = normalizeContextLeftMap(contextLeftPercentByModel);
       payload.sessionCacheTelemetryByModel = normalizeCacheTelemetryMap(cacheTelemetryByModel);
+      payload.activeGoal = activeGoal ? { ...activeGoal } : null;
       payload.excludeFromRequest = entry?.excludeFromRequest === true;
       if (Array.isArray(entry?.reasoningDetails) && entry.reasoningDetails.length > 0) {
         payload.reasoning_details = entry.reasoningDetails;
@@ -6306,8 +6311,8 @@ function getDefaultSessionRuntimeSettings() {
     voice_mode: normalizeVoiceMode(nexusConfig?.voice_mode),
     tts_voice: normalizeTtsVoice(nexusConfig?.tts_voice),
     tts_speed: normalizeTtsSpeed(nexusConfig?.tts_speed),
-    voice_output: nexusConfig?.voice_output !== false,
-    voice_compact: nexusConfig?.voice_compact !== false,
+    voice_output: nexusConfig?.voice_output === true,
+    voice_compact: nexusConfig?.voice_compact === true,
     voice_llm_rewrite: nexusConfig?.voice_llm_rewrite === true,
   };
 }
@@ -6389,11 +6394,11 @@ function normalizeSessionRuntimeSettings(raw, defaults = getDefaultSessionRuntim
     tts_voice: normalizeTtsVoice(source.tts_voice ?? defaults.tts_voice),
     tts_speed: normalizeTtsSpeed(source.tts_speed ?? defaults.tts_speed),
     voice_output: Object.prototype.hasOwnProperty.call(source, "voice_output")
-      ? source.voice_output !== false
-      : defaults.voice_output !== false,
+      ? source.voice_output === true
+      : defaults.voice_output === true,
     voice_compact: Object.prototype.hasOwnProperty.call(source, "voice_compact")
-      ? source.voice_compact !== false
-      : defaults.voice_compact !== false,
+      ? source.voice_compact === true
+      : defaults.voice_compact === true,
     voice_llm_rewrite: Object.prototype.hasOwnProperty.call(source, "voice_llm_rewrite")
       ? source.voice_llm_rewrite === true
       : defaults.voice_llm_rewrite === true,
@@ -6617,6 +6622,8 @@ async function ensureNexusConfigFileReady() {
     text_to_speech_model: "",
     speech_to_text_model: "",
     vision_model: "",
+    voice_output: false,
+    voice_compact: false,
   };
   const content = `${JSON.stringify(initialConfig, null, 2)}\n`;
   try {
@@ -6706,6 +6713,16 @@ async function saveNexusConfig() {
     vision_model: normalizeRuntimeModelId(
       nexusConfig?.vision_model ?? current?.vision_model
     ),
+    voice_output: (
+      sessionRuntimeSettings?.voice_output ??
+      nexusConfig?.voice_output ??
+      current?.voice_output
+    ) === true,
+    voice_compact: (
+      sessionRuntimeSettings?.voice_compact ??
+      nexusConfig?.voice_compact ??
+      current?.voice_compact
+    ) === true,
     model_context_window_override: normalizeModelContextWindow(
       nexusConfig?.model_context_window_override ??
         sessionRuntimeSettings?.context_window ??
@@ -6746,6 +6763,8 @@ async function loadNexusConfig() {
     text_to_speech_model: normalizeRuntimeModelId(parsed?.text_to_speech_model),
     speech_to_text_model: normalizeRuntimeModelId(parsed?.speech_to_text_model),
     vision_model: normalizeRuntimeModelId(parsed?.vision_model),
+    voice_output: parsed?.voice_output === true,
+    voice_compact: parsed?.voice_compact === true,
   };
   const providerName = typeof parsed.provider === "string" ? parsed.provider.trim() : "";
   if (providerName) {
@@ -6801,10 +6820,10 @@ function normalizeProviderEntry(raw) {
     base_url: base_url.trim(),
     api_key,
     model,
-    has_image_input: raw?.has_image_input !== false,
-    has_video_input: raw?.has_video_input !== false,
-    has_audio_input: raw?.has_audio_input !== false,
-    has_file_input: raw?.has_file_input !== false,
+    has_image_input: raw?.has_image_input === true,
+    has_video_input: raw?.has_video_input === true,
+    has_audio_input: raw?.has_audio_input === true,
+    has_file_input: raw?.has_file_input === true,
   };
 }
 
@@ -6910,6 +6929,7 @@ function appendHistoryEntry(role, content, extra = null) {
   payload.sessionRuntimeSettings = getMainSessionRuntimeSettings();
   payload.sessionContextLeftByModel = normalizeContextLeftMap(contextLeftPercentByModel);
   payload.sessionCacheTelemetryByModel = normalizeCacheTelemetryMap(cacheTelemetryByModel);
+  payload.activeGoal = activeGoal ? { ...activeGoal } : null;
   payload.excludeFromRequest = false;
   if (extra && typeof extra === "object") {
     if (Array.isArray(extra.reasoningDetails) && extra.reasoningDetails.length > 0) {
@@ -7153,6 +7173,78 @@ let activeMainLoopTaskId = "";
 let namedLoopPersistenceSuspended = false;
 let namedLoopPersistenceChain = Promise.resolve();
 let namedLoopsLoaded = false;
+// Persistent goal state (Codex-style /goal): a durable objective attached to
+// the current thread that keeps the agent working across turns until the
+// model verifies completion (GOAL_COMPLETE), the user pauses/clears it, an
+// interruption occurs, or the iteration budget is exhausted.
+let activeGoal = null; // { text, iterations, maxIterations, paused, startedAt }
+const GOAL_MAX_ITERATIONS = 40;
+const GOAL_COMPLETE_SENTINEL = "GOAL_COMPLETE";
+
+function setActiveGoal(text, options = {}) {
+  const normalized = String(text || "").trim();
+  if (!normalized) {
+    return { ok: false, error: "Goal text is required." };
+  }
+  activeGoal = {
+    text: normalized,
+    iterations: 0,
+    maxIterations: Math.max(1, Number(options.maxIterations) || GOAL_MAX_ITERATIONS),
+    paused: false,
+    startedAt: Date.now(),
+  };
+  return { ok: true, goal: activeGoal };
+}
+
+function clearActiveGoal() {
+  activeGoal = null;
+  return true;
+}
+
+function pauseActiveGoal() {
+  if (!activeGoal) return false;
+  activeGoal.paused = true;
+  return true;
+}
+
+function resumeActiveGoal() {
+  if (!activeGoal) return false;
+  activeGoal.paused = false;
+  return true;
+}
+
+function getActiveGoalSummary() {
+  if (!activeGoal) return null;
+  const elapsedMin = Math.max(0, Math.floor((Date.now() - activeGoal.startedAt) / 60000));
+  return {
+    text: activeGoal.text,
+    iterations: activeGoal.iterations,
+    maxIterations: activeGoal.maxIterations,
+    paused: activeGoal.paused,
+    elapsedMin,
+  };
+}
+
+// Goal block appended to the system prompt while a goal is active.
+function buildGoalSystemSection() {
+  const goal = getActiveGoalSummary();
+  if (!goal) return "";
+  return [
+    "",
+    "ACTIVE GOAL (persistent objective):",
+    goal.text,
+    "",
+    "GOAL RULES:",
+    "- Keep working toward this goal across turns until it is achieved. Do not stop after a single result unless the goal is verified complete.",
+    "- After each turn, check the evidence (tests, command output, files, benchmarks) and decide the next best action.",
+    "- Continue from the latest state; do not repeat completed work.",
+    `- When the goal is verified complete with concrete evidence, end your reply with exactly: ${GOAL_COMPLETE_SENTINEL} <one-line summary>`,
+    `- If blocked with no defensible path remains, end your reply with exactly: ${GOAL_COMPLETE_SENTINEL} BLOCKED: <what blocks progress>`,
+    `- Iteration budget: ${goal.iterations + 1}/${goal.maxIterations} used so far.`,
+    "",
+  ].join("\n");
+}
+
 let solveActive = false;
 let solveStartupActive = false;
 let solveStartupStatus = "";
@@ -9975,6 +10067,25 @@ function finalizePendingAssistantMessage(index, text, generation, options = {}) 
     triggerAnswerReveal(nextEntry);
   }
 
+  // Codex-style goal completion: detect the GOAL_COMPLETE sentinel in the
+  // final reply and stop the continuation loop.
+  if (role === "assistant" && activeGoal) {
+    const goalMatch = String(content).match(
+      new RegExp(`(?:^|\\n)\\s*${GOAL_COMPLETE_SENTINEL}\\s*:?\\s*(.+)`, "i")
+    );
+    if (goalMatch || String(content).includes(GOAL_COMPLETE_SENTINEL)) {
+      const summary = goalMatch ? String(goalMatch[1] || "").trim() : "";
+      const blocked = /^blocked/i.test(summary);
+      appendAssistantMessage(
+        blocked
+          ? `[goal] Stopped: blocked after ${activeGoal.iterations} iterations. ${summary}`
+          : `[goal] Completed after ${activeGoal.iterations} iteration${activeGoal.iterations === 1 ? "" : "s"}: ${summary || "verified complete"}`,
+        { excludeFromRequest: true, persistHistory: false }
+      );
+      clearActiveGoal();
+    }
+  }
+
   if (persistHistory) {
     const historyExtra = {};
     if (reasoningDetails) historyExtra.reasoningDetails = reasoningDetails;
@@ -10837,15 +10948,31 @@ function buildToolResultPayload(result) {
 
   if (result?.ok) {
     const outputText = output.trim();
-    const looksLikeEditResultDict =
-      outputText.startsWith("{") &&
-      outputText.endsWith("}") &&
-      /["'](?:path|file|replacements|bytes_written|added_lines|removed_lines|changed)["']/.test(
-        outputText
-      );
+    // File helpers already emit a rich diff through editEvents. If their return
+    // dictionary is also printed, hide only that dictionary from the UI while
+    // preserving every other stdout line (for example a following run_shell
+    // result). Keep the untouched output in history so the model still sees the
+    // exact helper return value.
+    const visibleOutput = editEvents.length > 0
+      ? output
+          .split("\n")
+          .filter((line) => {
+            const text = line.trim();
+            if (!text.startsWith("{") || !text.endsWith("}")) return true;
+            const hasEditTarget = /["'](?:path|file)["']\s*:/.test(text);
+            const hasEditOutcome =
+              /["'](?:replacements|bytes_written|added_lines|removed_lines|changed)["']\s*:/.test(
+                text
+              );
+            return !(hasEditTarget && hasEditOutcome);
+          })
+          .join("\n")
+          .trimEnd()
+      : output;
+    const visibleOutputText = visibleOutput.trim();
     const displayParts = [];
-    if (outputText.length > 0 && !(editEvents.length > 0 && looksLikeEditResultDict)) {
-      displayParts.push(output);
+    if (visibleOutputText.length > 0) {
+      displayParts.push(visibleOutput);
     }
     if (editEvents.length > 0) {
       displayParts.push(editEvents.join("\n"));
@@ -10868,17 +10995,18 @@ function buildToolResultPayload(result) {
       /["'](?:created_count|updated_count|entry_count|entries|plan)["']/.test(outputText);
     const uiSections = planUiMarkdown
       ? [
-          ...(!looksLikeStandalonePlanResult && outputText.length > 0
-            ? [{ kind: "result", text: output }]
+          ...(!looksLikeStandalonePlanResult && visibleOutputText.length > 0
+            ? [{ kind: "result", text: visibleOutput }]
             : []),
           ...editEvents.map((text) => ({ kind: "edit", text })),
           { kind: "plan", text: planUiMarkdown },
         ]
-      : editEvents.length > 0 && outputText.length > 0 &&
-          !(editEvents.length > 0 && looksLikeEditResultDict)
+      : editEvents.length > 0
         ? [
             ...editEvents.map((text) => ({ kind: "edit", text })),
-            { kind: "result", text: output },
+            ...(visibleOutputText.length > 0
+              ? [{ kind: "result", text: visibleOutput }]
+              : []),
           ]
         : [];
     return {
@@ -11263,7 +11391,8 @@ function appendToolMessages(
     toolInput: normalizedInput,
     toolCode: normalizedCode,
     toolOk: Boolean(toolOk),
-    ...(normalizedUiKind ? { uiKind: normalizedUiKind, uiContent: safeResult } : {}),
+    uiContent: safeResult,
+    ...(normalizedUiKind ? { uiKind: normalizedUiKind } : {}),
     ...(normalizedPlanAction ? { planAction: normalizedPlanAction } : {}),
   });
   scrollChatToBottom();
@@ -11866,7 +11995,7 @@ function queueAssistantReply(modelId, options = {}) {
         // only, so agent chatter stays silent unless you're watching it).
         if (
           activeAgentName === "main" &&
-          getActiveSessionRuntimeSettings().voice_output !== false &&
+          getActiveSessionRuntimeSettings().voice_output === true &&
           voiceEngineProcess
         ) {
           const lastAssistant = messages
@@ -11883,7 +12012,7 @@ function queueAssistantReply(modelId, options = {}) {
             const settings = getActiveSessionRuntimeSettings();
             let voice = normalizeTtsVoice(settings.tts_voice);
             const speed = normalizeTtsSpeed(settings.tts_speed);
-            const maxChars = settings.voice_compact !== false ? VOICE_COMPACT_MAX_CHARS : 0;
+            const maxChars = settings.voice_compact === true ? VOICE_COMPACT_MAX_CHARS : 0;
             // Auto-switch to the Turkish voice when the reply is Turkish and
             // the user has not explicitly chosen a different voice. Reading
             // Turkish with the English model sounds like gibberish.
@@ -11915,6 +12044,37 @@ function queueAssistantReply(modelId, options = {}) {
             excludeFromRequest: true,
             persistHistory: false,
           });
+        }
+        // Codex-style goal continuation: when a goal is active (not paused),
+        // within budget, and the thread is idle with no user input queued,
+        // queue the next autonomous turn toward the goal. Completion is
+        // detected from the GOAL_COMPLETE sentinel in the reply (parsed when
+        // the turn finalizes); stopping also happens on Esc/interruption.
+        if (
+          activeAgentName === "main" &&
+          activeGoal &&
+          !activeGoal.paused &&
+          !stopRequested &&
+          activeGoal.iterations < activeGoal.maxIterations
+        ) {
+          activeGoal.iterations += 1;
+          appendAssistantMessage(
+            `[goal] iteration ${activeGoal.iterations}/${activeGoal.maxIterations}: continuing toward: ${activeGoal.text}`,
+            { excludeFromRequest: true, persistHistory: false }
+          );
+          // The continuation instruction must reach the model: append it as a
+          // real (hidden) user message, then queue the next turn. queuedPrompt
+          // alone only feeds the busy indicator, not the request content.
+          const continuationPrompt = `Continue working toward the active goal. Check the current evidence, take the next best action, and verify progress. Reply with ${GOAL_COMPLETE_SENTINEL} only when the goal is verified complete with evidence or blocked.`;
+          messages.push({
+            role: "user",
+            content: continuationPrompt,
+            hidden: true,
+            excludeFromRequest: false,
+          });
+          markDirty();
+          renderFrame(false);
+          queueAssistantReply(getActiveSessionModel());
         }
         // Turn completed: fire Notification then Stop hooks. Stop hooks run
         // with a block cap (8) and receive stop_hook_active after a prior
@@ -15538,6 +15698,20 @@ function parseSessionHistory(raw, options = {}) {
       if (parsed?.sessionCacheTelemetryByModel && typeof parsed.sessionCacheTelemetryByModel === "object") {
         sessionCacheTelemetryByModel = normalizeCacheTelemetryMap(parsed.sessionCacheTelemetryByModel);
       }
+      if (
+        parsed?.activeGoal &&
+        typeof parsed.activeGoal === "object" &&
+        typeof parsed.activeGoal.text === "string" &&
+        parsed.activeGoal.text.trim()
+      ) {
+        activeGoal = {
+          text: String(parsed.activeGoal.text).trim(),
+          iterations: Math.max(0, Number(parsed.activeGoal.iterations) || 0),
+          maxIterations: Math.max(1, Number(parsed.activeGoal.maxIterations) || GOAL_MAX_ITERATIONS),
+          paused: parsed.activeGoal.paused === true,
+          startedAt: Number(parsed.activeGoal.startedAt) || Date.now(),
+        };
+      }
 
       const role = typeof parsed?.role === "string" ? parsed.role : "assistant";
       const content = parsed.content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
@@ -16524,6 +16698,120 @@ async function runSlashCommand(commandName, commandArgs = "") {
     return true;
   }
 
+  if (commandName === "/goal") {
+    const args = String(commandArgs ?? "").trim();
+    const sub = args.split(/\s+/, 1)[0].toLowerCase();
+    if (args === "" || sub === "status" || sub === "view") {
+      const goal = getActiveGoalSummary();
+      if (!goal) {
+        showAgentCommandNotice(
+          "No active goal. Set one with '/goal <objective>' (e.g. /goal fix all failing tests).",
+          false,
+          { persist: false }
+        );
+      } else {
+        showAgentCommandNotice(
+          `Active goal (${goal.paused ? "paused" : "running"}, ${goal.iterations}/${goal.maxIterations} iterations, ${goal.elapsedMin}m elapsed):\n${goal.text}`,
+          false,
+          { persist: false }
+        );
+      }
+      markDirty();
+      renderFrame(true);
+      return true;
+    }
+    if (sub === "pause") {
+      const paused = pauseActiveGoal();
+      showAgentCommandNotice(paused ? "Goal paused. Resume with '/goal resume'." : "No active goal to pause.", paused ? false : true, { persist: false });
+      markDirty();
+      renderFrame(true);
+      return true;
+    }
+    if (sub === "resume") {
+      const resumed = resumeActiveGoal();
+      if (resumed) {
+        showAgentCommandNotice("Goal resumed. The agent will continue on the next idle turn.", false, { persist: false });
+        // Immediately kick off the next continuation if the thread is idle.
+        if (activeAgentName === "main" && !isAssistantThinking() && pendingAssistantRequests === 0) {
+          activeGoal.iterations += 1;
+          messages.push({
+            role: "user",
+            content: `Continue working toward the active goal. Check the current evidence, take the next best action, and verify progress. Reply with ${GOAL_COMPLETE_SENTINEL} only when the goal is verified complete with evidence or blocked.`,
+            hidden: true,
+            excludeFromRequest: false,
+          });
+          markDirty();
+          renderFrame(false);
+          queueAssistantReply(getActiveSessionModel());
+        }
+      } else {
+        showAgentCommandNotice("No active goal to resume.", true, { persist: false });
+      }
+      markDirty();
+      renderFrame(true);
+      return true;
+    }
+    if (sub === "clear") {
+      const hadGoal = Boolean(activeGoal);
+      clearActiveGoal();
+      showAgentCommandNotice(hadGoal ? "Goal cleared. Autonomous continuation stopped." : "No active goal to clear.", !hadGoal, { persist: false });
+      markDirty();
+      renderFrame(true);
+      return true;
+    }
+    if (sub === "max") {
+      // /goal max <N> - adjust iteration budget (rarely needed).
+      const budget = Number(args.slice(sub.length).trim());
+      if (!Number.isFinite(budget) || budget <= 0) {
+        showAgentCommandNotice("Invalid budget. Use '/goal max <iterations>'.", true, { persist: false });
+      } else if (activeGoal) {
+        activeGoal.maxIterations = Math.floor(budget);
+        showAgentCommandNotice(`Goal iteration budget set to ${activeGoal.maxIterations}.`, false, { persist: false });
+      } else {
+        showAgentCommandNotice("No active goal.", true, { persist: false });
+      }
+      markDirty();
+      renderFrame(true);
+      return true;
+    }
+    // Set a new goal.
+    if (activeAgentName !== "main") {
+      showAgentCommandNotice("/goal is only available in the main session.", true);
+      return true;
+    }
+    if (isAssistantThinking() || pendingAssistantRequests > 0) {
+      showAgentCommandNotice("Wait for the current turn to finish before setting a goal.", true);
+      return true;
+    }
+    const result = setActiveGoal(args);
+    if (!result.ok) {
+      showAgentCommandNotice(result.error || "Could not set goal.", true);
+      return true;
+    }
+    // Refresh the system prompt so the goal is visible to the model.
+    ensureSystemMessageAtTop();
+    showAgentCommandNotice(
+      `Goal set (${activeGoal.maxIterations} iterations max): ${activeGoal.text}\nThe agent will continue autonomously until it verifies completion, is blocked, or you pause/clear it.`,
+      false,
+      { persist: false }
+    );
+    await rewriteSessionWithCurrentMessages();
+    refreshMainBufferAfterCommand();
+    markDirty();
+    renderFrame(true);
+    // Kick off the first autonomous iteration immediately.
+    messages.push({
+      role: "user",
+      content: `Begin working toward the active goal: ${activeGoal.text}. Take the first evidence-based step and continue until complete. Reply with ${GOAL_COMPLETE_SENTINEL} only when the goal is verified complete with evidence or blocked.`,
+      hidden: true,
+      excludeFromRequest: false,
+    });
+    markDirty();
+    renderFrame(false);
+    queueAssistantReply(getActiveSessionModel());
+    return true;
+  }
+
   if (commandName === "/solve") {
     const specText = String(commandArgs ?? "").trim();
     if (!specText) {
@@ -17238,6 +17526,25 @@ function formatRuntimeModelSetting(value) {
   return normalizeRuntimeModelId(value) || "not set";
 }
 
+// Category labels for the /settings buffer. Header rows are rendered between
+// categories to make the list easier to scan; they are purely visual (not
+// selectable) and hidden while searching.
+const SETTINGS_CATEGORY_ORDER = [
+  { label: "Model & Reasoning", keys: ["thinking", "thinking_blocks", "external_thinking", "thinking_effort", "model"] },
+  { label: "Media Models", keys: ["text_to_speech_model", "speech_to_text_model", "vision_model"] },
+  { label: "Context & Limits", keys: ["context_window", "request_timeout", "max_output_tokens"] },
+  { label: "Voice", keys: ["voice_mode", "tts_voice", "tts_speed", "voice_output", "voice_compact", "voice_llm_rewrite"] },
+];
+
+function getSettingCategoryLabel(settingKey) {
+  for (const category of SETTINGS_CATEGORY_ORDER) {
+    if (category.keys.includes(settingKey)) {
+      return category.label;
+    }
+  }
+  return "";
+}
+
 function getRuntimeSettings() {
   const runtimeSettings = getActiveSessionRuntimeSettings();
   const contextWindow = runtimeSettings.context_window;
@@ -17369,6 +17676,19 @@ function getFilteredRuntimeSettings() {
   });
 }
 
+function getSettingsVisualRowCount() {
+  const settings = getFilteredRuntimeSettings();
+  if (settingsSearch) return settings.length;
+  let headers = 0;
+  let lastCategory = "";
+  for (const setting of settings) {
+    const category = getSettingCategoryLabel(setting.key);
+    if (category && category !== lastCategory) headers += 1;
+    lastCategory = category || lastCategory;
+  }
+  return settings.length + headers;
+}
+
 function updateSettingsSelectionState() {
   const settings = getFilteredRuntimeSettings();
   settingsSelected = Math.max(0, Math.min(settingsSelected, Math.max(0, settings.length - 1)));
@@ -17377,7 +17697,9 @@ function updateSettingsSelectionState() {
   if (settingsSelected >= settingsScroll + visibleCount) {
     settingsScroll = settingsSelected - visibleCount + 1;
   }
-  settingsScroll = Math.min(settingsScroll, Math.max(0, settings.length - visibleCount));
+  // Account for category header rows when limiting the scroll bottom.
+  const visualTotal = getSettingsVisualRowCount();
+  settingsScroll = Math.min(settingsScroll, Math.max(0, visualTotal - visibleCount));
 }
 
 function openSettingsBuffer() {
@@ -18517,8 +18839,39 @@ function renderSettingsBuffer() {
   else setPanelRow(0, "Type to search", PLACEHOLDER_COLOR);
   if (settingsMessage) setPanelRow(1, settingsMessage, PLACEHOLDER_COLOR);
   if (settings.length === 0) setPanelRow(2, "no matching settings", PLACEHOLDER_COLOR);
+
+  // Category headers (visual only, not selectable). Hidden while searching so
+  // results read as a flat filtered list.
+  const showCategories = !settingsSearch;
+  const categoryByIndex = new Map();
+  let lastCategory = "";
+  for (let i = 0; i < settings.length; i += 1) {
+    const category = showCategories ? getSettingCategoryLabel(settings[i].key) : "";
+    if (category && category !== lastCategory) {
+      categoryByIndex.set(i, category);
+    }
+    lastCategory = category || lastCategory;
+  }
+
   const end = Math.min(settings.length, settingsScroll + visibleCount);
+  let visualRow = settingsMessage ? 3 : 2;
   for (let i = settingsScroll; i < end; i += 1) {
+    if (categoryByIndex.has(i)) {
+      // Blank spacer row before each category header (except when it is the
+      // very first visible row) so groups read as distinct sections.
+      if (visualRow > (settingsMessage ? 3 : 2)) {
+        setPanelRow(visualRow, " ".repeat(panelWidth));
+        visualRow += 1;
+      }
+      const headerText = ` ── ${categoryByIndex.get(i)} ──`;
+      setPanelRow(
+        visualRow,
+        headerText.padEnd(panelWidth, " "),
+        null,
+        `${PASTEL_YELLOW_COLOR}${headerText.padEnd(panelWidth, " ")}${RESET_COLOR}`
+      );
+      visualRow += 1;
+    }
     const setting = settings[i];
     const selected = i === settingsSelected;
     const marker = selected ? "●" : "○";
@@ -18541,14 +18894,15 @@ function renderSettingsBuffer() {
       const visibleHint = hintText.slice(0, Math.max(0, panelWidth - visibleMain.length));
       const padding = " ".repeat(Math.max(0, panelWidth - visibleMain.length - visibleHint.length));
       setPanelRow(
-        2 + i - settingsScroll,
+        visualRow,
         `${mainText}${hintText}`,
         null,
         `${GOLDENROD_COLOR}${visibleMain}${RESET_COLOR}${PLACEHOLDER_COLOR}${visibleHint}${RESET_COLOR}${padding}`
       );
     } else {
-      setPanelRow(2 + i - settingsScroll, mainText);
+      setPanelRow(visualRow, mainText);
     }
+    visualRow += 1;
   }
   setPanelRow(
     rows - 1,
@@ -20838,6 +21192,13 @@ function handleStopRequest(options = {}) {
   }
   stopNoticeOverride = String(options.notice || "");
   stopRequested = true;
+
+  // Codex-style goal handling on interruption: pausing the goal prevents the
+  // idle continuation from immediately re-queueing after the stop. The user
+  // can resume with '/goal resume'.
+  if (activeGoal && !activeGoal.paused) {
+    activeGoal.paused = true;
+  }
 
   if (getActiveAgentHandoff()) {
     cancelAgentHandoff()
@@ -24529,6 +24890,11 @@ function runFormatSelfTest() {
       typeof getRuntimeSettings().find((setting) => setting.key === "thinking")?.value !== "boolean" ||
       typeof getRuntimeSettings().find((setting) => setting.key === "thinking_blocks")?.value !== "boolean" ||
       typeof getRuntimeSettings().find((setting) => setting.key === "external_thinking")?.value !== "boolean" ||
+      getSettingCategoryLabel("thinking") !== "Model & Reasoning" ||
+      getSettingCategoryLabel("vision_model") !== "Media Models" ||
+      getSettingCategoryLabel("context_window") !== "Context & Limits" ||
+      getSettingCategoryLabel("tts_voice") !== "Voice" ||
+      getSettingCategoryLabel("bogus_setting") !== "" ||
       getRuntimeSettings().find((setting) => setting.key === "model")?.picker !== "model" ||
       getRuntimeSettings().find((setting) => setting.key === "model")?.format("") === "global: " ||
       getRuntimeSettings().find((setting) => setting.key === "text_to_speech_model")?.picker !== "model" ||
@@ -24553,6 +24919,16 @@ function runFormatSelfTest() {
       })() ||
       runtimeProfileFixture?.profileName !== "Vision Remote" ||
       runtimeProfileModelFixture !== "hidden/vision-model" ||
+      !(() => {
+        const savedGoal = activeGoal;
+        const result = setActiveGoal("fix all failing tests");
+        const ok = result.ok && activeGoal && activeGoal.text === "fix all failing tests" && !activeGoal.paused;
+        const paused = pauseActiveGoal() && activeGoal.paused === true;
+        const resumed = resumeActiveGoal() && activeGoal.paused === false;
+        const cleared = clearActiveGoal() && activeGoal === null;
+        activeGoal = savedGoal;
+        return ok && paused && resumed && cleared;
+      })() ||
       substituteImageDescriptions("see [Image #1] now", new Map([[1, "a cat"]])) !==
         "see <image#1>a cat</image> now" ||
       substituteImageDescriptions("no images", new Map()) !== "no images" ||
@@ -24568,8 +24944,13 @@ function runFormatSelfTest() {
       !PROVIDER_BOOL_FIELDS.has("has_audio_input") ||
       !PROVIDER_BOOL_FIELDS.has("has_file_input") ||
       getProviderEditorFields().length !== 8 ||
+      normalizeProviderEntry({ name: "P" }).has_image_input !== false ||
+      normalizeProviderEntry({ name: "P" }).has_video_input !== false ||
+      normalizeProviderEntry({ name: "P" }).has_audio_input !== false ||
+      normalizeProviderEntry({ name: "P" }).has_file_input !== false ||
       normalizeProviderEntry({ name: "P", has_image_input: false }).has_image_input !== false ||
       normalizeProviderEntry({ name: "P", has_audio_input: false }).has_audio_input !== false ||
+      normalizeProviderEntry({ name: "P", has_image_input: true }).has_image_input !== true ||
       normalizeTtsVoice("af_bella") !== "af_bella" ||
       normalizeTtsVoice("bad voice") !== "af_bella" ||
       normalizeTtsSpeed(1.1) !== 1.1 ||
@@ -24581,8 +24962,8 @@ function runFormatSelfTest() {
       /[ıİğĞşŞöÖüÜçÇ]/.test("Hello, how are you?") ||
       getRuntimeSettings().find((setting) => setting.key === "voice_mode")?.options.join(",") !==
         "ptt,hands-free,wake-word" ||
-      getRuntimeSettings().find((setting) => setting.key === "voice_output")?.value !== true ||
-      getRuntimeSettings().find((setting) => setting.key === "voice_compact")?.value !== true ||
+      getRuntimeSettings().find((setting) => setting.key === "voice_output")?.value !== false ||
+      getRuntimeSettings().find((setting) => setting.key === "voice_compact")?.value !== false ||
       getRuntimeSettings().find((setting) => setting.key === "voice_llm_rewrite")?.value !== false
     ) {
       out(`FORMAT_FAIL: runtime settings buffer is incomplete: ${JSON.stringify(runtimeSettingKeys)}\n`);
@@ -25840,6 +26221,48 @@ function runFormatSelfTest() {
       !mixedEditRunPayload.uiSections[1]?.text.includes("exit_code")
     ) {
       out("FORMAT_FAIL: mixed edit and execution output must render as separate UI sections\n");
+      return 1;
+    }
+    const printedEditAndRunPayload = buildToolResultPayload({
+      ok: true,
+      output: "{'path': 'index.js', 'replacements': 1, 'changed': True, 'added_lines': 8, 'removed_lines': 2}\n0 OK",
+      editEvents: [
+        "Edited index.js (+8 -2)\n--- a/index.js\n+++ b/index.js\n@@ -1 +1 @@\n-old\n+new",
+      ],
+      editSummaries: ["file content replaced successfully: index.js (1 replacements)"],
+    });
+    if (
+      printedEditAndRunPayload.uiSections?.length !== 2 ||
+      printedEditAndRunPayload.uiSections[0]?.kind !== "edit" ||
+      printedEditAndRunPayload.uiSections[1]?.text !== "0 OK" ||
+      printedEditAndRunPayload.displayText.includes("'replacements': 1") ||
+      !printedEditAndRunPayload.historyText.includes("file content replaced successfully")
+    ) {
+      out("FORMAT_FAIL: printed edit dictionaries must not hide or contaminate later command output\n");
+      return 1;
+    }
+    const editOnlyPayload = buildToolResultPayload({
+      ok: true,
+      output: "{'path': 'index.js', 'replacements': 1, 'changed': True}",
+      editEvents: ["Edited index.js (+1 -1)\n1 - old\n1 + new"],
+    });
+    if (
+      editOnlyPayload.uiSections?.length !== 1 ||
+      editOnlyPayload.uiSections[0]?.kind !== "edit" ||
+      editOnlyPayload.displayText.includes("'changed': True")
+    ) {
+      out("FORMAT_FAIL: edit-only helper output must render its diff without the raw return dictionary\n");
+      return 1;
+    }
+    const resumedMixedToolSession = parseSessionHistory(JSON.stringify({
+      role: "tool",
+      name: "code_execution",
+      content: "raw model history plus edit summary",
+      uiContent: "0 OK",
+      toolOk: true,
+    }));
+    if (resumedMixedToolSession.loadedMessages?.[0]?.uiContent !== "0 OK") {
+      out("FORMAT_FAIL: resumed non-plan tool results must preserve their dedicated UI content\n");
       return 1;
     }
     const nestedShellFailurePayload = buildToolResultPayload({
